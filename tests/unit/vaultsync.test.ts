@@ -1032,6 +1032,84 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("replaces a clean local copy when a plugin regenerated the note remotely", async () => {
+    const vault = await harness.createVault(aliceToken, "regenerated-note");
+    const vaultId = vault.id;
+    const original = await createNote(vaultId, "Reports/weekly.md", "report v1\ncount: 1\n");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    let sync: VaultSync | null = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(
+        () =>
+          (sync as any).localSyncState.acknowledgedFingerprint(original.path, original.guid) !==
+          null,
+        { timeout: 20_000, label: "original acknowledged locally" },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sync.destroy();
+      sync = null;
+
+      // The plugin regenerates the file by deleting and re-creating it.
+      await deleteNote(vaultId, original.path);
+      const regenerated = await createNote(vaultId, original.path, "report v2\ncount: 2\n");
+      expect(regenerated.guid).not.toBe(original.guid);
+
+      sync = new VaultSync(plugin as any);
+      (plugin as any).vaultSync = sync;
+      await waitFor(() => localVault.files.get(original.path) === regenerated.content, {
+        timeout: 20_000,
+        label: "regenerated note applied",
+      });
+      expect(bootstrapModal.calls).toEqual([]);
+      expect([...localVault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+      expect((await readNote(vaultId, original.path)).content).toBe(regenerated.content);
+    } finally {
+      sync?.destroy();
+    }
+  });
+
+  it("still asks when a regenerated note meets unsynced local edits", async () => {
+    const vault = await harness.createVault(aliceToken, "regenerated-note-dirty");
+    const vaultId = vault.id;
+    const original = await createNote(vaultId, "Reports/weekly.md", "report v1\ncount: 1\n");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    let sync: VaultSync | null = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(
+        () =>
+          (sync as any).localSyncState.acknowledgedFingerprint(original.path, original.guid) !==
+          null,
+        { timeout: 20_000, label: "original acknowledged locally" },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sync.destroy();
+      sync = null;
+
+      localVault.files.set(original.path, "report v1\ncount: 1\nmy notes\n");
+      await deleteNote(vaultId, original.path);
+      await createNote(vaultId, original.path, "report v2\ncount: 2\n");
+
+      sync = new VaultSync(plugin as any);
+      (plugin as any).vaultSync = sync;
+      await waitFor(() => bootstrapModal.calls.length === 1, {
+        timeout: 20_000,
+        label: "dirty local copy surfaced as a conflict",
+      });
+    } finally {
+      sync?.destroy();
+    }
+  });
+
   it("restores missing paths and preserves offline rename targets", async () => {
     const vault = await harness.createVault(aliceToken, "offline-path-changes");
     const vaultId = vault.id;

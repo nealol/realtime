@@ -5,7 +5,7 @@ import { applyTextToYText } from "./diff";
 import { dbg, snip } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInEditableMarkdown } from "./vaultHelpers";
 import { openTextConflictModal } from "./TextConflictModal";
-import { SyncedDoc } from "./SyncedDoc";
+import { SyncedDoc, type DocumentBootstrapOptions } from "./SyncedDoc";
 import { preserveTextConflict } from "./conflictRecovery";
 import { mergeText, mergeWithoutBaseline } from "./textMerge";
 import { sha256Text } from "./hash";
@@ -52,7 +52,8 @@ export class Document extends SyncedDoc {
   /** True only after startup content is durably present on this device. */
   private startupReady = false;
   private startupReconciling = false;
-  private readonly forceBootstrapConflict: boolean;
+  private forceBootstrapConflict: boolean;
+  private readonly staleLocalFingerprint: string | null;
   /** Suppress write-through while IndexedDB is replaying the startup baseline. */
   private startupBaselineCaptured = false;
 
@@ -65,10 +66,11 @@ export class Document extends SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
+    opts: DocumentBootstrapOptions = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.forceBootstrapConflict = opts.forceBootstrapConflict ?? false;
+    this.staleLocalFingerprint = opts.staleLocalFingerprint ?? null;
     this.ytext = this.ydoc.getText("contents");
 
     // ytext changes (local edits from other peers, or our own editor) flow to
@@ -135,8 +137,15 @@ export class Document extends SyncedDoc {
 
   private async captureStartupDisk(): Promise<void> {
     const disk = await this.readFromDisk();
+    let stale = false;
+    if (disk !== null && this.staleLocalFingerprint !== null) {
+      stale = (await sha256Text(disk)) === this.staleLocalFingerprint;
+    }
     this.diskAtStartup = disk;
-    this.localChangedAtStartup = disk !== null && disk !== this.baselineAtStartup;
+    // An untouched copy of a note deleted remotely (and since re-created at
+    // this path) is not a local change: let the new document replace it.
+    if (stale) this.forceBootstrapConflict = false;
+    this.localChangedAtStartup = disk !== null && !stale && disk !== this.baselineAtStartup;
     this.startupDiskReadPending = false;
   }
 

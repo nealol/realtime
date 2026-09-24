@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import { Notice, normalizePath, TFile } from "obsidian";
 import type RealtimePlugin from "./main";
-import { SyncedDoc } from "./SyncedDoc";
+import { SyncedDoc, type DocumentBootstrapOptions } from "./SyncedDoc";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import {
   jsonContains,
@@ -26,7 +26,8 @@ export abstract class StructuredDocument extends SyncedDoc {
   /** True only after startup content is durably present on this device. */
   private startupReady = false;
   private startupReconciling = false;
-  private readonly forceBootstrapConflict: boolean;
+  private forceBootstrapConflict: boolean;
+  private readonly staleLocalFingerprint: string | null;
   private baselineAtStartup: JsonValue = {};
   private baselineTextAtStartup = "";
   private diskAtStartup: JsonValue | null = null;
@@ -40,10 +41,11 @@ export abstract class StructuredDocument extends SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
+    opts: DocumentBootstrapOptions = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.forceBootstrapConflict = opts.forceBootstrapConflict ?? false;
+    this.staleLocalFingerprint = opts.staleLocalFingerprint ?? null;
     this.root = this.ydoc.getMap("root");
     this.rootObserver = (_events, txn) => this.onRootChanged(txn?.origin);
     this.root.observeDeep(this.rootObserver);
@@ -83,9 +85,16 @@ export abstract class StructuredDocument extends SyncedDoc {
     this.baselineAtStartup = this.value;
     this.baselineTextAtStartup = this.serialize(this.baselineAtStartup);
     const disk = await this.readParsedFromDisk();
+    let stale = false;
+    if (disk !== null && this.staleLocalFingerprint !== null) {
+      stale = (await sha256Text(this.serialize(disk))) === this.staleLocalFingerprint;
+    }
     this.diskAtStartup = disk;
+    // An untouched copy of a file deleted remotely (and since re-created at
+    // this path) is not a local change: let the new document replace it.
+    if (stale) this.forceBootstrapConflict = false;
     this.localChangedAtStartup =
-      disk !== null && this.serialize(disk) !== this.baselineTextAtStartup;
+      disk !== null && !stale && this.serialize(disk) !== this.baselineTextAtStartup;
   }
 
   protected async finishStartupReconcile(): Promise<void> {

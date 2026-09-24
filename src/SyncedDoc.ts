@@ -13,6 +13,18 @@ import { createMuxSocket } from "./sync/mux";
 import { epochPersistenceName } from "./documentEpoch";
 import { preserveTextConflict } from "./conflictRecovery";
 
+export interface DocumentBootstrapOptions {
+  autoConnect?: boolean;
+  /** The local file's durable identity is a different guid than this doc's. */
+  forceBootstrapConflict?: boolean;
+  /**
+   * Acknowledged fingerprint of the local file under an identity that has
+   * since been removed from the index. A disk file still matching it holds no
+   * unsynced edits, so it is replaced by this document instead of conflicting.
+   */
+  staleLocalFingerprint?: string | null;
+}
+
 export abstract class SyncedDoc {
   readonly path: string;
   readonly guid: string;

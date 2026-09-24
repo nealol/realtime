@@ -18,6 +18,7 @@ import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
 import type { StructuredDocument } from "./StructuredDocument";
+import type { DocumentBootstrapOptions } from "./SyncedDoc";
 import { BinarySync, type BinaryMeta } from "./BinarySync";
 import { ConfigSync, type ConfigMeta } from "./ConfigSync";
 import { categoryForConfigPath, enabledConfigCategories } from "./configCategories";
@@ -1297,15 +1298,39 @@ export class VaultSync {
     if (existing) this.removeDocument(path);
 
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
-    const doc = new Document(this.plugin, path, guid, serverDocId, isCreator, {
-      autoConnect: autoConnect && !this.mobileSuspended,
-      forceBootstrapConflict:
-        this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
-    });
+    const doc = new Document(
+      this.plugin,
+      path,
+      guid,
+      serverDocId,
+      isCreator,
+      this.bootstrapOptions(path, guid, autoConnect),
+    );
     this.documents.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
     this.scheduleMobileWorkingSetTrim(1_000);
     return doc;
+  }
+
+  private bootstrapOptions(
+    path: string,
+    guid: string,
+    autoConnect: boolean,
+  ): DocumentBootstrapOptions {
+    const identityConflict =
+      this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid);
+    const state = identityConflict ? this.localSyncState.get(path) : null;
+    // The previous identity was acknowledged and has left the index (deleted,
+    // not moved): an unchanged local copy is safe to replace.
+    const staleLocalFingerprint =
+      state?.identity && !state.candidate && state.fingerprint && !this.pathForGuid(state.identity)
+        ? state.fingerprint
+        : null;
+    return {
+      autoConnect: autoConnect && !this.mobileSuspended,
+      forceBootstrapConflict: identityConflict,
+      staleLocalFingerprint,
+    };
   }
 
   /** Best-effort: keep the server's guid → path registry current (for ACLs). */
@@ -1334,18 +1359,11 @@ export class VaultSync {
     if (existing) this.removeStructuredDocument(path);
 
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
+    const options = this.bootstrapOptions(path, guid, autoConnect);
     const doc =
       kind === "canvas"
-        ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator, {
-            autoConnect: autoConnect && !this.mobileSuspended,
-            forceBootstrapConflict:
-              this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
-          })
-        : new BaseDocument(this.plugin, path, guid, serverDocId, isCreator, {
-            autoConnect: autoConnect && !this.mobileSuspended,
-            forceBootstrapConflict:
-              this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
-          });
+        ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator, options)
+        : new BaseDocument(this.plugin, path, guid, serverDocId, isCreator, options);
     this.structuredDocuments.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
     this.scheduleMobileWorkingSetTrim(1_000);
