@@ -43,6 +43,8 @@ export class Document extends SyncedDoc {
   private diskAtStartup: string | null = null;
   /** Locally persisted Y.Text content before the first remote sync. */
   private baselineAtStartup = "";
+  /** The startup disk read failed and must succeed before reconciling. */
+  private startupDiskReadPending = false;
   /** Whether the local disk diverged from the baseline at startup. */
   private localChangedAtStartup = false;
   /** Guards the one-time startup merge so reconnects don't re-run it. */
@@ -116,16 +118,26 @@ export class Document extends SyncedDoc {
    */
   protected async afterPersistenceSynced(): Promise<void> {
     try {
-      const baseline = this.content;
-      this.baselineAtStartup = baseline;
-      const disk = await this.readFromDisk();
-      this.diskAtStartup = disk;
-      this.localChangedAtStartup = disk !== null && disk !== baseline;
+      this.baselineAtStartup = this.content;
+      await this.captureStartupDisk();
+    } catch (e) {
+      // A failed read is not a missing file. Reconciling as if it were would
+      // overwrite the local note with the (possibly empty) Y.Text; retry the
+      // read before reconciling instead.
+      console.warn(`[Realtime] startup read failed for ${this.path}; will retry`, e);
+      this.startupDiskReadPending = true;
     } finally {
       // Even if the disk read fails, remote Y.Text updates must still be allowed
       // to materialize locally after the provider syncs.
       this.startupBaselineCaptured = true;
     }
+  }
+
+  private async captureStartupDisk(): Promise<void> {
+    const disk = await this.readFromDisk();
+    this.diskAtStartup = disk;
+    this.localChangedAtStartup = disk !== null && disk !== this.baselineAtStartup;
+    this.startupDiskReadPending = false;
   }
 
   /**
@@ -145,6 +157,9 @@ export class Document extends SyncedDoc {
 
     try {
       if (!this.startupReconciled) {
+        // Throws while the file stays unreadable; the catch below retries.
+        if (this.startupDiskReadPending) await this.captureStartupDisk();
+        if (this.destroyed) return;
         const remote = this.content;
         const baseline = this.baselineAtStartup;
         const localDisk = this.diskAtStartup;

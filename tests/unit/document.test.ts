@@ -933,6 +933,39 @@ describe("Document sync", () => {
     }
   });
 
+  it("does not overwrite a local note when the startup disk read fails transiently", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("note.md", "irreplaceable local text");
+    const read = vault.read.bind(vault);
+    let failures = 1;
+    vault.read = async (file) => {
+      if (failures > 0) {
+        failures--;
+        throw new Error("EBUSY: file is being synced by the OS");
+      }
+      return await read(file);
+    };
+    const peer = new Peer(memberPlugin, docId(guid));
+    const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    try {
+      await doc.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "irreplaceable local text", {
+        timeout: 10_000,
+        label: "local text seeded after the read recovered",
+      });
+      expect(vault.files.get("note.md")).toBe("irreplaceable local text");
+      expect(doc.content).toBe("irreplaceable local text");
+    } finally {
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+
   it("creator startup: treats an empty first remote as unseeded, not a conflict", async () => {
     const guid = freshGuid();
     const peer = new Peer(memberPlugin, docId(guid));
