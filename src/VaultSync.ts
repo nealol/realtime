@@ -26,6 +26,7 @@ import { LocalSyncState, type MaterializedKind } from "./localSyncState";
 import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
 export { isConflictCopy } from "./conflictRecovery";
 import { sha256Text } from "./hash";
+import { ensureParentFolder } from "./vaultHelpers";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -167,6 +168,8 @@ export class VaultSync {
   >();
   private remoteDeletePreserved = new Set<string>();
   private remoteDeletesApplying = new Set<string>();
+  /** Old path → new path for remote renames being applied to the vault. */
+  private remoteRenamesApplying = new Map<string, string>();
   /** Last explicit user/local activity per path; used for mobile LRU eviction. */
   private mobileLastUsedAt = new Map<string, number>();
   private mobileTrimTimer: number | null = null;
@@ -1140,6 +1143,14 @@ export class VaultSync {
         kind === "text" ? this.files.has(path) : this.structured.has(path);
       if (wasReintroduced()) return;
       const file = this.plugin.app.vault.getAbstractFileByPath(path);
+      if (
+        file instanceof TFile &&
+        !this.remoteDeletePreserved.has(path) &&
+        deletedIdentity &&
+        (await this.applyRemoteRename(path, kind, deletedIdentity, wasReintroduced))
+      ) {
+        return;
+      }
       if (file instanceof TFile && !this.remoteDeletePreserved.has(path)) {
         const textDocument = this.documents.get(path);
         const structuredDocument = this.structuredDocuments.get(path);
@@ -1193,6 +1204,70 @@ export class VaultSync {
         window.setTimeout(() => void this.handleRemoteDelete(path, kind, deletedIdentity), 2_000);
       }
     }
+  }
+
+  /**
+   * The index publishes a rename as delete(old) + set(new) with the same guid.
+   * Applying that literally deletes the old file and materializes the new one
+   * from the CRDT, so any local edits the server has not acknowledged (e.g.
+   * made while sync was stopped) land in a conflict copy. When the guid now
+   * lives at a path that does not exist locally, move the file instead: the
+   * document at the new path then merges those edits against its baseline.
+   */
+  private async applyRemoteRename(
+    from: string,
+    kind: "text" | StructuredKind,
+    guid: string,
+    wasReintroduced: () => boolean,
+  ): Promise<boolean> {
+    const to = this.pathForGuid(guid);
+    if (!to || to === from || this.localFileExists(to)) return false;
+    const target = kind === "text" ? this.files.get(to) : this.structured.get(to);
+    const targetKind = kind === "text" ? "text" : isStructuredMeta(target) ? target.kind : null;
+    if (targetKind !== kind) return false;
+    const pending = kind === "text" ? this.documents.get(to) : this.structuredDocuments.get(to);
+    // A ready document at the target has already materialized its content.
+    if (pending?.isReady()) return false;
+
+    await ensureParentFolder(this.plugin.app, to);
+    const current = this.plugin.app.vault.getAbstractFileByPath(from);
+    if (
+      this.destroyed ||
+      wasReintroduced() ||
+      this.localFileExists(to) ||
+      !(current instanceof TFile) ||
+      this.pathForGuid(guid) !== to
+    ) {
+      return false;
+    }
+    this.removeDocument(from);
+    this.removeStructuredDocument(from);
+    // A target document that already read its (then missing) disk file must
+    // start over so it sees the moved content.
+    if (pending) {
+      if (kind === "text") this.removeDocument(to);
+      else this.removeStructuredDocument(to);
+    }
+    this.bumpPathVersion(from);
+    this.bumpPathVersion(to);
+    this.localSyncState.move(from, to, kind);
+    this.remoteRenamesApplying.set(from, to);
+    try {
+      await this.plugin.app.vault.rename(current, to);
+    } catch (error) {
+      this.remoteRenamesApplying.delete(from);
+      this.localSyncState.move(to, from, kind);
+      throw error;
+    }
+    // Obsidian reports the rename synchronously; the timeout only bounds a
+    // late event so it can never suppress a later user rename.
+    window.setTimeout(() => {
+      if (this.remoteRenamesApplying.get(from) === to) this.remoteRenamesApplying.delete(from);
+    }, 1_000);
+    if (this.destroyed) return true;
+    this.enqueueDoc({ path: to, guid, kind }, true);
+    this.pumpDocQueue();
+    return true;
   }
 
   private rematerializeReintroducedPath(path: string): void {
@@ -1563,6 +1638,11 @@ export class VaultSync {
   }
 
   private onLocalRename(file: TAbstractFile, oldPath: string): void {
+    if (this.remoteRenamesApplying.get(oldPath) === file.path) {
+      // Our own application of a remote rename; the index already has it.
+      this.remoteRenamesApplying.delete(oldPath);
+      return;
+    }
     if (!this.initialSynced) {
       const oldVersion = this.bumpPathVersion(oldPath);
       const newVersion = this.bumpPathVersion(file.path);

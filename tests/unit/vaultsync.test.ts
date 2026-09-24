@@ -935,6 +935,103 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("carries offline disk edits to a note that was renamed remotely", async () => {
+    const vault = await harness.createVault(aliceToken, "remote-rename-offline-edit");
+    const vaultId = vault.id;
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    localVault.files.set("old.md", "shared line\n");
+    const peer = makeIndexPeer(plugin, vaultId);
+    let sync: VaultSync | null = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(() => peer.files.has("old.md"), { timeout: 20_000, label: "indexed" });
+      const guid = peer.files.get("old.md")!;
+      await waitFor(
+        () => (sync as any).localSyncState.acknowledgedFingerprint("old.md", guid) !== null,
+        { timeout: 20_000, label: "baseline acknowledged" },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sync.destroy();
+      sync = null;
+
+      // Edited on this device while Obsidian's sync was stopped...
+      localVault.files.set("old.md", "shared line\nlocal offline edit\n");
+      // ...while another device renamed the note.
+      peer.doc.transact(() => {
+        peer.files.delete("old.md");
+        peer.files.set("new.md", guid);
+      });
+      await waitFor(() => !peer.provider.hasLocalChanges, { label: "remote rename acknowledged" });
+
+      sync = new VaultSync(plugin as any);
+      (plugin as any).vaultSync = sync;
+      await waitFor(
+        () =>
+          localVault.files.get("new.md") === "shared line\nlocal offline edit\n" &&
+          !localVault.files.has("old.md"),
+        { timeout: 20_000, label: "offline edit followed the rename" },
+      );
+      await waitFor(
+        async () =>
+          (await readNoteStatus(vaultId, "new.md")) === 200 &&
+          (await readNote(vaultId, "new.md")).content === "shared line\nlocal offline edit\n",
+        { timeout: 20_000, label: "offline edit published at the new path" },
+      );
+      expect([...localVault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+      expect(bootstrapModal.calls).toEqual([]);
+    } finally {
+      sync?.destroy();
+      peer.provider.destroy();
+      peer.doc.destroy();
+    }
+  });
+
+  it("moves an open-session note in place when it is renamed remotely", async () => {
+    const vault = await harness.createVault(aliceToken, "remote-rename-live");
+    const vaultId = vault.id;
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    localVault.files.set("Inbox/a.md", "body\n");
+    const peer = makeIndexPeer(plugin, vaultId);
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    const renames: string[] = [];
+    localVault.on("rename", (file: TFile, oldPath: string) =>
+      renames.push(`${oldPath}->${file.path}`),
+    );
+    try {
+      await waitFor(() => peer.files.has("Inbox/a.md"), { timeout: 20_000, label: "indexed" });
+      const guid = peer.files.get("Inbox/a.md")!;
+      peer.doc.transact(() => {
+        peer.files.delete("Inbox/a.md");
+        peer.files.set("Archive/a.md", guid);
+      });
+      await waitFor(
+        () =>
+          localVault.files.get("Archive/a.md") === "body\n" && !localVault.files.has("Inbox/a.md"),
+        { timeout: 20_000, label: "remote rename applied" },
+      );
+      expect(renames).toEqual(["Inbox/a.md->Archive/a.md"]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(peer.files.get("Archive/a.md")).toBe(guid);
+      expect(peer.files.has("Inbox/a.md")).toBe(false);
+      expect([...localVault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+    } finally {
+      sync.destroy();
+      peer.provider.destroy();
+      peer.doc.destroy();
+    }
+  });
+
   it("restores missing paths and preserves offline rename targets", async () => {
     const vault = await harness.createVault(aliceToken, "offline-path-changes");
     const vaultId = vault.id;
