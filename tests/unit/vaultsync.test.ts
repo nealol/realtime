@@ -13,6 +13,9 @@ import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { waitFor } from "../support/util";
 import { CompatibilityError } from "../../src/caps";
 import { CanvasDocument } from "../../src/CanvasDocument";
+import { parseCanvas, reconcileCanvas, serializeCanvas } from "../../src/structured/canvas";
+import { toValue } from "../../src/structured/reconcile";
+import { Peer } from "../support/peer";
 
 const bootstrapModal = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -199,6 +202,120 @@ describe("VaultSync index", () => {
       });
     } finally {
       sync.destroy();
+    }
+  });
+
+  it("adopts the remote note when a plugin created the same note locally from a template", async () => {
+    const vault = await harness.createVault(aliceToken, "template-remote-superset");
+    const remote = await createNote(
+      vault.id,
+      "Daily/2026-09-24.md",
+      "# 2026-09-24\n\n## Tasks\n- written on the other device\n",
+    );
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    // The daily-notes plugin created today's note before sync caught up.
+    local.vault.files.set(remote.path, "# 2026-09-24\n\n## Tasks\n");
+
+    const sync = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = sync;
+    try {
+      await waitFor(() => local.vault.files.get(remote.path) === remote.content, {
+        timeout: 20_000,
+        label: "remote note adopted",
+      });
+      expect(bootstrapModal.calls).toEqual([]);
+      expect((await readNote(vault.id, remote.path)).content).toBe(remote.content);
+      expect([...local.vault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+    } finally {
+      sync.destroy();
+    }
+  });
+
+  it("publishes the local note when it extends a template the remote created", async () => {
+    const vault = await harness.createVault(aliceToken, "template-local-superset");
+    const remote = await createNote(vault.id, "Daily/2026-09-24.md", "# 2026-09-24\n\n## Tasks\n");
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const filled = "# 2026-09-24\n\n## Tasks\n- written offline\n";
+    local.vault.files.set(remote.path, filled);
+
+    const sync = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = sync;
+    try {
+      await waitFor(async () => (await readNote(vault.id, remote.path)).content === filled, {
+        timeout: 20_000,
+        label: "local superset published",
+      });
+      expect(bootstrapModal.calls).toEqual([]);
+      expect(local.vault.files.get(remote.path)).toBe(filled);
+    } finally {
+      sync.destroy();
+    }
+  });
+
+  it("adopts a remote canvas over an empty canvas a plugin created locally", async () => {
+    const vault = await harness.createVault(aliceToken, "template-remote-canvas");
+    const path = "Boards/Today.canvas";
+    const guid = crypto.randomUUID();
+    const seed = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const remoteNode = {
+      id: "n1",
+      type: "text",
+      text: "remote",
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 60,
+    };
+    const canvasPeer = new Peer(seed.plugin, `${vault.id}__${guid}`);
+    const index = makeIndexPeer(seed.plugin as any, vault.id);
+    await canvasPeer.whenSynced();
+    canvasPeer.doc.transact(() =>
+      reconcileCanvas(
+        canvasPeer.doc.getMap("root"),
+        parseCanvas(JSON.stringify({ nodes: [remoteNode], edges: [] })),
+        canvasPeer.doc.clientID,
+      ),
+    );
+    await canvasPeer.whenChangesSynced();
+    await waitFor(() => index.provider.status === "connected", { label: "index peer connected" });
+    index.doc.getMap("structured").set(path, { guid, kind: "canvas" });
+    await waitFor(() => !index.provider.hasLocalChanges, { label: "index entry acknowledged" });
+
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    local.vault.files.set(path, JSON.stringify({ nodes: [], edges: [] }));
+    const sync = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = sync;
+    try {
+      await waitFor(() => JSON.parse(local.vault.files.get(path) ?? "{}").nodes?.length === 1, {
+        timeout: 20_000,
+        label: "remote canvas adopted",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(JSON.parse(serializeCanvas(toValue(canvasPeer.doc.getMap("root")))).nodes).toEqual([
+        remoteNode,
+      ]);
+      expect([...local.vault.files.keys()].filter((file) => /conflicted copy/.test(file))).toEqual(
+        [],
+      );
+    } finally {
+      sync.destroy();
+      canvasPeer.destroy();
+      index.provider.destroy();
+      index.doc.destroy();
     }
   });
 
@@ -412,6 +529,57 @@ describe("VaultSync index", () => {
       expect(await readNoteStatus(vault.id, created.path)).toBe(200);
     } finally {
       secondSync.destroy();
+    }
+  });
+
+  it("does not conflict on restart when an automation edits a note it created remotely", async () => {
+    const vault = await harness.createVault(aliceToken, "automation-remote-create");
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    // Real vault reads hit the disk adapter and resolve after other microtasks.
+    const read = local.vault.read.bind(local.vault);
+    local.vault.read = async (file: TFile) => {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return await read(file);
+    };
+    const first = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = first;
+    await waitFor(() => (first as any).initialSynced, { timeout: 20_000, label: "bootstrapped" });
+
+    // An automation creates the note while this client is running; the client
+    // materializes it through vault.create, whose create event echoes back.
+    const created = await createNote(vault.id, "Automation/log.md", "entry 1\n");
+    await waitFor(() => local.vault.files.get(created.path) === created.content, {
+      timeout: 20_000,
+      label: "automation note materialized",
+    });
+    await waitFor(
+      () => (first as any).localSyncState.get(created.path)?.fingerprint !== undefined,
+      { timeout: 20_000, label: "materialized content acknowledged" },
+    );
+    // Let the echoed create handler finish its slow read before checking.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect((first as any).localSyncState.get(created.path)?.identity).toBe(created.guid);
+    first.destroy();
+
+    // The automation keeps writing while this client is closed.
+    await replaceNote(vault.id, created.path, "entry 1\nentry 2\n");
+
+    const restarted = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = restarted;
+    try {
+      await waitFor(() => local.vault.files.get(created.path) === "entry 1\nentry 2\n", {
+        timeout: 20_000,
+        label: "remote automation edit applied after restart",
+      });
+      expect(bootstrapModal.calls).toEqual([]);
+      expect([...local.vault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+    } finally {
+      restarted.destroy();
     }
   });
 
@@ -764,6 +932,181 @@ describe("VaultSync index", () => {
       ).toBe(true);
     } finally {
       sync.destroy();
+    }
+  });
+
+  it("carries offline disk edits to a note that was renamed remotely", async () => {
+    const vault = await harness.createVault(aliceToken, "remote-rename-offline-edit");
+    const vaultId = vault.id;
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    localVault.files.set("old.md", "shared line\n");
+    const peer = makeIndexPeer(plugin, vaultId);
+    let sync: VaultSync | null = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(() => peer.files.has("old.md"), { timeout: 20_000, label: "indexed" });
+      const guid = peer.files.get("old.md")!;
+      await waitFor(
+        () => (sync as any).localSyncState.acknowledgedFingerprint("old.md", guid) !== null,
+        { timeout: 20_000, label: "baseline acknowledged" },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sync.destroy();
+      sync = null;
+
+      // Edited on this device while Obsidian's sync was stopped...
+      localVault.files.set("old.md", "shared line\nlocal offline edit\n");
+      // ...while another device renamed the note.
+      peer.doc.transact(() => {
+        peer.files.delete("old.md");
+        peer.files.set("new.md", guid);
+      });
+      await waitFor(() => !peer.provider.hasLocalChanges, { label: "remote rename acknowledged" });
+
+      sync = new VaultSync(plugin as any);
+      (plugin as any).vaultSync = sync;
+      await waitFor(
+        () =>
+          localVault.files.get("new.md") === "shared line\nlocal offline edit\n" &&
+          !localVault.files.has("old.md"),
+        { timeout: 20_000, label: "offline edit followed the rename" },
+      );
+      await waitFor(
+        async () =>
+          (await readNoteStatus(vaultId, "new.md")) === 200 &&
+          (await readNote(vaultId, "new.md")).content === "shared line\nlocal offline edit\n",
+        { timeout: 20_000, label: "offline edit published at the new path" },
+      );
+      expect([...localVault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+      expect(bootstrapModal.calls).toEqual([]);
+    } finally {
+      sync?.destroy();
+      peer.provider.destroy();
+      peer.doc.destroy();
+    }
+  });
+
+  it("moves an open-session note in place when it is renamed remotely", async () => {
+    const vault = await harness.createVault(aliceToken, "remote-rename-live");
+    const vaultId = vault.id;
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    localVault.files.set("Inbox/a.md", "body\n");
+    const peer = makeIndexPeer(plugin, vaultId);
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    const renames: string[] = [];
+    localVault.on("rename", (file: TFile, oldPath: string) =>
+      renames.push(`${oldPath}->${file.path}`),
+    );
+    try {
+      await waitFor(() => peer.files.has("Inbox/a.md"), { timeout: 20_000, label: "indexed" });
+      const guid = peer.files.get("Inbox/a.md")!;
+      peer.doc.transact(() => {
+        peer.files.delete("Inbox/a.md");
+        peer.files.set("Archive/a.md", guid);
+      });
+      await waitFor(
+        () =>
+          localVault.files.get("Archive/a.md") === "body\n" && !localVault.files.has("Inbox/a.md"),
+        { timeout: 20_000, label: "remote rename applied" },
+      );
+      expect(renames).toEqual(["Inbox/a.md->Archive/a.md"]);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(peer.files.get("Archive/a.md")).toBe(guid);
+      expect(peer.files.has("Inbox/a.md")).toBe(false);
+      expect([...localVault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+    } finally {
+      sync.destroy();
+      peer.provider.destroy();
+      peer.doc.destroy();
+    }
+  });
+
+  it("replaces a clean local copy when a plugin regenerated the note remotely", async () => {
+    const vault = await harness.createVault(aliceToken, "regenerated-note");
+    const vaultId = vault.id;
+    const original = await createNote(vaultId, "Reports/weekly.md", "report v1\ncount: 1\n");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    let sync: VaultSync | null = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(
+        () =>
+          (sync as any).localSyncState.acknowledgedFingerprint(original.path, original.guid) !==
+          null,
+        { timeout: 20_000, label: "original acknowledged locally" },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sync.destroy();
+      sync = null;
+
+      // The plugin regenerates the file by deleting and re-creating it.
+      await deleteNote(vaultId, original.path);
+      const regenerated = await createNote(vaultId, original.path, "report v2\ncount: 2\n");
+      expect(regenerated.guid).not.toBe(original.guid);
+
+      sync = new VaultSync(plugin as any);
+      (plugin as any).vaultSync = sync;
+      await waitFor(() => localVault.files.get(original.path) === regenerated.content, {
+        timeout: 20_000,
+        label: "regenerated note applied",
+      });
+      expect(bootstrapModal.calls).toEqual([]);
+      expect([...localVault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+      expect((await readNote(vaultId, original.path)).content).toBe(regenerated.content);
+    } finally {
+      sync?.destroy();
+    }
+  });
+
+  it("still asks when a regenerated note meets unsynced local edits", async () => {
+    const vault = await harness.createVault(aliceToken, "regenerated-note-dirty");
+    const vaultId = vault.id;
+    const original = await createNote(vaultId, "Reports/weekly.md", "report v1\ncount: 1\n");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    let sync: VaultSync | null = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(
+        () =>
+          (sync as any).localSyncState.acknowledgedFingerprint(original.path, original.guid) !==
+          null,
+        { timeout: 20_000, label: "original acknowledged locally" },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sync.destroy();
+      sync = null;
+
+      localVault.files.set(original.path, "report v1\ncount: 1\nmy notes\n");
+      await deleteNote(vaultId, original.path);
+      await createNote(vaultId, original.path, "report v2\ncount: 2\n");
+
+      sync = new VaultSync(plugin as any);
+      (plugin as any).vaultSync = sync;
+      await waitFor(() => bootstrapModal.calls.length === 1, {
+        timeout: 20_000,
+        label: "dirty local copy surfaced as a conflict",
+      });
+    } finally {
+      sync?.destroy();
     }
   });
 

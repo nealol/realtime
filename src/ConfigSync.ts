@@ -10,6 +10,7 @@ import {
 import { dbg } from "./debug";
 import type { LocalSyncState } from "./localSyncState";
 import { isConflictCopy, preserveAdapterConflict } from "./conflictRecovery";
+import { mergeStructuredStartupResult, type JsonValue } from "./structured/reconcile";
 
 export interface ConfigMeta {
   hash: string;
@@ -89,6 +90,36 @@ export function mergeJsonSettings(remoteText: string, localText: string): string
   }
   if (!isPlainObject(remote) || !isPlainObject(local)) return null;
   return JSON.stringify({ ...remote, ...local }, null, 2);
+}
+
+/**
+ * Three-way merge of JSON settings against the last synced version. Plugins
+ * and the workspace rewrite their JSON files on every device, so both sides
+ * routinely diverge on disjoint keys; those merge without a recovery copy.
+ * Returns `null` when any side is not a plain JSON object.
+ */
+export function mergeJsonSettingsThreeWay(
+  baseText: string,
+  remoteText: string,
+  localText: string,
+): { text: string; conflicted: boolean } | null {
+  let base: unknown;
+  let remote: unknown;
+  let local: unknown;
+  try {
+    base = JSON.parse(baseText);
+    remote = JSON.parse(remoteText);
+    local = JSON.parse(localText);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(base) || !isPlainObject(remote) || !isPlainObject(local)) return null;
+  const merged = mergeStructuredStartupResult(
+    base as JsonValue,
+    local as JsonValue,
+    remote as JsonValue,
+  );
+  return { text: JSON.stringify(merged.value, null, 2), conflicted: merged.conflicted };
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -478,9 +509,11 @@ export class ConfigSync {
 
   /**
    * Both sides changed the same JSON settings file since the shared baseline.
-   * Mirror Obsidian Sync: merge the objects with local keys on top of remote
-   * keys, write the merged result locally, and publish it. Falls back to
-   * newest-wins when either side isn't a plain JSON object.
+   * First try a three-way merge against the baseline blob; disjoint changes
+   * publish silently. Otherwise mirror Obsidian Sync: merge the objects with
+   * local keys on top of remote keys, preserve the remote as a recovery copy,
+   * and publish. Falls back to newest-wins when either side isn't a plain
+   * JSON object.
    */
   private async mergeConflict(
     path: string,
@@ -508,6 +541,31 @@ export class ConfigSync {
     }
 
     const decoder = new TextDecoder();
+    const baseHash = this.lastSyncedHash.get(path);
+    if (baseHash) {
+      const baseBytes = await this.plugin.auth
+        .getBlob(this.vaultId, path, baseHash)
+        .catch(() => null);
+      if (!this.canApply(generation)) {
+        if (!this.destroyed) void this.reconcile(path);
+        return;
+      }
+      const threeWay = baseBytes
+        ? mergeJsonSettingsThreeWay(
+            decoder.decode(baseBytes),
+            decoder.decode(remoteBytes),
+            decoder.decode(localBytes),
+          )
+        : null;
+      if (threeWay && !threeWay.conflicted) {
+        if (!(await this.configStateMatches(path, local.hash, remote.hash))) {
+          void this.reconcile(path);
+          return;
+        }
+        await this.writeMergedAndUpload(path, threeWay.text, remote.hash, generation);
+        return;
+      }
+    }
     const merged = mergeJsonSettings(decoder.decode(remoteBytes), decoder.decode(localBytes));
     if (merged === null) {
       // Not mergeable JSON → newest modified version wins.
@@ -541,6 +599,15 @@ export class ConfigSync {
       return;
     }
 
+    await this.writeMergedAndUpload(path, merged, remote.hash, generation);
+  }
+
+  private async writeMergedAndUpload(
+    path: string,
+    merged: string,
+    remoteHash: string,
+    generation: number,
+  ): Promise<void> {
     const mergedBytes = new TextEncoder().encode(merged);
     const buffer = mergedBytes.buffer.slice(
       mergedBytes.byteOffset,
@@ -557,7 +624,7 @@ export class ConfigSync {
       window.setTimeout(() => this.writing.delete(path), 0);
     }
     if (!this.canApply(generation)) return;
-    await this.uploadBytes(path, buffer, null, remote.hash, generation);
+    await this.uploadBytes(path, buffer, null, remoteHash, generation);
     dbg("config merged", path);
   }
 
