@@ -202,6 +202,61 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("adopts the remote note when a plugin created the same note locally from a template", async () => {
+    const vault = await harness.createVault(aliceToken, "template-remote-superset");
+    const remote = await createNote(
+      vault.id,
+      "Daily/2026-09-24.md",
+      "# 2026-09-24\n\n## Tasks\n- written on the other device\n",
+    );
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    // The daily-notes plugin created today's note before sync caught up.
+    local.vault.files.set(remote.path, "# 2026-09-24\n\n## Tasks\n");
+
+    const sync = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = sync;
+    try {
+      await waitFor(() => local.vault.files.get(remote.path) === remote.content, {
+        timeout: 20_000,
+        label: "remote note adopted",
+      });
+      expect(bootstrapModal.calls).toEqual([]);
+      expect((await readNote(vault.id, remote.path)).content).toBe(remote.content);
+      expect([...local.vault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+    } finally {
+      sync.destroy();
+    }
+  });
+
+  it("publishes the local note when it extends a template the remote created", async () => {
+    const vault = await harness.createVault(aliceToken, "template-local-superset");
+    const remote = await createNote(vault.id, "Daily/2026-09-24.md", "# 2026-09-24\n\n## Tasks\n");
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const filled = "# 2026-09-24\n\n## Tasks\n- written offline\n";
+    local.vault.files.set(remote.path, filled);
+
+    const sync = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = sync;
+    try {
+      await waitFor(async () => (await readNote(vault.id, remote.path)).content === filled, {
+        timeout: 20_000,
+        label: "local superset published",
+      });
+      expect(bootstrapModal.calls).toEqual([]);
+      expect(local.vault.files.get(remote.path)).toBe(filled);
+    } finally {
+      sync.destroy();
+    }
+  });
+
   it("recovers a bootstrap decision after restart during the conflict window", async () => {
     const vault = await harness.createVault(aliceToken, "bootstrap-crash-window");
     const remote = await createNote(vault.id, "collision.md", "remote before restart");

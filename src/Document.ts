@@ -7,7 +7,7 @@ import { ensureParentFolder, getFileByPath, isOpenInEditableMarkdown } from "./v
 import { openTextConflictModal } from "./TextConflictModal";
 import { SyncedDoc } from "./SyncedDoc";
 import { preserveTextConflict } from "./conflictRecovery";
-import { mergeText } from "./textMerge";
+import { mergeText, mergeWithoutBaseline } from "./textMerge";
 import { sha256Text } from "./hash";
 import { getDocumentEpoch } from "./documentEpoch";
 
@@ -174,9 +174,17 @@ export class Document extends SyncedDoc {
         if (sameDevicePrefixFastForward) {
           this.applyText(localDisk);
         } else if (isConflict) {
-          const merge = this.forceBootstrapConflict
-            ? ({ kind: "conflict" } as const)
+          // Without a shared baseline (an unrelated local file, or a note both
+          // devices created independently — typically by a plugin template),
+          // a diff3 sees two overlapping inserts. Accept whichever side already
+          // contains the other before asking the user.
+          const allowLocalSuperset = getDocumentEpoch(this.plugin, this.serverDocId) === 0;
+          let merge = this.forceBootstrapConflict
+            ? mergeWithoutBaseline(localDisk, remote, allowLocalSuperset)
             : mergeText(baseline, localDisk, remote);
+          if (merge.kind === "conflict" && !this.forceBootstrapConflict && baseline.length === 0) {
+            merge = mergeWithoutBaseline(localDisk, remote, allowLocalSuperset);
+          }
           if (merge.kind === "merged") {
             this.applyText(merge.content);
           } else {
