@@ -4,6 +4,7 @@ import type RealtimePlugin from "./main";
 import { SyncedDoc } from "./SyncedDoc";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import {
+  jsonContains,
   mergeStructuredStartupResult,
   reconcileInto,
   toValue,
@@ -11,6 +12,7 @@ import {
 } from "./structured/reconcile";
 import { preserveTextConflict } from "./conflictRecovery";
 import { sha256Text } from "./hash";
+import { getDocumentEpoch } from "./documentEpoch";
 
 export const DISK_ORIGIN = Symbol("realtime-structured-disk");
 
@@ -97,12 +99,14 @@ export abstract class StructuredDocument extends SyncedDoc {
           this.diskAtStartup !== null &&
           (this.localChangedAtStartup || this.forceBootstrapConflict)
         ) {
-          const merge = this.forceBootstrapConflict
-            ? {
-                value: this.diskAtStartup,
-                conflicted: this.serialize(this.diskAtStartup) !== this.serialize(remote),
-              }
-            : mergeStructuredStartupResult(this.baselineAtStartup, this.diskAtStartup, remote);
+          const merge =
+            this.mergeWithoutSharedBaseline(this.diskAtStartup, remote) ??
+            (this.forceBootstrapConflict
+              ? {
+                  value: this.diskAtStartup,
+                  conflicted: this.serialize(this.diskAtStartup) !== this.serialize(remote),
+                }
+              : mergeStructuredStartupResult(this.baselineAtStartup, this.diskAtStartup, remote));
           if (merge.conflicted) {
             const preservedPath = await preserveTextConflict(
               this.plugin,
@@ -155,6 +159,33 @@ export abstract class StructuredDocument extends SyncedDoc {
         window.setTimeout(() => void this.finishStartupReconcile(), 2_000);
       }
     }
+  }
+
+  /**
+   * Without a shared baseline (an unrelated local file, or the same file
+   * created independently on two devices, e.g. an empty canvas from a plugin),
+   * take whichever side already contains the other instead of letting the
+   * local copy overwrite the remote. The local superset is not taken after an
+   * epoch rollover, where the remote may have removed content on purpose.
+   */
+  private mergeWithoutSharedBaseline(
+    disk: JsonValue,
+    remote: JsonValue,
+  ): { value: JsonValue; conflicted: boolean } | null {
+    const baselineEmpty = this.baselineTextAtStartup === this.serialize(this.parse(""));
+    if (!this.forceBootstrapConflict && !baselineEmpty) return null;
+    // Compare file-level shapes; the CRDT value also carries internal state
+    // (e.g. canvas tombstone maps) that never reaches disk.
+    const diskShape = this.parse(this.serialize(disk));
+    const remoteShape = this.parse(this.serialize(remote));
+    if (jsonContains(remoteShape, diskShape)) return { value: remote, conflicted: false };
+    if (
+      getDocumentEpoch(this.plugin, this.serverDocId) === 0 &&
+      jsonContains(diskShape, remoteShape)
+    ) {
+      return { value: disk, conflicted: false };
+    }
+    return null;
   }
 
   protected async afterChangesSynced(): Promise<void> {

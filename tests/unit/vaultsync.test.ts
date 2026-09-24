@@ -13,6 +13,9 @@ import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { waitFor } from "../support/util";
 import { CompatibilityError } from "../../src/caps";
 import { CanvasDocument } from "../../src/CanvasDocument";
+import { parseCanvas, reconcileCanvas, serializeCanvas } from "../../src/structured/canvas";
+import { toValue } from "../../src/structured/reconcile";
+import { Peer } from "../support/peer";
 
 const bootstrapModal = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -254,6 +257,65 @@ describe("VaultSync index", () => {
       expect(local.vault.files.get(remote.path)).toBe(filled);
     } finally {
       sync.destroy();
+    }
+  });
+
+  it("adopts a remote canvas over an empty canvas a plugin created locally", async () => {
+    const vault = await harness.createVault(aliceToken, "template-remote-canvas");
+    const path = "Boards/Today.canvas";
+    const guid = crypto.randomUUID();
+    const seed = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const remoteNode = {
+      id: "n1",
+      type: "text",
+      text: "remote",
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 60,
+    };
+    const canvasPeer = new Peer(seed.plugin, `${vault.id}__${guid}`);
+    const index = makeIndexPeer(seed.plugin as any, vault.id);
+    await canvasPeer.whenSynced();
+    canvasPeer.doc.transact(() =>
+      reconcileCanvas(
+        canvasPeer.doc.getMap("root"),
+        parseCanvas(JSON.stringify({ nodes: [remoteNode], edges: [] })),
+        canvasPeer.doc.clientID,
+      ),
+    );
+    await canvasPeer.whenChangesSynced();
+    await waitFor(() => index.provider.status === "connected", { label: "index peer connected" });
+    index.doc.getMap("structured").set(path, { guid, kind: "canvas" });
+    await waitFor(() => !index.provider.hasLocalChanges, { label: "index entry acknowledged" });
+
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    local.vault.files.set(path, JSON.stringify({ nodes: [], edges: [] }));
+    const sync = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = sync;
+    try {
+      await waitFor(() => JSON.parse(local.vault.files.get(path) ?? "{}").nodes?.length === 1, {
+        timeout: 20_000,
+        label: "remote canvas adopted",
+      });
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(JSON.parse(serializeCanvas(toValue(canvasPeer.doc.getMap("root")))).nodes).toEqual([
+        remoteNode,
+      ]);
+      expect([...local.vault.files.keys()].filter((file) => /conflicted copy/.test(file))).toEqual(
+        [],
+      );
+    } finally {
+      sync.destroy();
+      canvasPeer.destroy();
+      index.provider.destroy();
+      index.doc.destroy();
     }
   });
 
