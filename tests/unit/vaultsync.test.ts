@@ -415,6 +415,57 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("does not conflict on restart when an automation edits a note it created remotely", async () => {
+    const vault = await harness.createVault(aliceToken, "automation-remote-create");
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    // Real vault reads hit the disk adapter and resolve after other microtasks.
+    const read = local.vault.read.bind(local.vault);
+    local.vault.read = async (file: TFile) => {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return await read(file);
+    };
+    const first = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = first;
+    await waitFor(() => (first as any).initialSynced, { timeout: 20_000, label: "bootstrapped" });
+
+    // An automation creates the note while this client is running; the client
+    // materializes it through vault.create, whose create event echoes back.
+    const created = await createNote(vault.id, "Automation/log.md", "entry 1\n");
+    await waitFor(() => local.vault.files.get(created.path) === created.content, {
+      timeout: 20_000,
+      label: "automation note materialized",
+    });
+    await waitFor(
+      () => (first as any).localSyncState.get(created.path)?.fingerprint !== undefined,
+      { timeout: 20_000, label: "materialized content acknowledged" },
+    );
+    // Let the echoed create handler finish its slow read before checking.
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect((first as any).localSyncState.get(created.path)?.identity).toBe(created.guid);
+    first.destroy();
+
+    // The automation keeps writing while this client is closed.
+    await replaceNote(vault.id, created.path, "entry 1\nentry 2\n");
+
+    const restarted = new VaultSync(local.plugin as any);
+    (local.plugin as any).vaultSync = restarted;
+    try {
+      await waitFor(() => local.vault.files.get(created.path) === "entry 1\nentry 2\n", {
+        timeout: 20_000,
+        label: "remote automation edit applied after restart",
+      });
+      expect(bootstrapModal.calls).toEqual([]);
+      expect([...local.vault.files.keys()].filter((path) => /conflicted copy/.test(path))).toEqual(
+        [],
+      );
+    } finally {
+      restarted.destroy();
+    }
+  });
+
   it("does not publish a deletion when restart interrupts remote note materialization", async () => {
     const vault = await harness.createVault(aliceToken, "remote-create-interrupted");
     const created = await createNote(vault.id, "Servant42/interrupted.md", "remote content");

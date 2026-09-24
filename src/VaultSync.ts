@@ -600,12 +600,12 @@ export class VaultSync {
       const kind = this.classify(file);
       if (kind === "text" && !this.localSyncState.has(file.path)) {
         const fingerprint = await sha256Text(await this.plugin.app.vault.read(file));
-        this.localSyncState.beginCandidate(file.path, "text", null, fingerprint);
+        this.beginUntrackedCandidate(file.path, "text", fingerprint);
       } else if (kind === "structured" && !this.localSyncState.has(file.path)) {
         const structuredKind = this.structuredKindForExtension(file.extension);
         if (structuredKind) {
           const fingerprint = await sha256Text(await this.plugin.app.vault.read(file));
-          this.localSyncState.beginCandidate(file.path, structuredKind, null, fingerprint);
+          this.beginUntrackedCandidate(file.path, structuredKind, fingerprint);
         }
       }
     }
@@ -1422,6 +1422,18 @@ export class VaultSync {
     return kind;
   }
 
+  /**
+   * Record a local file with no accepted identity yet. Callers check
+   * `has(path)` before hashing, but the hash awaits a disk read: a document
+   * materializing a remote file (whose vault.create echoes back here) commits
+   * its identity meanwhile. Overwriting that with `null` would turn every later
+   * remote change into a forced bootstrap conflict for the file.
+   */
+  private beginUntrackedCandidate(path: string, kind: MaterializedKind, fingerprint: string): void {
+    if (this.localSyncState.has(path)) return;
+    this.localSyncState.beginCandidate(path, kind, null, fingerprint);
+  }
+
   private onLocalCreate(file: TAbstractFile): void {
     if (this.destroyed) return;
     if (!this.initialSynced) {
@@ -1447,7 +1459,7 @@ export class VaultSync {
         ) {
           return;
         }
-        this.localSyncState.beginCandidate(path, "text", null, fingerprint);
+        this.beginUntrackedCandidate(path, "text", fingerprint);
       }
     } else if (kind === "structured" && file instanceof TFile) {
       const structuredKind = this.structuredKindForExtension(file.extension);
@@ -1460,7 +1472,7 @@ export class VaultSync {
         ) {
           return;
         }
-        this.localSyncState.beginCandidate(path, structuredKind, null, fingerprint);
+        this.beginUntrackedCandidate(path, structuredKind, fingerprint);
       }
     }
     if (kind === "binary") {
