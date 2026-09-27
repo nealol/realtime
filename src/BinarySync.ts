@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { TFile, Notice } from "obsidian";
+import { TFile, Notice, Platform } from "obsidian";
 import type RealtimePlugin from "./main";
 import type { VaultSync } from "./VaultSync";
 import { sha256Hex } from "./hash";
@@ -31,6 +31,10 @@ export interface BinaryMeta {
 const LARGE_FILE_BYTES = 5 * 1024 * 1024;
 /** Max upload attempts before giving up (with a Notice). */
 const MAX_UPLOAD_ATTEMPTS = 5;
+/** Startup reconcile pool: parallel paths, and bytes held in memory at once. */
+const RECONCILE_CONCURRENCY = 6;
+const MOBILE_RECONCILE_CONCURRENCY = 3;
+const RECONCILE_MAX_BYTES_IN_FLIGHT = 32 * 1024 * 1024;
 /** Delay before re-draining the upload queue when deferred / after a failure. */
 const DRAIN_RETRY_MS = 2000;
 
@@ -171,13 +175,41 @@ export class BinarySync {
 
     this.pullingMissingRemote = true;
     try {
-      for (const path of paths) {
-        await this.reconcile(path);
-        if (this.destroyed) return;
-      }
+      await this.reconcileConcurrently([...paths]);
     } finally {
       this.pullingMissingRemote = false;
     }
+  }
+
+  /**
+   * Reconcile many paths with a small bounded pool. The startup pass used to
+   * await each path in turn, so a fresh device paid one full blob round trip
+   * per attachment back to back. Each download is held in memory whole, so
+   * the pool is also capped by the bytes it has in flight (a single file
+   * larger than the cap still runs, alone).
+   */
+  private async reconcileConcurrently(paths: string[]): Promise<void> {
+    const maxJobs = Platform?.isMobile ? MOBILE_RECONCILE_CONCURRENCY : RECONCILE_CONCURRENCY;
+    const running = new Set<Promise<void>>();
+    let bytesInFlight = 0;
+    for (const path of paths) {
+      if (this.destroyed) break;
+      const size = this.binaries.get(path)?.size ?? 0;
+      while (
+        running.size > 0 &&
+        (running.size >= maxJobs || bytesInFlight + size > RECONCILE_MAX_BYTES_IN_FLIGHT)
+      ) {
+        await Promise.race(running);
+      }
+      if (this.destroyed) break;
+      bytesInFlight += size;
+      const job: Promise<void> = this.reconcile(path).finally(() => {
+        bytesInFlight -= size;
+        running.delete(job);
+      });
+      running.add(job);
+    }
+    await Promise.all(running);
   }
 
   remotePaths(): string[] {

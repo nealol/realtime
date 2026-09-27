@@ -120,6 +120,58 @@ describe("BinarySync", () => {
     }
   });
 
+  it("downloads startup attachments in parallel within count and byte limits", async () => {
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const indexDoc = new Y.Doc();
+    const binaries = indexDoc.getMap<BinaryMeta>("binaries");
+    const blobs = new Map<string, ArrayBuffer>();
+    const addRemote = async (path: string, size: number) => {
+      const data = new TextEncoder().encode(path).buffer as ArrayBuffer;
+      const hash = await sha256Hex(data);
+      blobs.set(hash, data);
+      binaries.set(path, { hash, size });
+    };
+    for (let i = 0; i < 20; i++) await addRemote(`small/${i}.png`, 1024);
+    for (let i = 0; i < 3; i++) await addRemote(`large/${i}.mov`, 20 * 1024 * 1024);
+
+    let inFlight = 0;
+    let largeInFlight = 0;
+    let peak = 0;
+    let largePeak = 0;
+    plugin.auth.getBlob = async (_vault: string, path: string, hash: string) => {
+      const large = path.startsWith("large/");
+      inFlight++;
+      if (large) largeInFlight++;
+      peak = Math.max(peak, inFlight);
+      largePeak = Math.max(largePeak, largeInFlight);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      inFlight--;
+      if (large) largeInFlight--;
+      return blobs.get(hash)!;
+    };
+    const bs = new BinarySync(
+      plugin as any,
+      { isTextSyncBusy: () => false, recordTrash: () => {} } as any,
+      indexDoc,
+    );
+    try {
+      bs.seedBaseline();
+      await bs.reconcileAll([]);
+      expect(vault.binaries.size).toBe(23);
+      // Downloads overlap, up to the pool size.
+      expect(peak).toBeGreaterThan(1);
+      expect(peak).toBeLessThanOrEqual(6);
+      // Two 20 MB files exceed the in-flight byte budget, so they run alone.
+      expect(largePeak).toBe(1);
+    } finally {
+      bs.destroy();
+      indexDoc.destroy();
+    }
+  });
+
   it("uploads a local binary and a peer downloads identical bytes", async () => {
     const A = makeDevice("A");
     const B = makeDevice("B");
