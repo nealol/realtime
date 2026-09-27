@@ -818,7 +818,13 @@ describe("VaultSync index", () => {
       await waitFor(
         () => {
           const binarySync = (sync as any).binarySync;
-          return binarySync.hasPath("new.bin") && binarySync.hasPath("old.bin");
+          // Startup reconciles paths in parallel, so the upload of new.bin can
+          // publish before old.bin's restore download lands on disk.
+          return (
+            binarySync.hasPath("new.bin") &&
+            binarySync.hasPath("old.bin") &&
+            local.vault.binaries.has("old.bin")
+          );
         },
         { timeout: 20_000, label: "interrupted binary rename recovered safely" },
       );
