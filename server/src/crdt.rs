@@ -241,6 +241,18 @@ impl DocumentStore {
         document.read_update().await
     }
 
+    /// Run a read-only closure against the live document. Cheaper than
+    /// [`Self::read_update`] for point lookups: no full-state encode, and it
+    /// does not wait on the mutation lock held by writers.
+    pub async fn read_with<R>(
+        &self,
+        document_id: &str,
+        read: impl FnOnce(&Doc) -> R,
+    ) -> Result<R, CrdtError> {
+        let (_, document) = self.get_or_load(document_id).await?;
+        document.read_with(read)
+    }
+
     pub(crate) async fn read_update_with_epoch(
         &self,
         document_id: &str,
@@ -1215,6 +1227,14 @@ impl PersistentDocument {
             events,
             sync_metrics,
         }
+    }
+
+    fn read_with<R>(&self, read: impl FnOnce(&Doc) -> R) -> Result<R, CrdtError> {
+        let awareness = self
+            .awareness
+            .read()
+            .map_err(|_| CrdtError::Protocol("document lock poisoned".into()))?;
+        Ok(read(awareness.doc()))
     }
 
     fn snapshot(&self) -> Result<Vec<u8>, CrdtError> {
