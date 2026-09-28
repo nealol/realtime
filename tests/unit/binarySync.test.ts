@@ -120,6 +120,43 @@ describe("BinarySync", () => {
     }
   });
 
+  it("restores a prioritized attachment missing locally before the startup pass", async () => {
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const data = bytes([9, 9, 9]);
+    const hash = await sha256Hex(data);
+    const localState = new LocalSyncState(`binary-priority:${freshGuid()}`);
+    await localState.whenSynced;
+    // Synced on an earlier run; the file is now missing locally (e.g. evicted).
+    localState.markSynced("pic.png", "binary", hash, hash);
+    const indexDoc = new Y.Doc();
+    const binaries = indexDoc.getMap<BinaryMeta>("binaries");
+    binaries.set("pic.png", { hash, size: 3 });
+    plugin.auth.getBlob = async () => data;
+    const bs = new BinarySync(
+      plugin as any,
+      { isTextSyncBusy: () => false, recordTrash: () => {} } as any,
+      indexDoc,
+      localState,
+    );
+    try {
+      bs.seedBaseline();
+      // An open note or canvas asks for the image before reconcileAll runs.
+      bs.prioritizePaths(["pic.png"]);
+      await waitFor(() => vault.binaries.has("pic.png") || !binaries.has("pic.png"), {
+        label: "prioritized reconcile settled",
+      });
+      expect(binaries.get("pic.png")?.hash).toBe(hash);
+      expect(asArray(vault.binaries.get("pic.png"))).toEqual([9, 9, 9]);
+    } finally {
+      bs.destroy();
+      indexDoc.destroy();
+      localState.destroy();
+    }
+  });
+
   it("downloads startup attachments in parallel within count and byte limits", async () => {
     const { plugin, vault } = makeFakePlugin(harness.authUrl, {
       sessionToken: token,

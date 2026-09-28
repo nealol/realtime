@@ -233,7 +233,13 @@ export class BinarySync {
       if (this.urgentPaths.has(job.path)) job.urgent = true;
     }
     this.uploadQueue.sort((left, right) => Number(right.urgent) - Number(left.urgent));
-    for (const path of added) void this.reconcile(path);
+    for (const path of added) {
+      // Until the startup pass has run, a file missing locally means "not
+      // pulled yet", never "deleted here": give the early reconcile the same
+      // semantics instead of publishing a delete from a stale baseline.
+      if (!this.started || this.pullingMissingRemote) this.deferredInitialPulls.add(path);
+      void this.reconcile(path);
+    }
     this.scheduleDrain();
   }
 
