@@ -1116,6 +1116,68 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("downloads images embedded in the open note ahead of the background pass", async () => {
+    const vault = await harness.createVault(aliceToken, "open-note-embeds");
+    const vaultId = vault.id;
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vaultId,
+    });
+    const upload = async (path: string, data: Uint8Array) => {
+      const buffer = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+      const hash = await sha256Hex(buffer as ArrayBuffer);
+      const response = await fetch(
+        `${harness.authUrl}/api/vaults/${vaultId}/blobs/${hash}?path=${encodeURIComponent(path)}`,
+        {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${aliceToken}`,
+            "Content-Type": "application/octet-stream",
+          },
+          body: data,
+        },
+      );
+      expect(response.status).toBe(200);
+      return { hash, size: data.byteLength };
+    };
+    const peer = makeIndexPeer(plugin, vaultId);
+    await waitFor(() => peer.provider.status === "connected", { label: "index peer connected" });
+    const embedded = await upload("Attachments/pic.png", new Uint8Array([1, 2, 3]));
+    const unrelated = await upload("Attachments/other.png", new Uint8Array([4, 5, 6]));
+    peer.doc.transact(() => {
+      peer.doc.getMap("binaries").set("Attachments/pic.png", embedded);
+      peer.doc.getMap("binaries").set("Attachments/other.png", unrelated);
+    });
+    await waitFor(() => !peer.provider.hasLocalChanges, { label: "binary entries acknowledged" });
+
+    localVault.files.set("Daily/today.md", "# Today\n\n![[pic.png|200]]\n");
+    (plugin.app as any).workspace = {
+      on: () => ({}),
+      getActiveFile: () => new TFile("Daily/today.md"),
+      iterateAllLeaves: () => {},
+    };
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    // Keep the background binary pass from running, so only the open-note
+    // prioritization can bring the image down.
+    (sync as any).startBackgroundSyncAfterPriorityDrain = () => {};
+    try {
+      await waitFor(() => localVault.binaries.has("Attachments/pic.png"), {
+        timeout: 20_000,
+        label: "embedded image downloaded",
+      });
+      expect([...new Uint8Array(localVault.binaries.get("Attachments/pic.png")!)]).toEqual([
+        1, 2, 3,
+      ]);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(localVault.binaries.has("Attachments/other.png")).toBe(false);
+    } finally {
+      sync.destroy();
+      peer.provider.destroy();
+      peer.doc.destroy();
+    }
+  });
+
   it("restores missing paths and preserves offline rename targets", async () => {
     const vault = await harness.createVault(aliceToken, "offline-path-changes");
     const vaultId = vault.id;

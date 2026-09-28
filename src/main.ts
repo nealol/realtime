@@ -210,6 +210,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
         this.vaultSync?.reconnectAll();
         const file = this.app.workspace.getActiveFile();
         if (file) this.vaultSync?.prioritizeItem({ path: file.path });
+        this.vaultSync?.prioritizeOpenNoteAttachments();
         this.vaultSync?.bindOpenCanvases();
         this.vaultSync?.bindOpenBases();
         // Canvas views may not have their private `canvas` object ready when
@@ -229,6 +230,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
         const file = this.app.workspace.getActiveFile();
         if (file) void this.recordRecentPath(file.path);
         if (file) this.vaultSync?.prioritizeItem({ path: file.path });
+        this.vaultSync?.prioritizeOpenNoteAttachments();
         this.vaultSync?.bindOpenCanvases();
         this.vaultSync?.bindOpenBases();
       }),
@@ -242,6 +244,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
         if (layoutBindTimer !== null) window.clearTimeout(layoutBindTimer);
         layoutBindTimer = window.setTimeout(() => {
           layoutBindTimer = null;
+          this.vaultSync?.prioritizeOpenNoteAttachments();
           this.vaultSync?.bindOpenCanvases();
           this.vaultSync?.bindOpenBases();
         }, 200);

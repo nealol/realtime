@@ -28,6 +28,7 @@ import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
 export { isConflictCopy } from "./conflictRecovery";
 import { sha256Text } from "./hash";
 import { ensureParentFolder } from "./vaultHelpers";
+import { embeddedLinkpaths, resolveAttachmentLink } from "./noteAttachments";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -139,6 +140,18 @@ export class VaultSync {
   private wasConnected = false;
 
   private filesObserver: (event: Y.YMapEvent<string>) => void;
+  /** Attachments embedded in open notes, currently prioritized for download. */
+  private noteAttachmentPaths = new Set<string>();
+  /** Attachments currently prioritized by open Canvas views. */
+  private canvasAttachmentPaths = new Set<string>();
+  private noteAttachmentTimer: number | null = null;
+  private noteAttachmentGeneration = 0;
+  /** An open note embeds an attachment the binary index does not list yet. */
+  private noteAttachmentsUnresolved = false;
+  private binaryBaselineSeeded = false;
+  private readonly binariesObserver = (): void => {
+    if (this.noteAttachmentsUnresolved) this.prioritizeOpenNoteAttachments();
+  };
   private structuredObserver: (event: Y.YMapEvent<StructuredMeta>) => void;
   private statusListener: (status: SyncStatus) => void;
   private vaultEvents: EventRef[] = [];
@@ -225,6 +238,7 @@ export class VaultSync {
 
     this.filesObserver = this.onFilesChanged.bind(this);
     this.files.observe(this.filesObserver);
+    this.indexDoc.getMap("binaries").observe(this.binariesObserver);
     this.structuredObserver = this.onStructuredChanged.bind(this);
     this.structured.observe(this.structuredObserver);
 
@@ -286,6 +300,8 @@ export class VaultSync {
     // Capture the persisted (pre-remote-merge) binary baseline before connecting.
     this.binarySync.seedBaseline();
     this.configSync.seedBaseline();
+    this.binaryBaselineSeeded = true;
+    this.prioritizeOpenNoteAttachments();
     if (!this.mobileSuspended) void this.connectIndexAfterCompatibilityCheck();
   }
 
@@ -443,11 +459,82 @@ export class VaultSync {
   }
 
   prioritizeCanvasAttachments(paths: Iterable<string>): void {
-    this.binarySync.prioritizePaths(paths);
+    const added = [...paths];
+    for (const path of added) this.canvasAttachmentPaths.add(path);
+    this.binarySync.prioritizePaths(added);
   }
 
   unprioritizeCanvasAttachments(paths: Iterable<string>): void {
-    this.binarySync.unprioritizePaths(paths);
+    const removed = [...paths];
+    for (const path of removed) this.canvasAttachmentPaths.delete(path);
+    this.binarySync.unprioritizePaths(
+      removed.filter((path) => !this.noteAttachmentPaths.has(path)),
+    );
+  }
+
+  /**
+   * Download the attachments embedded in open notes ahead of the startup
+   * binary pass, which otherwise waits for every prioritized note (on a fresh
+   * device, all of them) and leaves the open note's images broken meanwhile.
+   * Debounced; safe to call on every workspace or open-note change.
+   */
+  prioritizeOpenNoteAttachments(): void {
+    if (this.destroyed || this.noteAttachmentTimer !== null) return;
+    this.noteAttachmentTimer = window.setTimeout(() => {
+      this.noteAttachmentTimer = null;
+      void this.refreshNoteAttachments().catch((error) => {
+        console.error("[Realtime] failed to prioritize note attachments", error);
+      });
+    }, 150);
+  }
+
+  private openMarkdownPaths(): Set<string> {
+    const paths = new Set<string>();
+    const add = (file: TFile | null | undefined) => {
+      if (file?.extension === "md") paths.add(file.path);
+    };
+    add((this.plugin.app.workspace as any).getActiveFile?.());
+    (this.plugin.app.workspace as any).iterateAllLeaves?.((leaf: any) => add(leaf?.view?.file));
+    return paths;
+  }
+
+  private async refreshNoteAttachments(): Promise<void> {
+    if (this.destroyed || !this.binaryBaselineSeeded) return;
+    const generation = ++this.noteAttachmentGeneration;
+    const candidates = this.canvasBinaryPaths(this.binarySync.remotePaths());
+    const next = new Set<string>();
+    let unresolved = false;
+    for (const notePath of this.openMarkdownPaths()) {
+      const resident = this.documents.get(notePath);
+      const file = this.plugin.app.vault.getAbstractFileByPath(notePath);
+      const text = resident
+        ? resident.content
+        : file instanceof TFile
+          ? await this.plugin.app.vault.read(file)
+          : "";
+      if (this.destroyed || generation !== this.noteAttachmentGeneration) return;
+      for (const link of embeddedLinkpaths(text)) {
+        const target = resolveAttachmentLink(link, notePath, candidates);
+        if (target) {
+          next.add(target);
+        } else if (
+          !/\.md$/i.test(link) &&
+          /\.[a-z0-9]+$/i.test(link) &&
+          !this.plugin.app.metadataCache?.getFirstLinkpathDest?.(link, notePath)
+        ) {
+          // Likely an attachment whose index entry has not arrived yet.
+          unresolved = true;
+        }
+      }
+    }
+    this.noteAttachmentsUnresolved = unresolved;
+    const added = [...next].filter((path) => !this.noteAttachmentPaths.has(path));
+    const removed = [...this.noteAttachmentPaths].filter(
+      (path) => !next.has(path) && !this.canvasAttachmentPaths.has(path),
+    );
+    this.noteAttachmentPaths = next;
+    this.binarySync.unprioritizePaths(removed);
+    this.binarySync.prioritizePaths(added);
   }
 
   canvasBinaryPaths(paths: Iterable<string>): string[] {
@@ -1780,6 +1867,15 @@ export class VaultSync {
 
   private onLocalModify(file: TAbstractFile): void {
     if (this.destroyed) return;
+    // An open note's embeds can change as the user edits it, or as its synced
+    // content first reaches disk on a fresh device.
+    if (
+      file instanceof TFile &&
+      file.extension === "md" &&
+      this.openMarkdownPaths().has(file.path)
+    ) {
+      this.prioritizeOpenNoteAttachments();
+    }
     if (!this.initialSynced) {
       const version = this.bumpPathVersion(file.path);
       this.bootstrapVaultEvents.push({ type: "modify", file, version });
@@ -2013,6 +2109,11 @@ export class VaultSync {
     this.localSyncState.destroy();
     this.files.unobserve(this.filesObserver);
     this.structured.unobserve(this.structuredObserver);
+    this.indexDoc.getMap("binaries").unobserve(this.binariesObserver);
+    if (this.noteAttachmentTimer !== null) {
+      window.clearTimeout(this.noteAttachmentTimer);
+      this.noteAttachmentTimer = null;
+    }
     this.indexProvider.off(SYNC_EVENT_STATUS, this.statusListener);
     this.indexProvider.off(SYNC_EVENT_DOCUMENT_INVALIDATED, this.invalidationListener);
     if (this.mobileTrimTimer !== null) {
