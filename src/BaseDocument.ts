@@ -1,4 +1,5 @@
 import type RealtimePlugin from "./main";
+import type { DocumentBootstrapOptions } from "./SyncedDoc";
 import { StructuredDocument } from "./StructuredDocument";
 import { BaseBinding, BASE_LOCAL_ORIGIN } from "./editor/BaseBinding";
 import { parseBase, serializeBase } from "./structured/base";
@@ -13,7 +14,7 @@ export class BaseDocument extends StructuredDocument {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
+    opts: DocumentBootstrapOptions = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.binding = new BaseBinding(plugin, this);

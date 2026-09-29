@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import {
+  jsonContains,
   mergeStructuredStartup,
   mergeStructuredStartupResult,
   reconcileInto,
@@ -343,9 +344,17 @@ describe("canvas concurrent merge", () => {
       edges: [],
     });
 
-    expect(canvasNodes(doc2.getMap("root")).map((n) => n.id).sort()).toEqual(["n1", "n3"]);
+    expect(
+      canvasNodes(doc2.getMap("root"))
+        .map((n) => n.id)
+        .sort(),
+    ).toEqual(["n1", "n3"]);
     Y.applyUpdate(doc1, Y.encodeStateAsUpdate(doc2));
-    expect(canvasNodes(doc1.getMap("root")).map((n) => n.id).sort()).toEqual(["n1", "n3"]);
+    expect(
+      canvasNodes(doc1.getMap("root"))
+        .map((n) => n.id)
+        .sort(),
+    ).toEqual(["n1", "n3"]);
   });
 });
 
@@ -353,5 +362,19 @@ describe("base serializer", () => {
   it("round-trips YAML values", () => {
     const value = parseBase("views:\n  - type: table\n    filter: status == 'open'\n");
     expect(parseBase(serializeBase(value))).toEqual(value);
+  });
+});
+
+describe("jsonContains", () => {
+  it("accepts supersets of records and ordered arrays", () => {
+    const empty = parseCanvas("");
+    const filled = parseCanvas(
+      JSON.stringify({ nodes: [{ id: "a", type: "text", text: "hi" }], edges: [] }),
+    );
+    expect(jsonContains(filled, empty)).toBe(true);
+    expect(jsonContains(empty, filled)).toBe(false);
+    expect(jsonContains({ views: [1, 2, 3], extra: true }, { views: [1, 3] })).toBe(true);
+    expect(jsonContains({ views: [1, 2, 3] }, { views: [3, 1] })).toBe(false);
+    expect(jsonContains({ a: { b: 1, c: 2 } }, { a: { b: 2 } })).toBe(false);
   });
 });

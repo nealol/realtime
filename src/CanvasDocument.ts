@@ -1,4 +1,5 @@
 import type RealtimePlugin from "./main";
+import type { DocumentBootstrapOptions } from "./SyncedDoc";
 import * as Y from "yjs";
 import { StructuredDocument, DISK_ORIGIN } from "./StructuredDocument";
 import { CanvasBinding, CANVAS_LOCAL_ORIGIN } from "./editor/CanvasBinding";
@@ -28,7 +29,7 @@ export class CanvasDocument extends StructuredDocument {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
+    opts: DocumentBootstrapOptions = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.binding = new CanvasBinding(plugin, this);

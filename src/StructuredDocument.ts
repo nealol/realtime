@@ -1,9 +1,10 @@
 import * as Y from "yjs";
 import { Notice, normalizePath, TFile } from "obsidian";
 import type RealtimePlugin from "./main";
-import { SyncedDoc } from "./SyncedDoc";
+import { SyncedDoc, type DocumentBootstrapOptions } from "./SyncedDoc";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import {
+  jsonContains,
   mergeStructuredStartupResult,
   reconcileInto,
   toValue,
@@ -11,6 +12,7 @@ import {
 } from "./structured/reconcile";
 import { preserveTextConflict } from "./conflictRecovery";
 import { sha256Text } from "./hash";
+import { getDocumentEpoch } from "./documentEpoch";
 
 export const DISK_ORIGIN = Symbol("realtime-structured-disk");
 
@@ -24,7 +26,8 @@ export abstract class StructuredDocument extends SyncedDoc {
   /** True only after startup content is durably present on this device. */
   private startupReady = false;
   private startupReconciling = false;
-  private readonly forceBootstrapConflict: boolean;
+  private forceBootstrapConflict: boolean;
+  private readonly staleLocalFingerprint: string | null;
   private baselineAtStartup: JsonValue = {};
   private baselineTextAtStartup = "";
   private diskAtStartup: JsonValue | null = null;
@@ -38,10 +41,11 @@ export abstract class StructuredDocument extends SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
+    opts: DocumentBootstrapOptions = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.forceBootstrapConflict = opts.forceBootstrapConflict ?? false;
+    this.staleLocalFingerprint = opts.staleLocalFingerprint ?? null;
     this.root = this.ydoc.getMap("root");
     this.rootObserver = (_events, txn) => this.onRootChanged(txn?.origin);
     this.root.observeDeep(this.rootObserver);
@@ -81,9 +85,16 @@ export abstract class StructuredDocument extends SyncedDoc {
     this.baselineAtStartup = this.value;
     this.baselineTextAtStartup = this.serialize(this.baselineAtStartup);
     const disk = await this.readParsedFromDisk();
+    let stale = false;
+    if (disk !== null && this.staleLocalFingerprint !== null) {
+      stale = (await sha256Text(this.serialize(disk))) === this.staleLocalFingerprint;
+    }
     this.diskAtStartup = disk;
+    // An untouched copy of a file deleted remotely (and since re-created at
+    // this path) is not a local change: let the new document replace it.
+    if (stale) this.forceBootstrapConflict = false;
     this.localChangedAtStartup =
-      disk !== null && this.serialize(disk) !== this.baselineTextAtStartup;
+      disk !== null && !stale && this.serialize(disk) !== this.baselineTextAtStartup;
   }
 
   protected async finishStartupReconcile(): Promise<void> {
@@ -97,12 +108,14 @@ export abstract class StructuredDocument extends SyncedDoc {
           this.diskAtStartup !== null &&
           (this.localChangedAtStartup || this.forceBootstrapConflict)
         ) {
-          const merge = this.forceBootstrapConflict
-            ? {
-                value: this.diskAtStartup,
-                conflicted: this.serialize(this.diskAtStartup) !== this.serialize(remote),
-              }
-            : mergeStructuredStartupResult(this.baselineAtStartup, this.diskAtStartup, remote);
+          const merge =
+            this.mergeWithoutSharedBaseline(this.diskAtStartup, remote) ??
+            (this.forceBootstrapConflict
+              ? {
+                  value: this.diskAtStartup,
+                  conflicted: this.serialize(this.diskAtStartup) !== this.serialize(remote),
+                }
+              : mergeStructuredStartupResult(this.baselineAtStartup, this.diskAtStartup, remote));
           if (merge.conflicted) {
             const preservedPath = await preserveTextConflict(
               this.plugin,
@@ -155,6 +168,33 @@ export abstract class StructuredDocument extends SyncedDoc {
         window.setTimeout(() => void this.finishStartupReconcile(), 2_000);
       }
     }
+  }
+
+  /**
+   * Without a shared baseline (an unrelated local file, or the same file
+   * created independently on two devices, e.g. an empty canvas from a plugin),
+   * take whichever side already contains the other instead of letting the
+   * local copy overwrite the remote. The local superset is not taken after an
+   * epoch rollover, where the remote may have removed content on purpose.
+   */
+  private mergeWithoutSharedBaseline(
+    disk: JsonValue,
+    remote: JsonValue,
+  ): { value: JsonValue; conflicted: boolean } | null {
+    const baselineEmpty = this.baselineTextAtStartup === this.serialize(this.parse(""));
+    if (!this.forceBootstrapConflict && !baselineEmpty) return null;
+    // Compare file-level shapes; the CRDT value also carries internal state
+    // (e.g. canvas tombstone maps) that never reaches disk.
+    const diskShape = this.parse(this.serialize(disk));
+    const remoteShape = this.parse(this.serialize(remote));
+    if (jsonContains(remoteShape, diskShape)) return { value: remote, conflicted: false };
+    if (
+      getDocumentEpoch(this.plugin, this.serverDocId) === 0 &&
+      jsonContains(diskShape, remoteShape)
+    ) {
+      return { value: disk, conflicted: false };
+    }
+    return null;
   }
 
   protected async afterChangesSynced(): Promise<void> {

@@ -100,3 +100,40 @@ export function mergeText(
   output.push(...base.slice(offset));
   return { kind: "merged", content: output.join("") };
 }
+
+function contentLines(text: string): string[] {
+  return lines(text)
+    .map((line) => line.replace(/\r?\n$/, ""))
+    .filter((line) => line.trim().length > 0);
+}
+
+/** True when every non-blank line of `inner` appears in `outer`, in order. */
+export function containsLines(outer: string, inner: string): boolean {
+  const needles = contentLines(inner);
+  let index = 0;
+  for (const line of contentLines(outer)) {
+    if (index === needles.length) break;
+    if (line === needles[index]) index++;
+  }
+  return index === needles.length;
+}
+
+/**
+ * Two-way merge for texts with no shared history (e.g. the same note created
+ * independently by a plugin on two devices). Picks the side that already
+ * contains every non-blank line of the other, so no content is dropped; any
+ * other divergence is a conflict. `allowLocalSuperset` is off when the remote
+ * may have intentionally removed content (after an epoch rollover).
+ */
+export function mergeWithoutBaseline(
+  localText: string,
+  remoteText: string,
+  allowLocalSuperset: boolean,
+): TextMergeResult {
+  if (localText === remoteText) return { kind: "merged", content: localText };
+  if (containsLines(remoteText, localText)) return { kind: "merged", content: remoteText };
+  if (allowLocalSuperset && containsLines(localText, remoteText)) {
+    return { kind: "merged", content: localText };
+  }
+  return { kind: "conflict" };
+}

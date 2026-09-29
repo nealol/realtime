@@ -18,6 +18,7 @@ import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
 import type { StructuredDocument } from "./StructuredDocument";
+import type { DocumentBootstrapOptions } from "./SyncedDoc";
 import { BinarySync, type BinaryMeta } from "./BinarySync";
 import { ConfigSync, type ConfigMeta } from "./ConfigSync";
 import { categoryForConfigPath, enabledConfigCategories } from "./configCategories";
@@ -26,6 +27,8 @@ import { LocalSyncState, type MaterializedKind } from "./localSyncState";
 import { isConflictCopy, preserveTextConflict } from "./conflictRecovery";
 export { isConflictCopy } from "./conflictRecovery";
 import { sha256Text } from "./hash";
+import { ensureParentFolder } from "./vaultHelpers";
+import { embeddedLinkpaths, resolveAttachmentLink } from "./noteAttachments";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -137,6 +140,18 @@ export class VaultSync {
   private wasConnected = false;
 
   private filesObserver: (event: Y.YMapEvent<string>) => void;
+  /** Attachments embedded in open notes, currently prioritized for download. */
+  private noteAttachmentPaths = new Set<string>();
+  /** Attachments currently prioritized by open Canvas views. */
+  private canvasAttachmentPaths = new Set<string>();
+  private noteAttachmentTimer: number | null = null;
+  private noteAttachmentGeneration = 0;
+  /** An open note embeds an attachment the binary index does not list yet. */
+  private noteAttachmentsUnresolved = false;
+  private binaryBaselineSeeded = false;
+  private readonly binariesObserver = (): void => {
+    if (this.noteAttachmentsUnresolved) this.prioritizeOpenNoteAttachments();
+  };
   private structuredObserver: (event: Y.YMapEvent<StructuredMeta>) => void;
   private statusListener: (status: SyncStatus) => void;
   private vaultEvents: EventRef[] = [];
@@ -167,6 +182,8 @@ export class VaultSync {
   >();
   private remoteDeletePreserved = new Set<string>();
   private remoteDeletesApplying = new Set<string>();
+  /** Old path → new path for remote renames being applied to the vault. */
+  private remoteRenamesApplying = new Map<string, string>();
   /** Last explicit user/local activity per path; used for mobile LRU eviction. */
   private mobileLastUsedAt = new Map<string, number>();
   private mobileTrimTimer: number | null = null;
@@ -221,6 +238,7 @@ export class VaultSync {
 
     this.filesObserver = this.onFilesChanged.bind(this);
     this.files.observe(this.filesObserver);
+    this.indexDoc.getMap("binaries").observe(this.binariesObserver);
     this.structuredObserver = this.onStructuredChanged.bind(this);
     this.structured.observe(this.structuredObserver);
 
@@ -282,6 +300,8 @@ export class VaultSync {
     // Capture the persisted (pre-remote-merge) binary baseline before connecting.
     this.binarySync.seedBaseline();
     this.configSync.seedBaseline();
+    this.binaryBaselineSeeded = true;
+    this.prioritizeOpenNoteAttachments();
     if (!this.mobileSuspended) void this.connectIndexAfterCompatibilityCheck();
   }
 
@@ -439,11 +459,82 @@ export class VaultSync {
   }
 
   prioritizeCanvasAttachments(paths: Iterable<string>): void {
-    this.binarySync.prioritizePaths(paths);
+    const added = [...paths];
+    for (const path of added) this.canvasAttachmentPaths.add(path);
+    this.binarySync.prioritizePaths(added);
   }
 
   unprioritizeCanvasAttachments(paths: Iterable<string>): void {
-    this.binarySync.unprioritizePaths(paths);
+    const removed = [...paths];
+    for (const path of removed) this.canvasAttachmentPaths.delete(path);
+    this.binarySync.unprioritizePaths(
+      removed.filter((path) => !this.noteAttachmentPaths.has(path)),
+    );
+  }
+
+  /**
+   * Download the attachments embedded in open notes ahead of the startup
+   * binary pass, which otherwise waits for every prioritized note (on a fresh
+   * device, all of them) and leaves the open note's images broken meanwhile.
+   * Debounced; safe to call on every workspace or open-note change.
+   */
+  prioritizeOpenNoteAttachments(): void {
+    if (this.destroyed || this.noteAttachmentTimer !== null) return;
+    this.noteAttachmentTimer = window.setTimeout(() => {
+      this.noteAttachmentTimer = null;
+      void this.refreshNoteAttachments().catch((error) => {
+        console.error("[Realtime] failed to prioritize note attachments", error);
+      });
+    }, 150);
+  }
+
+  private openMarkdownPaths(): Set<string> {
+    const paths = new Set<string>();
+    const add = (file: TFile | null | undefined) => {
+      if (file?.extension === "md") paths.add(file.path);
+    };
+    add((this.plugin.app.workspace as any).getActiveFile?.());
+    (this.plugin.app.workspace as any).iterateAllLeaves?.((leaf: any) => add(leaf?.view?.file));
+    return paths;
+  }
+
+  private async refreshNoteAttachments(): Promise<void> {
+    if (this.destroyed || !this.binaryBaselineSeeded) return;
+    const generation = ++this.noteAttachmentGeneration;
+    const candidates = this.canvasBinaryPaths(this.binarySync.remotePaths());
+    const next = new Set<string>();
+    let unresolved = false;
+    for (const notePath of this.openMarkdownPaths()) {
+      const resident = this.documents.get(notePath);
+      const file = this.plugin.app.vault.getAbstractFileByPath(notePath);
+      const text = resident
+        ? resident.content
+        : file instanceof TFile
+          ? await this.plugin.app.vault.read(file)
+          : "";
+      if (this.destroyed || generation !== this.noteAttachmentGeneration) return;
+      for (const link of embeddedLinkpaths(text)) {
+        const target = resolveAttachmentLink(link, notePath, candidates);
+        if (target) {
+          next.add(target);
+        } else if (
+          !/\.md$/i.test(link) &&
+          /\.[a-z0-9]+$/i.test(link) &&
+          !this.plugin.app.metadataCache?.getFirstLinkpathDest?.(link, notePath)
+        ) {
+          // Likely an attachment whose index entry has not arrived yet.
+          unresolved = true;
+        }
+      }
+    }
+    this.noteAttachmentsUnresolved = unresolved;
+    const added = [...next].filter((path) => !this.noteAttachmentPaths.has(path));
+    const removed = [...this.noteAttachmentPaths].filter(
+      (path) => !next.has(path) && !this.canvasAttachmentPaths.has(path),
+    );
+    this.noteAttachmentPaths = next;
+    this.binarySync.unprioritizePaths(removed);
+    this.binarySync.prioritizePaths(added);
   }
 
   canvasBinaryPaths(paths: Iterable<string>): string[] {
@@ -600,12 +691,12 @@ export class VaultSync {
       const kind = this.classify(file);
       if (kind === "text" && !this.localSyncState.has(file.path)) {
         const fingerprint = await sha256Text(await this.plugin.app.vault.read(file));
-        this.localSyncState.beginCandidate(file.path, "text", null, fingerprint);
+        this.beginUntrackedCandidate(file.path, "text", fingerprint);
       } else if (kind === "structured" && !this.localSyncState.has(file.path)) {
         const structuredKind = this.structuredKindForExtension(file.extension);
         if (structuredKind) {
           const fingerprint = await sha256Text(await this.plugin.app.vault.read(file));
-          this.localSyncState.beginCandidate(file.path, structuredKind, null, fingerprint);
+          this.beginUntrackedCandidate(file.path, structuredKind, fingerprint);
         }
       }
     }
@@ -1140,6 +1231,14 @@ export class VaultSync {
         kind === "text" ? this.files.has(path) : this.structured.has(path);
       if (wasReintroduced()) return;
       const file = this.plugin.app.vault.getAbstractFileByPath(path);
+      if (
+        file instanceof TFile &&
+        !this.remoteDeletePreserved.has(path) &&
+        deletedIdentity &&
+        (await this.applyRemoteRename(path, kind, deletedIdentity, wasReintroduced))
+      ) {
+        return;
+      }
       if (file instanceof TFile && !this.remoteDeletePreserved.has(path)) {
         const textDocument = this.documents.get(path);
         const structuredDocument = this.structuredDocuments.get(path);
@@ -1195,6 +1294,70 @@ export class VaultSync {
     }
   }
 
+  /**
+   * The index publishes a rename as delete(old) + set(new) with the same guid.
+   * Applying that literally deletes the old file and materializes the new one
+   * from the CRDT, so any local edits the server has not acknowledged (e.g.
+   * made while sync was stopped) land in a conflict copy. When the guid now
+   * lives at a path that does not exist locally, move the file instead: the
+   * document at the new path then merges those edits against its baseline.
+   */
+  private async applyRemoteRename(
+    from: string,
+    kind: "text" | StructuredKind,
+    guid: string,
+    wasReintroduced: () => boolean,
+  ): Promise<boolean> {
+    const to = this.pathForGuid(guid);
+    if (!to || to === from || this.localFileExists(to)) return false;
+    const target = kind === "text" ? this.files.get(to) : this.structured.get(to);
+    const targetKind = kind === "text" ? "text" : isStructuredMeta(target) ? target.kind : null;
+    if (targetKind !== kind) return false;
+    const pending = kind === "text" ? this.documents.get(to) : this.structuredDocuments.get(to);
+    // A ready document at the target has already materialized its content.
+    if (pending?.isReady()) return false;
+
+    await ensureParentFolder(this.plugin.app, to);
+    const current = this.plugin.app.vault.getAbstractFileByPath(from);
+    if (
+      this.destroyed ||
+      wasReintroduced() ||
+      this.localFileExists(to) ||
+      !(current instanceof TFile) ||
+      this.pathForGuid(guid) !== to
+    ) {
+      return false;
+    }
+    this.removeDocument(from);
+    this.removeStructuredDocument(from);
+    // A target document that already read its (then missing) disk file must
+    // start over so it sees the moved content.
+    if (pending) {
+      if (kind === "text") this.removeDocument(to);
+      else this.removeStructuredDocument(to);
+    }
+    this.bumpPathVersion(from);
+    this.bumpPathVersion(to);
+    this.localSyncState.move(from, to, kind);
+    this.remoteRenamesApplying.set(from, to);
+    try {
+      await this.plugin.app.vault.rename(current, to);
+    } catch (error) {
+      this.remoteRenamesApplying.delete(from);
+      this.localSyncState.move(to, from, kind);
+      throw error;
+    }
+    // Obsidian reports the rename synchronously; the timeout only bounds a
+    // late event so it can never suppress a later user rename.
+    window.setTimeout(() => {
+      if (this.remoteRenamesApplying.get(from) === to) this.remoteRenamesApplying.delete(from);
+    }, 1_000);
+    if (this.destroyed) return true;
+    this.enqueueDoc({ path: to, guid, kind }, true);
+    this.pumpDocQueue();
+    return true;
+  }
+
   private rematerializeReintroducedPath(path: string): void {
     const guid = this.files.get(path);
     if (guid) {
@@ -1222,15 +1385,39 @@ export class VaultSync {
     if (existing) this.removeDocument(path);
 
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
-    const doc = new Document(this.plugin, path, guid, serverDocId, isCreator, {
-      autoConnect: autoConnect && !this.mobileSuspended,
-      forceBootstrapConflict:
-        this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
-    });
+    const doc = new Document(
+      this.plugin,
+      path,
+      guid,
+      serverDocId,
+      isCreator,
+      this.bootstrapOptions(path, guid, autoConnect),
+    );
     this.documents.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
     this.scheduleMobileWorkingSetTrim(1_000);
     return doc;
+  }
+
+  private bootstrapOptions(
+    path: string,
+    guid: string,
+    autoConnect: boolean,
+  ): DocumentBootstrapOptions {
+    const identityConflict =
+      this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid);
+    const state = identityConflict ? this.localSyncState.get(path) : null;
+    // The previous identity was acknowledged and has left the index (deleted,
+    // not moved): an unchanged local copy is safe to replace.
+    const staleLocalFingerprint =
+      state?.identity && !state.candidate && state.fingerprint && !this.pathForGuid(state.identity)
+        ? state.fingerprint
+        : null;
+    return {
+      autoConnect: autoConnect && !this.mobileSuspended,
+      forceBootstrapConflict: identityConflict,
+      staleLocalFingerprint,
+    };
   }
 
   /** Best-effort: keep the server's guid → path registry current (for ACLs). */
@@ -1259,18 +1446,11 @@ export class VaultSync {
     if (existing) this.removeStructuredDocument(path);
 
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
+    const options = this.bootstrapOptions(path, guid, autoConnect);
     const doc =
       kind === "canvas"
-        ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator, {
-            autoConnect: autoConnect && !this.mobileSuspended,
-            forceBootstrapConflict:
-              this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
-          })
-        : new BaseDocument(this.plugin, path, guid, serverDocId, isCreator, {
-            autoConnect: autoConnect && !this.mobileSuspended,
-            forceBootstrapConflict:
-              this.localFileExists(path) && this.localSyncState.hasIdentityConflict(path, guid),
-          });
+        ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator, options)
+        : new BaseDocument(this.plugin, path, guid, serverDocId, isCreator, options);
     this.structuredDocuments.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
     this.scheduleMobileWorkingSetTrim(1_000);
@@ -1422,6 +1602,18 @@ export class VaultSync {
     return kind;
   }
 
+  /**
+   * Record a local file with no accepted identity yet. Callers check
+   * `has(path)` before hashing, but the hash awaits a disk read: a document
+   * materializing a remote file (whose vault.create echoes back here) commits
+   * its identity meanwhile. Overwriting that with `null` would turn every later
+   * remote change into a forced bootstrap conflict for the file.
+   */
+  private beginUntrackedCandidate(path: string, kind: MaterializedKind, fingerprint: string): void {
+    if (this.localSyncState.has(path)) return;
+    this.localSyncState.beginCandidate(path, kind, null, fingerprint);
+  }
+
   private onLocalCreate(file: TAbstractFile): void {
     if (this.destroyed) return;
     if (!this.initialSynced) {
@@ -1447,7 +1639,7 @@ export class VaultSync {
         ) {
           return;
         }
-        this.localSyncState.beginCandidate(path, "text", null, fingerprint);
+        this.beginUntrackedCandidate(path, "text", fingerprint);
       }
     } else if (kind === "structured" && file instanceof TFile) {
       const structuredKind = this.structuredKindForExtension(file.extension);
@@ -1460,7 +1652,7 @@ export class VaultSync {
         ) {
           return;
         }
-        this.localSyncState.beginCandidate(path, structuredKind, null, fingerprint);
+        this.beginUntrackedCandidate(path, structuredKind, fingerprint);
       }
     }
     if (kind === "binary") {
@@ -1551,6 +1743,11 @@ export class VaultSync {
   }
 
   private onLocalRename(file: TAbstractFile, oldPath: string): void {
+    if (this.remoteRenamesApplying.get(oldPath) === file.path) {
+      // Our own application of a remote rename; the index already has it.
+      this.remoteRenamesApplying.delete(oldPath);
+      return;
+    }
     if (!this.initialSynced) {
       const oldVersion = this.bumpPathVersion(oldPath);
       const newVersion = this.bumpPathVersion(file.path);
@@ -1670,6 +1867,15 @@ export class VaultSync {
 
   private onLocalModify(file: TAbstractFile): void {
     if (this.destroyed) return;
+    // An open note's embeds can change as the user edits it, or as its synced
+    // content first reaches disk on a fresh device.
+    if (
+      file instanceof TFile &&
+      file.extension === "md" &&
+      this.openMarkdownPaths().has(file.path)
+    ) {
+      this.prioritizeOpenNoteAttachments();
+    }
     if (!this.initialSynced) {
       const version = this.bumpPathVersion(file.path);
       this.bootstrapVaultEvents.push({ type: "modify", file, version });
@@ -1903,6 +2109,11 @@ export class VaultSync {
     this.localSyncState.destroy();
     this.files.unobserve(this.filesObserver);
     this.structured.unobserve(this.structuredObserver);
+    this.indexDoc.getMap("binaries").unobserve(this.binariesObserver);
+    if (this.noteAttachmentTimer !== null) {
+      window.clearTimeout(this.noteAttachmentTimer);
+      this.noteAttachmentTimer = null;
+    }
     this.indexProvider.off(SYNC_EVENT_STATUS, this.statusListener);
     this.indexProvider.off(SYNC_EVENT_DOCUMENT_INVALIDATED, this.invalidationListener);
     if (this.mobileTrimTimer !== null) {

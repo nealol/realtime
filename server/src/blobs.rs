@@ -21,6 +21,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
+use yrs::{Any, Map, Out, ReadTxn, Transact};
 
 use crate::crdt::Level;
 use crate::error::{AppError, AppResult};
@@ -92,16 +93,25 @@ async fn blob_matches_path(
     path: &str,
     hash: &str,
 ) -> AppResult<bool> {
-    let update = crate::ydoc::read_update(state, vault_id).await?;
-    let mut entries = crate::ydoc::decode_binaries_entries(&update)
-        .map_err(|error| AppError::Internal(error.to_string()))?;
-    entries.extend(
-        crate::ydoc::decode_config_entries(&update)
-            .map_err(|error| AppError::Internal(error.to_string()))?,
-    );
-    Ok(entries
-        .iter()
-        .any(|entry| entry.path == path && entry.hash == hash))
+    // Point lookup in the live index doc. Encoding and re-decoding the whole
+    // index per request cost O(vault size) on every blob download.
+    state
+        .documents
+        .read_with(vault_id, |doc| {
+            let txn = doc.transact();
+            ["binaries", "configFiles"].into_iter().any(|name| {
+                let Some(map) = txn.get_map(name) else {
+                    return false;
+                };
+                matches!(
+                    map.get(&txn, path),
+                    Some(Out::Any(Any::Map(meta)))
+                        if matches!(meta.get("hash"), Some(Any::String(value)) if value.as_ref() == hash)
+                )
+            })
+        })
+        .await
+        .map_err(AppError::from)
 }
 
 /// `HEAD /api/vaults/{id}/blobs/{hash}` — 200 if present, 404 otherwise. Lets the

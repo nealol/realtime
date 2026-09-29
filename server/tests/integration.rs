@@ -2444,6 +2444,101 @@ async fn blob_put_head_get_roundtrip() {
 }
 
 #[tokio::test]
+async fn path_scoped_blob_get_checks_the_index_entry() {
+    let (app, state) = test_app_with_state().await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    let image = b"png bytes".to_vec();
+    let image_hash = sha256_hex(&image);
+    let config = b"{\"theme\":\"dark\"}".to_vec();
+    let config_hash = sha256_hex(&config);
+    for (hash, bytes) in [(&image_hash, &image), (&config_hash, &config)] {
+        let uri = format!("/api/vaults/{vault_id}/blobs/{hash}");
+        let (status, _) = send_raw(&app, "PUT", &uri, Some(&alice), bytes.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    state
+        .documents
+        .apply_update(
+            &vault_id,
+            &files_and_binaries_update(&[(
+                "Attachments/pic.png".to_string(),
+                image_hash.clone(),
+                image.len() as i64,
+            )]),
+        )
+        .await
+        .unwrap();
+    {
+        use yrs::{Any, Map, ReadTxn, Transact};
+        let doc = yrs::Doc::new();
+        let configs = doc.get_or_insert_map("configFiles");
+        {
+            let mut txn = doc.transact_mut();
+            let meta = HashMap::from([
+                ("hash".to_string(), Any::String(config_hash.as_str().into())),
+                ("size".to_string(), Any::Number(config.len() as f64)),
+                ("mtime".to_string(), Any::Number(1.0)),
+            ]);
+            configs.insert(&mut txn, ".obsidian/appearance.json", Any::from(meta));
+        }
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        state
+            .documents
+            .apply_update(&vault_id, &update)
+            .await
+            .unwrap();
+    }
+
+    let get = |hash: &str, path: &str| format!("/api/vaults/{vault_id}/blobs/{hash}?path={path}");
+    let (status, got) = send_raw(
+        &app,
+        "GET",
+        &get(&image_hash, "Attachments/pic.png"),
+        Some(&alice),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, image);
+    let (status, got) = send_raw(
+        &app,
+        "GET",
+        &get(&config_hash, ".obsidian/appearance.json"),
+        Some(&alice),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, config);
+
+    // The blob exists, but the path does not reference it.
+    for (hash, path) in [
+        (&image_hash, "Attachments/other.png"),
+        (&config_hash, "Attachments/pic.png"),
+        (&image_hash, ".obsidian/appearance.json"),
+    ] {
+        let (status, _) = send_raw(&app, "GET", &get(hash, path), Some(&alice), vec![]).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{path} must not serve {hash}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn blob_rejects_bad_hash_and_mismatch() {
     let app = test_app().await;
     let alice = login(&app, "alice").await;

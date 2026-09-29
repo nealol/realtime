@@ -91,7 +91,8 @@ export class FakeVault {
   }
 
   /** Test helper: simulate an external/offline edit + the resulting event. */
-  rename(oldPath: string, newPath: string): void {
+  async rename(fileOrPath: TAbstractFile | string, newPath: string): Promise<void> {
+    const oldPath = typeof fileOrPath === "string" ? fileOrPath : fileOrPath.path;
     const content = this.files.get(oldPath) ?? "";
     this.files.delete(oldPath);
     this.files.set(newPath, content);

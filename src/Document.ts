@@ -5,9 +5,9 @@ import { applyTextToYText } from "./diff";
 import { dbg, snip } from "./debug";
 import { ensureParentFolder, getFileByPath, isOpenInEditableMarkdown } from "./vaultHelpers";
 import { openTextConflictModal } from "./TextConflictModal";
-import { SyncedDoc } from "./SyncedDoc";
+import { SyncedDoc, type DocumentBootstrapOptions } from "./SyncedDoc";
 import { preserveTextConflict } from "./conflictRecovery";
-import { mergeText } from "./textMerge";
+import { mergeText, mergeWithoutBaseline } from "./textMerge";
 import { sha256Text } from "./hash";
 import { getDocumentEpoch } from "./documentEpoch";
 
@@ -43,6 +43,8 @@ export class Document extends SyncedDoc {
   private diskAtStartup: string | null = null;
   /** Locally persisted Y.Text content before the first remote sync. */
   private baselineAtStartup = "";
+  /** The startup disk read failed and must succeed before reconciling. */
+  private startupDiskReadPending = false;
   /** Whether the local disk diverged from the baseline at startup. */
   private localChangedAtStartup = false;
   /** Guards the one-time startup merge so reconnects don't re-run it. */
@@ -50,7 +52,8 @@ export class Document extends SyncedDoc {
   /** True only after startup content is durably present on this device. */
   private startupReady = false;
   private startupReconciling = false;
-  private readonly forceBootstrapConflict: boolean;
+  private forceBootstrapConflict: boolean;
+  private readonly staleLocalFingerprint: string | null;
   /** Suppress write-through while IndexedDB is replaying the startup baseline. */
   private startupBaselineCaptured = false;
 
@@ -63,10 +66,11 @@ export class Document extends SyncedDoc {
     guid: string,
     serverDocId: string,
     isCreator: boolean,
-    opts: { autoConnect?: boolean; forceBootstrapConflict?: boolean } = {},
+    opts: DocumentBootstrapOptions = {},
   ) {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.forceBootstrapConflict = opts.forceBootstrapConflict ?? false;
+    this.staleLocalFingerprint = opts.staleLocalFingerprint ?? null;
     this.ytext = this.ydoc.getText("contents");
 
     // ytext changes (local edits from other peers, or our own editor) flow to
@@ -116,16 +120,33 @@ export class Document extends SyncedDoc {
    */
   protected async afterPersistenceSynced(): Promise<void> {
     try {
-      const baseline = this.content;
-      this.baselineAtStartup = baseline;
-      const disk = await this.readFromDisk();
-      this.diskAtStartup = disk;
-      this.localChangedAtStartup = disk !== null && disk !== baseline;
+      this.baselineAtStartup = this.content;
+      await this.captureStartupDisk();
+    } catch (e) {
+      // A failed read is not a missing file. Reconciling as if it were would
+      // overwrite the local note with the (possibly empty) Y.Text; retry the
+      // read before reconciling instead.
+      console.warn(`[Realtime] startup read failed for ${this.path}; will retry`, e);
+      this.startupDiskReadPending = true;
     } finally {
       // Even if the disk read fails, remote Y.Text updates must still be allowed
       // to materialize locally after the provider syncs.
       this.startupBaselineCaptured = true;
     }
+  }
+
+  private async captureStartupDisk(): Promise<void> {
+    const disk = await this.readFromDisk();
+    let stale = false;
+    if (disk !== null && this.staleLocalFingerprint !== null) {
+      stale = (await sha256Text(disk)) === this.staleLocalFingerprint;
+    }
+    this.diskAtStartup = disk;
+    // An untouched copy of a note deleted remotely (and since re-created at
+    // this path) is not a local change: let the new document replace it.
+    if (stale) this.forceBootstrapConflict = false;
+    this.localChangedAtStartup = disk !== null && !stale && disk !== this.baselineAtStartup;
+    this.startupDiskReadPending = false;
   }
 
   /**
@@ -145,6 +166,9 @@ export class Document extends SyncedDoc {
 
     try {
       if (!this.startupReconciled) {
+        // Throws while the file stays unreadable; the catch below retries.
+        if (this.startupDiskReadPending) await this.captureStartupDisk();
+        if (this.destroyed) return;
         const remote = this.content;
         const baseline = this.baselineAtStartup;
         const localDisk = this.diskAtStartup;
@@ -174,9 +198,17 @@ export class Document extends SyncedDoc {
         if (sameDevicePrefixFastForward) {
           this.applyText(localDisk);
         } else if (isConflict) {
-          const merge = this.forceBootstrapConflict
-            ? ({ kind: "conflict" } as const)
+          // Without a shared baseline (an unrelated local file, or a note both
+          // devices created independently — typically by a plugin template),
+          // a diff3 sees two overlapping inserts. Accept whichever side already
+          // contains the other before asking the user.
+          const allowLocalSuperset = getDocumentEpoch(this.plugin, this.serverDocId) === 0;
+          let merge = this.forceBootstrapConflict
+            ? mergeWithoutBaseline(localDisk, remote, allowLocalSuperset)
             : mergeText(baseline, localDisk, remote);
+          if (merge.kind === "conflict" && !this.forceBootstrapConflict && baseline.length === 0) {
+            merge = mergeWithoutBaseline(localDisk, remote, allowLocalSuperset);
+          }
           if (merge.kind === "merged") {
             this.applyText(merge.content);
           } else {

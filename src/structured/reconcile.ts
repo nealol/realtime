@@ -219,6 +219,25 @@ function applyStringToYText(ytext: Y.Text, next: string): void {
   if (insert) ytext.insert(prefix, insert);
 }
 
+/**
+ * True when `outer` already holds everything in `inner`: every record key
+ * with a contained value, and every array element in order. Used to settle
+ * startups without a shared baseline where one side is a superset.
+ */
+export function jsonContains(outer: JsonValue, inner: JsonValue): boolean {
+  if (jsonEqual(outer, inner)) return true;
+  if (Array.isArray(outer) && Array.isArray(inner)) {
+    let index = 0;
+    for (const value of outer) {
+      if (index === inner.length) break;
+      if (jsonEqual(value, inner[index])) index++;
+    }
+    return index === inner.length;
+  }
+  if (!isRecord(outer) || !isRecord(inner)) return false;
+  return Object.keys(inner).every((key) => key in outer && jsonContains(outer[key], inner[key]));
+}
+
 function isRecord(value: unknown): value is Record<string, JsonValue> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

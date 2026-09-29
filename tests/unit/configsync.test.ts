@@ -4,9 +4,11 @@ import {
   ConfigSync,
   decideConfigReconcile,
   mergeJsonSettings,
+  mergeJsonSettingsThreeWay,
   type ConfigMeta,
 } from "../../src/ConfigSync";
 import { LocalSyncState } from "../../src/localSyncState";
+import { sha256Hex } from "../../src/hash";
 import { makeFakePlugin } from "../support/fakePlugin";
 import { freshGuid } from "../support/util";
 import { waitFor } from "../support/util";
@@ -283,5 +285,80 @@ describe("mergeJsonSettings", () => {
     expect(mergeJsonSettings("[1,2]", "{}")).toBeNull();
     expect(mergeJsonSettings("{}", '"str"')).toBeNull();
     expect(mergeJsonSettings("not json", "{}")).toBeNull();
+  });
+});
+
+describe("three-way JSON settings merge", () => {
+  it("merges disjoint key changes without flagging a conflict", () => {
+    const base = JSON.stringify({ a: 1, b: 1, nested: { x: 1, y: 1 } });
+    const remote = JSON.stringify({ a: 2, b: 1, nested: { x: 1, y: 2 } });
+    const local = JSON.stringify({ a: 1, b: 3, nested: { x: 3, y: 1 } });
+    const merged = mergeJsonSettingsThreeWay(base, remote, local);
+    expect(merged?.conflicted).toBe(false);
+    expect(JSON.parse(merged!.text)).toEqual({ a: 2, b: 3, nested: { x: 3, y: 2 } });
+  });
+
+  it("flags the same key changed differently on both sides", () => {
+    const merged = mergeJsonSettingsThreeWay('{"a":1}', '{"a":2}', '{"a":3}');
+    expect(merged?.conflicted).toBe(true);
+  });
+
+  it("returns null for non-object JSON", () => {
+    expect(mergeJsonSettingsThreeWay("[]", "{}", "{}")).toBeNull();
+  });
+
+  it("publishes a clean plugin data merge without a recovery copy", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const path = ".obsidian/plugins/tasks/data.json";
+    const encode = (value: unknown) => new TextEncoder().encode(JSON.stringify(value)).buffer;
+    const baseBytes = encode({ lastOpened: 1, theme: "dark", recent: ["a"] });
+    const remoteBytes = encode({ lastOpened: 2, theme: "dark", recent: ["a"] });
+    const localBytes = encode({ lastOpened: 1, theme: "dark", recent: ["a", "b"] });
+    const baseHash = await sha256Hex(baseBytes);
+    const remoteHash = await sha256Hex(remoteBytes);
+    const localHash = await sha256Hex(localBytes);
+    const disk = new Map<string, ArrayBuffer>([[path, localBytes]]);
+    const blobs = new Map<string, ArrayBuffer>([
+      [baseHash, baseBytes],
+      [remoteHash, remoteBytes],
+    ]);
+    (plugin.app.vault as any).adapter = {
+      exists: vi.fn(async (file: string) => disk.has(file)),
+      stat: vi.fn(async () => ({ mtime: 1 })),
+      readBinary: vi.fn(async (file: string) => disk.get(file)!),
+      writeBinary: vi.fn(async (file: string, bytes: ArrayBuffer) => void disk.set(file, bytes)),
+      mkdir: vi.fn(async () => undefined),
+    };
+    plugin.auth.getBlob = vi.fn(async (_vault: string, _path: string, hash: string) => {
+      const bytes = blobs.get(hash);
+      if (!bytes) throw new Error("missing blob");
+      return bytes;
+    });
+    plugin.auth.blobExists = vi.fn(async () => false);
+    plugin.auth.putBlob = vi.fn(async (_vault: string, _path: string, hash: string, bytes) => {
+      blobs.set(hash, bytes);
+    });
+    const indexDoc = new Y.Doc();
+    const configFiles = indexDoc.getMap<ConfigMeta>("configFiles");
+    configFiles.set(path, { hash: remoteHash, size: remoteBytes.byteLength, mtime: 1 });
+    const sync = new ConfigSync(plugin as any, indexDoc);
+    try {
+      (sync as any).lastSyncedHash.set(path, baseHash);
+      await (sync as any).mergeConflict(
+        path,
+        { hash: localHash, size: localBytes.byteLength, mtime: 1 },
+        configFiles.get(path),
+      );
+      const merged = JSON.parse(new TextDecoder().decode(disk.get(path)!));
+      expect(merged).toEqual({ lastOpened: 2, theme: "dark", recent: ["a", "b"] });
+      expect([...disk.keys()].filter((file) => /conflicted copy/.test(file))).toEqual([]);
+      expect(configFiles.get(path)?.hash).toBe(await sha256Hex(disk.get(path)!));
+    } finally {
+      sync.destroy();
+      indexDoc.destroy();
+    }
   });
 });
