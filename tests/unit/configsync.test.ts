@@ -12,6 +12,7 @@ import { sha256Hex } from "../../src/hash";
 import { makeFakePlugin } from "../support/fakePlugin";
 import { freshGuid } from "../support/util";
 import { waitFor } from "../support/util";
+import { HttpError } from "../../src/httpError";
 
 const local: ConfigMeta = { hash: "local", size: 1, mtime: 200 };
 const remote: ConfigMeta = { hash: "remote", size: 1, mtime: 100 };
@@ -325,6 +326,8 @@ describe("three-way JSON settings merge", () => {
       [baseHash, baseBytes],
       [remoteHash, remoteBytes],
     ]);
+    const indexDoc = new Y.Doc();
+    const configFiles = indexDoc.getMap<ConfigMeta>("configFiles");
     (plugin.app.vault as any).adapter = {
       exists: vi.fn(async (file: string) => disk.has(file)),
       stat: vi.fn(async () => ({ mtime: 1 })),
@@ -332,7 +335,12 @@ describe("three-way JSON settings merge", () => {
       writeBinary: vi.fn(async (file: string, bytes: ArrayBuffer) => void disk.set(file, bytes)),
       mkdir: vi.fn(async () => undefined),
     };
-    plugin.auth.getBlob = vi.fn(async (_vault: string, _path: string, hash: string) => {
+    // Mirror the server: a path-scoped request only serves the hash that path
+    // currently maps to; a hash-only request serves any stored blob.
+    plugin.auth.getBlob = vi.fn(async (_vault: string, blobPath: string | null, hash: string) => {
+      if (blobPath !== null && configFiles.get(blobPath)?.hash !== hash) {
+        throw new HttpError("blob download failed: not found", 404);
+      }
       const bytes = blobs.get(hash);
       if (!bytes) throw new Error("missing blob");
       return bytes;
@@ -341,8 +349,6 @@ describe("three-way JSON settings merge", () => {
     plugin.auth.putBlob = vi.fn(async (_vault: string, _path: string, hash: string, bytes) => {
       blobs.set(hash, bytes);
     });
-    const indexDoc = new Y.Doc();
-    const configFiles = indexDoc.getMap<ConfigMeta>("configFiles");
     configFiles.set(path, { hash: remoteHash, size: remoteBytes.byteLength, mtime: 1 });
     const sync = new ConfigSync(plugin as any, indexDoc);
     try {

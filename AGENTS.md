@@ -62,7 +62,11 @@ The server and client release on independent cadences; a single server serves ma
   `documentEpoch="1"`, `documentInvalidation="1"`.
 - `documentEpoch` is required. It gates the proposal/acknowledgement rollover
   protocol and the `epoch` field on document tokens; clients must create a
-  fresh local Y.Doc and persistence namespace when it changes.
+  fresh local Y.Doc and persistence namespace when it changes. While a
+  proposal is pending, tokens name the pending epoch and add the optional
+  `epochPending: true` (no cap bump); clients must wait for activation and must
+  never connect a fresh-epoch Y.Doc to the retiring epoch, or its items are
+  later re-uploaded into the replacement as duplicate content.
 - `documentInvalidation` is optional. It gates advisory child-document
   invalidation messages. Mobile document eviction must remain disabled when
   the cap is absent or unsupported; do not add it to server `requiredCaps`

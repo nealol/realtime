@@ -481,6 +481,100 @@ describe("SyncedPluginDatabase", () => {
     }
   });
 
+  it("does not keep rebasing when a site's newest changes were overwritten before compaction", async () => {
+    _resetSqliteForTests();
+    const doc = new Y.Doc();
+    const a = makeEngine({ doc, snap: newSnapStore() });
+    const b = makeEngine({ doc, snap: newSnapStore() });
+    let consumer: ReturnType<typeof makeEngine> | null = null;
+    try {
+      await a.start();
+      await b.start();
+      await a.whenLive();
+      await b.whenLive();
+      await a.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["t", "from a"]);
+      await new Promise((r) => setTimeout(r, 400));
+      await a.exec(`UPDATE tasks SET title = ? WHERE id = ?`, ["a again", "t"]);
+      await waitFor(async () => (await titles(b)).includes("a again"), { label: "b saw a" });
+      await b.exec(`UPDATE tasks SET title = ? WHERE id = ?`, ["b wins", "t"]);
+      await waitFor(async () => (await titles(a)).includes("b wins"), { label: "a saw b" });
+      await new Promise((r) => setTimeout(r, 400));
+
+      // The server replica, its cursor, and a log compacted through it: a's
+      // last change survives only as b's overwrite.
+      const replica = await readAllChanges((b as any).db);
+      const arr = doc.getArray<any>("batches");
+      const marks: Record<string, number> = {};
+      for (const batch of arr.toArray()) {
+        marks[batch.siteId] = Math.max(marks[batch.siteId] ?? 0, batch.toDbVersion);
+      }
+      arr.delete(0, arr.length);
+      doc.getMap("meta").set("compactedThrough", marks);
+
+      let bootstraps = 0;
+      consumer = makeEngine({
+        doc,
+        snap: newSnapStore(),
+        bootstrap: async () => {
+          bootstraps++;
+          return { changes: replica, cursor: marks };
+        },
+      });
+      await consumer.start();
+      await consumer.whenLive();
+      expect(await titles(consumer)).toEqual(["b wins"]);
+      // A later metadata change must not trigger another full rebase.
+      doc.getMap("meta").set("compactedThrough", { ...marks });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(bootstraps).toBe(1);
+    } finally {
+      await a.close();
+      await b.close();
+      await consumer?.close();
+    }
+  });
+
+  it("does not rebase after a restart when its own earlier batches were partly compacted", async () => {
+    _resetSqliteForTests();
+    const doc = new Y.Doc();
+    const snap = newSnapStore();
+    const first = makeEngine({ doc, snap });
+    await first.start();
+    await first.whenLive();
+    await first.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["one", "first"]);
+    await new Promise((r) => setTimeout(r, 400));
+    await first.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["two", "second"]);
+    await new Promise((r) => setTimeout(r, 400));
+    await first.close();
+
+    // Other devices applied the first batch, so the server compacted it; the
+    // second is still in the log.
+    const arr = doc.getArray<any>("batches");
+    expect(arr.length).toBe(2);
+    const dropped = arr.get(0);
+    arr.delete(0, 1);
+    doc.getMap("meta").set("compactedThrough", { [dropped.siteId]: dropped.toDbVersion });
+
+    let bootstraps = 0;
+    const second = makeEngine({
+      doc,
+      snap,
+      bootstrap: async () => {
+        bootstraps++;
+        return [];
+      },
+    });
+    try {
+      await second.start();
+      await second.whenLive();
+      await new Promise((r) => setTimeout(r, 300));
+      expect(bootstraps).toBe(0);
+      expect(await titles(second)).toEqual(["first", "second"]);
+    } finally {
+      await second.close();
+    }
+  });
+
   it("replays own-site batches that are newer than the restored snapshot", async () => {
     const doc = new Y.Doc();
     const snap = newSnapStore();

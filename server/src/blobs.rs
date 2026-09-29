@@ -66,6 +66,9 @@ fn blob_path(state: &AppState, vault_id: &str, hash: &str) -> AppResult<PathBuf>
 #[derive(Default, serde::Deserialize)]
 pub struct BlobQuery {
     path: Option<String>,
+    /// Expected byte length (HEAD). A stored copy of another length is a torn
+    /// write and reported as missing, so the uploader re-sends it.
+    size: Option<u64>,
 }
 
 async fn authorize_blob(
@@ -87,27 +90,34 @@ async fn authorize_blob(
     Ok(())
 }
 
-async fn blob_matches_path(
+/// Look up `path` in the live index: `None` when it does not map to `hash`,
+/// otherwise the byte size the index records for it (if any).
+async fn blob_meta_for_path(
     state: &AppState,
     vault_id: &str,
     path: &str,
     hash: &str,
-) -> AppResult<bool> {
+) -> AppResult<Option<Option<u64>>> {
     // Point lookup in the live index doc. Encoding and re-decoding the whole
     // index per request cost O(vault size) on every blob download.
     state
         .documents
         .read_with(vault_id, |doc| {
             let txn = doc.transact();
-            ["binaries", "configFiles"].into_iter().any(|name| {
-                let Some(map) = txn.get_map(name) else {
-                    return false;
+            ["binaries", "configFiles"].into_iter().find_map(|name| {
+                let map = txn.get_map(name)?;
+                let Some(Out::Any(Any::Map(meta))) = map.get(&txn, path) else {
+                    return None;
                 };
-                matches!(
-                    map.get(&txn, path),
-                    Some(Out::Any(Any::Map(meta)))
-                        if matches!(meta.get("hash"), Some(Any::String(value)) if value.as_ref() == hash)
-                )
+                if !matches!(meta.get("hash"), Some(Any::String(value)) if value.as_ref() == hash) {
+                    return None;
+                }
+                let size = match meta.get("size") {
+                    Some(Any::Number(value)) if *value >= 0.0 => Some(*value as u64),
+                    Some(Any::BigInt(value)) if *value >= 0 => Some(*value as u64),
+                    _ => None,
+                };
+                Some(size)
             })
         })
         .await
@@ -125,6 +135,10 @@ pub async fn head_blob(
     authorize_blob(&state, &user, &vault_id, query.path.as_deref(), false).await?;
     let path = blob_path(&state, &vault_id, &hash)?;
     match tokio::fs::metadata(&path).await {
+        Ok(metadata) if query.size.is_some_and(|size| size != metadata.len()) => {
+            tracing::warn!(%vault_id, %hash, "stored blob has the wrong size; reporting it missing");
+            Err(AppError::NotFound)
+        }
         Ok(_) => Ok(StatusCode::OK),
         Err(_) => Err(AppError::NotFound),
     }
@@ -138,9 +152,11 @@ pub async fn get_blob(
     Query(query): Query<BlobQuery>,
 ) -> AppResult<Response> {
     authorize_blob(&state, &user, &vault_id, query.path.as_deref(), false).await?;
+    let mut expected_size = None;
     if let Some(path) = query.path.as_deref() {
-        if !blob_matches_path(&state, &vault_id, path, &hash).await? {
-            return Err(AppError::NotFound);
+        match blob_meta_for_path(&state, &vault_id, path, &hash).await? {
+            Some(size) => expected_size = size,
+            None => return Err(AppError::NotFound),
         }
     }
     let path = blob_path(&state, &vault_id, &hash)?;
@@ -148,6 +164,18 @@ pub async fn get_blob(
     let file = tokio::fs::File::open(&path)
         .await
         .map_err(|_| AppError::NotFound)?;
+    if let Some(expected) = expected_size {
+        let actual = file
+            .metadata()
+            .await
+            .map_err(|e| AppError::Internal(format!("blob stat: {e}")))?
+            .len();
+        if actual != expected {
+            // Serving a torn copy would only make clients write corrupt files.
+            tracing::warn!(%vault_id, %hash, actual, expected, "refusing to serve a torn blob");
+            return Err(AppError::NotFound);
+        }
+    }
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
@@ -165,14 +193,23 @@ pub async fn put_blob(
     AuthUser(user): AuthUser,
     Path((vault_id, hash)): Path<(String, String)>,
     Query(query): Query<BlobQuery>,
+    headers: axum::http::HeaderMap,
     body: Body,
 ) -> AppResult<StatusCode> {
     authorize_blob(&state, &user, &vault_id, query.path.as_deref(), true).await?;
     let path = blob_path(&state, &vault_id, &hash)?;
 
-    // Already stored: short-circuit. Content addressing makes this safe.
-    if tokio::fs::metadata(&path).await.is_ok() {
-        return Ok(StatusCode::OK);
+    // Already stored: short-circuit, since content addressing makes a
+    // complete copy identical. A copy whose length differs from this upload
+    // is torn, so it is replaced below once the new bytes verify.
+    let expected_len = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if let Ok(metadata) = tokio::fs::metadata(&path).await {
+        if expected_len.is_none_or(|len| len == metadata.len()) {
+            return Ok(StatusCode::OK);
+        }
     }
 
     let dir = path
@@ -201,10 +238,15 @@ pub async fn put_blob(
     }
 
     // Atomic publish. A concurrent uploader of the same content is harmless: the
-    // rename just replaces an identical file.
+    // rename just replaces an identical file. The data was fsynced before the
+    // rename, and the directory entry is fsynced after it, so a crash cannot
+    // leave a torn file under the final name.
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| AppError::Internal(format!("blob publish: {e}")))?;
+    if let Ok(directory) = tokio::fs::File::open(dir).await {
+        let _ = directory.sync_all().await;
+    }
 
     // A new blob may resolve a shim that git backup committed as a fallback
     // while the bytes were missing, so nudge a re-commit.
@@ -243,6 +285,9 @@ async fn stream_to_file(body: Body, tmp: &FsPath) -> AppResult<String> {
     file.flush()
         .await
         .map_err(|e| AppError::Internal(format!("blob flush: {e}")))?;
+    file.sync_all()
+        .await
+        .map_err(|e| AppError::Internal(format!("blob sync: {e}")))?;
 
     Ok(hex_lower(&hasher.finalize()))
 }

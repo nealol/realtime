@@ -54,12 +54,22 @@ export interface SyncedPluginDatabaseOptions {
   saveSnapshot: (text: string) => Promise<void>;
   /** Remove the persisted snapshot. */
   deleteSnapshot: () => Promise<void>;
-  /** Pull the full server changeset for a cursor (bootstrap / rebase). */
-  bootstrap?: (cursor: Cursor) => Promise<ChangeRow[]>;
+  /**
+   * Pull the full server changeset for a cursor (bootstrap / rebase). Servers
+   * also return the per-site cursor the changeset covers; older ones (and
+   * simple stubs) return only the rows.
+   */
+  bootstrap?: (cursor: Cursor) => Promise<ChangeRow[] | BootstrapChangeset>;
   /** Notify the server that we published (debounced upstream). */
   touch?: () => void;
   /** Optional repair hook after remote applies. */
   onMergeReview?: (tables: string[]) => void | Promise<void>;
+}
+
+export interface BootstrapChangeset {
+  changes: ChangeRow[];
+  /** Per-site db_version the changeset covers (overwritten changes included). */
+  cursor?: Cursor;
 }
 
 const PUBLISH_DEBOUNCE_MS = 250;
@@ -334,15 +344,27 @@ export class SyncedPluginDatabase {
 
   private async bootstrapInto(db: DB, cursor: Cursor): Promise<Cursor> {
     if (!this.opts.bootstrap) return { ...cursor };
-    const rows = await this.opts.bootstrap(cursor);
-    if (rows.length === 0) return { ...cursor };
-    await db.tx(async (tx) => {
-      await applyChanges(tx as unknown as DB, rows);
-    });
+    const result = await this.opts.bootstrap(cursor);
+    const rows = Array.isArray(result) ? result : result.changes;
+    const covered = Array.isArray(result) ? {} : (result.cursor ?? {});
+    if (rows.length > 0) {
+      await db.tx(async (tx) => {
+        await applyChanges(tx as unknown as DB, rows);
+      });
+    }
     const advanced = { ...cursor };
     for (const row of rows) {
       const site = bytesToHex(base64ToBytes(row.site_id));
       advanced[site] = Math.max(advanced[site] ?? 0, row.db_version);
+    }
+    // The replica keeps only each cell's winning change, so the rows alone
+    // understate how far a site's changes are covered once later writes from
+    // other sites overwrote them; trust the server's cursor for that.
+    for (const [site, version] of Object.entries(covered)) {
+      const value = Number(version);
+      if (Number.isSafeInteger(value) && value > 0) {
+        advanced[site.toLowerCase()] = Math.max(advanced[site.toLowerCase()] ?? 0, value);
+      }
     }
     return advanced;
   }
@@ -622,12 +644,14 @@ export class SyncedPluginDatabase {
       // past it.
       for (const batch of siteBatches) {
         if (this.appliedBatchIds.has(batch.id)) continue;
-        // Own-site batches: the applied cursor doesn't track our own site
+        // Own-site batches: the applied cursor doesn't track our own sites
         // (it only records *remote* progress), so use `published` as the
-        // contiguity baseline instead. Without this, any own-site batch with
-        // fromDbVersion > 0 (common after a crash-recovery restart) would
-        // false-fire the gap check and stall with a warning on every pass.
-        const ownSite = batch.siteId === this.siteHex;
+        // contiguity baseline instead. That includes the site ids earlier
+        // sessions of this device published under (each session opens a
+        // fresh database with a new site id): their rows are already local,
+        // and treating them as remote would restart at 0 and read a partly
+        // compacted range as a gap that needs a full rebase.
+        const ownSite = batch.siteId === this.siteHex || this.published[batch.siteId] !== undefined;
         const applied = ownSite
           ? (this.published[batch.siteId] ?? 0)
           : (this.cursor[batch.siteId] ?? 0);

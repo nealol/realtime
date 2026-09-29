@@ -16,11 +16,11 @@ import { IndexeddbPersistence } from "y-indexeddb";
 import type RealtimePlugin from "../main";
 import { getClientToken } from "../sync/clientToken";
 import { createMuxSocket } from "../sync/mux";
-import { epochPersistenceName } from "../documentEpoch";
+import { epochPersistenceName, getDocumentEpoch } from "../documentEpoch";
 import { CRSQLITE_WASM_DATA_URL } from "./wasmBinary";
 import type { PluginDbDocHandle } from "./PluginDbSync";
 import type { SyncedPluginDatabaseOptions } from "./SyncedPluginDatabase";
-import type { ChangeRow, Cursor } from "./types";
+import type { Cursor } from "./types";
 
 /**
  * Build the non-user-supplied engine deps for a given database.
@@ -100,8 +100,7 @@ export function buildEngineDeps(
         console.warn("[Realtime] snapshot delete failed", e);
       }
     },
-    bootstrap: (cursor: Cursor): Promise<ChangeRow[]> =>
-      plugin.auth.pluginDbChanges(vaultId, pluginId, name, cursor),
+    bootstrap: (cursor: Cursor) => plugin.auth.pluginDbChanges(vaultId, pluginId, name, cursor),
     touch: () => {
       void plugin.auth.touchPluginDb(vaultId, pluginId, name).catch(() => {});
     },
@@ -111,13 +110,18 @@ export function buildEngineDeps(
 /** A per-database Realtime + IndexedDB transport handle. */
 function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle {
   const doc = new Y.Doc();
-  const provider = new RealtimeProvider(docId, doc, () => getClientToken(plugin, docId), {
-    connect: false,
-    socketFactory: createMuxSocket,
-  });
+  // Pin the epoch: after an epoch change this handle holds retired-epoch
+  // state and must be replaced, never reconnected.
+  const epoch = getDocumentEpoch(plugin, docId);
+  const provider = new RealtimeProvider(
+    docId,
+    doc,
+    () => getClientToken(plugin, docId, undefined, epoch),
+    { connect: false, socketFactory: createMuxSocket },
+  );
   const serverScope = plugin.settings.authServerId || plugin.settings.authServerUrl;
   const persistence = new IndexeddbPersistence(
-    epochPersistenceName(plugin, docId, `realtime:plugindb:${serverScope}:${docId}`),
+    epochPersistenceName(plugin, docId, `realtime:plugindb:${serverScope}:${docId}`, epoch),
     doc,
   );
 

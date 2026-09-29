@@ -104,6 +104,7 @@ async fn git_state_ext_with_debounce(
         crdt_epoch_max_updates: 100_000,
         crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
         crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+        crdt_epoch_ack_timeout_ms: 30_000,
         crdt_max_documents_per_vault: 100_000,
         blob_dir: std::env::temp_dir().display().to_string(),
         oidc_mode: OidcMode::Mock,
@@ -275,6 +276,7 @@ fn test_config(public_base_url: &str, attachment_max_bytes: u64) -> Config {
         crdt_epoch_max_updates: 100_000,
         crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
         crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+        crdt_epoch_ack_timeout_ms: 30_000,
         crdt_max_documents_per_vault: 100_000,
         blob_dir: blob_dir.display().to_string(),
         oidc_mode: OidcMode::Mock,
@@ -2538,6 +2540,95 @@ async fn path_scoped_blob_get_checks_the_index_entry() {
     }
 }
 
+/// A crash before blobs were fsynced could leave a torn copy under the final
+/// name. It must read as missing (so the uploader re-sends it), must not be
+/// served for a path whose index entry records the real size, and a PUT with
+/// the full content must replace it.
+#[tokio::test]
+async fn torn_blob_copies_are_reported_missing_and_repaired() {
+    let (app, state) = test_app_with_state().await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    let content = b"complete attachment bytes".to_vec();
+    let hash = sha256_hex(&content);
+    let blob_dir = std::path::PathBuf::from(&state.config.blob_dir).join(&vault_id);
+    tokio::fs::create_dir_all(&blob_dir).await.unwrap();
+    tokio::fs::write(blob_dir.join(&hash), &content[..5])
+        .await
+        .unwrap();
+    state
+        .documents
+        .apply_update(
+            &vault_id,
+            &files_and_binaries_update(&[(
+                "a.bin".to_string(),
+                hash.clone(),
+                content.len() as i64,
+            )]),
+        )
+        .await
+        .unwrap();
+
+    let uri = format!("/api/vaults/{vault_id}/blobs/{hash}");
+    let (status, _) = send_raw(
+        &app,
+        "HEAD",
+        &format!("{uri}?size={}", content.len()),
+        Some(&alice),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a torn copy is not the blob");
+    let (status, _) = send_raw(&app, "HEAD", &uri, Some(&alice), vec![]).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "size-less lookups keep their old meaning"
+    );
+    let (status, _) = send_raw(
+        &app,
+        "GET",
+        &format!("{uri}?path=a.bin"),
+        Some(&alice),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a torn copy is never served");
+
+    let request = Request::builder()
+        .method("PUT")
+        .uri(&uri)
+        .header(header::AUTHORIZATION, format!("Bearer {alice}"))
+        .header(header::CONTENT_LENGTH, content.len())
+        .body(Body::from(content.clone()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        tokio::fs::read(blob_dir.join(&hash)).await.unwrap(),
+        content
+    );
+    let (status, got) = send_raw(
+        &app,
+        "GET",
+        &format!("{uri}?path=a.bin"),
+        Some(&alice),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(got, content);
+}
+
 #[tokio::test]
 async fn blob_rejects_bad_hash_and_mismatch() {
     let app = test_app().await;
@@ -4678,18 +4769,23 @@ async fn plugin_db_replication_dump_compaction_and_bootstrap() {
 
     // Bootstrap survives compaction: a fresh client (empty cursor) still gets
     // the full changeset, served from the replica.
-    let rows = state
+    let (rows, covered) = state
         .plugindb
         .bootstrap_changes(&vault_id, "my-plugin", "tasks", &HashMap::new())
         .await
         .unwrap();
     assert!(!rows.is_empty(), "bootstrap must serve compacted history");
+    assert_eq!(
+        covered.get(&site_hex).copied(),
+        Some(max_v),
+        "bootstrap reports the cursor it covers"
+    );
     let tables: std::collections::HashSet<_> = rows.iter().map(|r| r.table.as_str()).collect();
     assert_eq!(tables, std::collections::HashSet::from(["tasks"]));
     // A caught-up cursor gets nothing.
     let mut caught_up = HashMap::new();
     caught_up.insert(site_hex.clone(), max_v);
-    let none = state
+    let (none, _) = state
         .plugindb
         .bootstrap_changes(&vault_id, "my-plugin", "tasks", &caught_up)
         .await
@@ -4917,6 +5013,44 @@ async fn plugin_db_routes_validate_ids_and_membership() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["changes"], json!([]));
+}
+
+/// Bootstrap responses carry the cursor the changeset covers, so a client does
+/// not have to infer it from surviving rows (which omit overwritten changes).
+#[tokio::test]
+async fn plugin_db_changes_report_the_cursor_they_cover() {
+    let (app, state) = test_app_with_state().await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "Notes"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+
+    let raw = include_bytes!("fixtures/client-published-doc.bin");
+    let view = realtime_server::plugindb::decode_doc(raw).expect("decode client doc");
+    let batch = &view.batches[0];
+    state
+        .documents
+        .apply_update(&format!("{vault_id}__plugindb__my-plugin__tasks"), raw)
+        .await
+        .unwrap();
+
+    let (status, body) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/plugin-dbs/my-plugin/tasks/changes"),
+        Some(&alice),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body["changes"].as_array().unwrap().is_empty());
+    assert_eq!(body["cursor"][&batch.site_id], json!(batch.to_db_version));
 }
 
 // ---------- cross-stack wire-format regression ----------
@@ -5147,7 +5281,7 @@ async fn plugin_db_sql_endpoints() {
         .execute_sql(&vault_id, "my-plugin", "tasks", &stmts)
         .await
         .expect("execute re-publish");
-    let rows = state
+    let (rows, _) = state
         .plugindb
         .bootstrap_changes(&vault_id, "my-plugin", "tasks", &HashMap::new())
         .await
@@ -5910,6 +6044,7 @@ async fn history_test_app() -> (Router, std::path::PathBuf, std::path::PathBuf) 
         crdt_epoch_max_updates: 100_000,
         crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
         crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+        crdt_epoch_ack_timeout_ms: 30_000,
         crdt_max_documents_per_vault: 100_000,
         blob_dir: blob_dir.display().to_string(),
         oidc_mode: OidcMode::Mock,
@@ -5973,6 +6108,7 @@ async fn git_ext_app(
         crdt_epoch_max_updates: 100_000,
         crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
         crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+        crdt_epoch_ack_timeout_ms: 30_000,
         crdt_max_documents_per_vault: 100_000,
         blob_dir: std::env::temp_dir().display().to_string(),
         oidc_mode: OidcMode::Mock,
@@ -7363,4 +7499,126 @@ async fn public_attachment_share_is_scoped_to_the_shared_version_and_revocable()
     let replacement_url = format!("/a/{}", replacement["id"].as_str().unwrap());
     let (status, _) = send(&app, "GET", &replacement_url, None, None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------- dmux ----------
+
+fn mux_varint(buf: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
+}
+
+fn mux_open(channel: u64, path_and_query: &str) -> Vec<u8> {
+    let mut frame = Vec::new();
+    mux_varint(&mut frame, 1);
+    mux_varint(&mut frame, channel);
+    mux_varint(&mut frame, path_and_query.len() as u64);
+    frame.extend_from_slice(path_and_query.as_bytes());
+    frame
+}
+
+/// A rejected OPEN must reach the client even when the connection's outbound
+/// queue is full; a dropped OPEN_ERR leaves that client channel waiting forever.
+#[tokio::test]
+async fn dmux_open_rejection_survives_a_full_outbound_queue() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as TtMsg;
+    use yrs::{Map, ReadTxn, StateVector, Transact};
+
+    let (app, state) = test_app_with_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let app = app.clone();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+    let session = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&session),
+        Some(json!({ "name": "Mux" })),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let document_id = format!("{vault_id}__muxflood");
+    let (status, token) = send(
+        &app,
+        "POST",
+        "/api/doc-token",
+        Some(&session),
+        Some(json!({ "vaultId": vault_id, "docId": document_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let path = format!(
+        "/d/{document_id}/ws/{document_id}?token={}",
+        token["token"].as_str().unwrap()
+    );
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/dmux"))
+        .await
+        .unwrap();
+    ws.send(TtMsg::Binary(mux_open(1, &path))).await.unwrap();
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+            .await
+            .expect("OPEN_OK")
+            .unwrap()
+            .unwrap();
+        if let TtMsg::Binary(frame) = message {
+            if frame.as_slice() == [2, 1] {
+                break;
+            }
+        }
+    }
+
+    // Stop reading and push enough document traffic through the channel to
+    // fill the socket buffers and the connection's outbound queue.
+    let value = "x".repeat(1 << 20);
+    for index in 0..24 {
+        let doc = yrs::Doc::new();
+        doc.get_or_insert_map("values").insert(
+            &mut doc.transact_mut(),
+            format!("key-{index}"),
+            value.as_str(),
+        );
+        let update = doc
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        state
+            .documents
+            .apply_update(&document_id, &update)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Reusing a channel id is rejected while the queue is still full.
+    ws.send(TtMsg::Binary(mux_open(1, &path))).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let message = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("the OPEN_ERR for the rejected channel never arrived")
+            .expect("mux socket closed")
+            .expect("mux socket errored");
+        if let TtMsg::Binary(frame) = message {
+            if frame.as_slice() == [3, 1] {
+                break;
+            }
+        }
+    }
 }

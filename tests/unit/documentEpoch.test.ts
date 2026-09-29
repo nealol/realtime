@@ -11,6 +11,17 @@ import {
   getClientToken,
   resetTokenRetryStateForTests,
 } from "../../src/sync/clientToken";
+import { HttpError } from "../../src/httpError";
+
+function tokenFor(docId: string) {
+  return {
+    url: `wss://sync.example.com/d/${docId}/ws`,
+    baseUrl: `https://sync.example.com/d/${docId}`,
+    docId,
+    token: "token",
+    epoch: 0,
+  };
+}
 
 function plugin(server = "server-a") {
   return {
@@ -90,63 +101,16 @@ describe("document epochs", () => {
     expect(instance.acceptDocumentEpoch).not.toHaveBeenCalled();
   });
 
-  it("uses a read-only retiring-epoch token to finish an interrupted acknowledgement", async () => {
+  it("waits for a pending epoch instead of reading the retiring one", async () => {
     const instance = plugin();
     setDocumentEpoch(instance, "vault__note", 3);
-    instance.auth.docToken
-      .mockResolvedValueOnce({
-        url: "wss://sync.example.com/d/vault__note/ws",
-        baseUrl: "https://sync.example.com/d/vault__note",
-        docId: "vault__note",
-        token: "old-epoch-token",
-        epoch: 2,
-      })
-      .mockResolvedValueOnce({
-        url: "wss://sync.example.com/d/vault__note/ws",
-        baseUrl: "https://sync.example.com/d/vault__note",
-        docId: "vault__note",
-        token: "read-only-old-epoch-token",
-        authorization: "read-only",
-        epoch: 2,
-      });
-
-    await expect(getClientToken(instance, "vault__note")).resolves.toEqual(
-      expect.objectContaining({
-        token: "read-only-old-epoch-token",
-        authorization: "read-only",
-        epoch: 2,
-      }),
-    );
-    expect(instance.auth.docToken).toHaveBeenNthCalledWith(
-      2,
-      "vault",
-      "vault__note",
-      undefined,
-      "read-only",
-    );
-    expect(getDocumentEpoch(instance, "vault__note")).toBe(3);
-    expect(instance.acceptDocumentEpoch).not.toHaveBeenCalled();
-  });
-
-  it("rejects a recovery token unless the server confirms read-only authorization", async () => {
-    const instance = plugin();
-    setDocumentEpoch(instance, "vault__note", 3);
-    instance.auth.docToken
-      .mockResolvedValueOnce({
-        url: "wss://sync.example.com/d/vault__note/ws",
-        baseUrl: "https://sync.example.com/d/vault__note",
-        docId: "vault__note",
-        token: "old-epoch-token",
-        epoch: 2,
-      })
-      .mockResolvedValueOnce({
-        url: "wss://sync.example.com/d/vault__note/ws",
-        baseUrl: "https://sync.example.com/d/vault__note",
-        docId: "vault__note",
-        token: "unsafe-full-old-epoch-token",
-        authorization: "full",
-        epoch: 2,
-      });
+    instance.auth.docToken.mockResolvedValue({
+      url: "wss://sync.example.com/d/vault__note/ws",
+      baseUrl: "https://sync.example.com/d/vault__note",
+      docId: "vault__note",
+      token: "old-epoch-token",
+      epoch: 2,
+    });
 
     await expect(getClientToken(instance, "vault__note")).rejects.toEqual(
       expect.objectContaining<DocumentEpochPendingError>({
@@ -156,33 +120,126 @@ describe("document epochs", () => {
         serverEpoch: 2,
       }),
     );
+    // A read-only grant to the retiring epoch would load its items into the
+    // fresh local document, which later uploads them into the replacement.
+    expect(instance.auth.docToken).toHaveBeenCalledTimes(1);
+    expect(instance.auth.docToken).toHaveBeenCalledWith("vault", "vault__note", undefined);
+    expect(getDocumentEpoch(instance, "vault__note")).toBe(3);
+  });
+
+  it("waits while the server activates the epoch a token names", async () => {
+    const instance = plugin();
+    setDocumentEpoch(instance, "vault__note", 3);
+    instance.auth.docToken.mockResolvedValue({
+      ...tokenFor("vault__note"),
+      epoch: 3,
+      epochPending: true,
+    });
+    await expect(getClientToken(instance, "vault__note", undefined, 3)).rejects.toBeInstanceOf(
+      DocumentEpochPendingError,
+    );
+    instance.auth.docToken.mockResolvedValue({ ...tokenFor("vault__note"), epoch: 3 });
+    await expect(getClientToken(instance, "vault__note", undefined, 3)).resolves.toEqual(
+      expect.objectContaining({ epoch: 3 }),
+    );
+  });
+
+  it("refuses tokens to a document instance built for an older epoch", async () => {
+    const instance = plugin();
+    setDocumentEpoch(instance, "vault__note", 4);
+    instance.auth.docToken.mockResolvedValue({
+      url: "wss://sync.example.com/d/vault__note/ws",
+      baseUrl: "https://sync.example.com/d/vault__note",
+      docId: "vault__note",
+      token: "token",
+      epoch: 4,
+    });
+
+    await expect(getClientToken(instance, "vault__note", undefined, 3)).rejects.toEqual(
+      expect.objectContaining<DocumentEpochChangedError>({
+        name: "DocumentEpochChangedError",
+        documentId: "vault__note",
+        epoch: 4,
+      }),
+    );
+    expect(instance.auth.docToken).not.toHaveBeenCalled();
+    await expect(getClientToken(instance, "vault__note", undefined, 4)).resolves.toEqual(
+      expect.objectContaining({ epoch: 4 }),
+    );
   });
 
   it("does not globally back off unrelated documents while an epoch is pending", async () => {
     resetTokenRetryStateForTests(30_000);
     const instance = plugin();
     setDocumentEpoch(instance, "vault__pending", 3);
-    instance.auth.docToken.mockImplementation(
-      async (
-        _vault: string,
-        docId: string,
-        _path?: string,
-        authorization?: "full" | "read-only",
-      ) => ({
-        url: `wss://sync.example.com/d/${docId}/ws`,
-        baseUrl: `https://sync.example.com/d/${docId}`,
-        docId,
-        token: "token",
-        authorization,
-        epoch: docId === "vault__pending" ? 2 : 0,
-      }),
-    );
+    instance.auth.docToken.mockImplementation(async (_vault: string, docId: string) => ({
+      url: `wss://sync.example.com/d/${docId}/ws`,
+      baseUrl: `https://sync.example.com/d/${docId}`,
+      docId,
+      token: "token",
+      epoch: docId === "vault__pending" ? 2 : 0,
+    }));
 
-    await expect(getClientToken(instance, "vault__pending")).resolves.toEqual(
-      expect.objectContaining({ docId: "vault__pending", authorization: "read-only" }),
+    await expect(getClientToken(instance, "vault__pending")).rejects.toBeInstanceOf(
+      DocumentEpochPendingError,
     );
     await expect(getClientToken(instance, "vault__other")).resolves.toEqual(
       expect.objectContaining({ docId: "vault__other" }),
     );
+  });
+
+  it("does not delay other documents after one document's request is rejected", async () => {
+    resetTokenRetryStateForTests(30_000);
+    const instance = plugin();
+    instance.auth.docToken.mockImplementation(async (_vault: string, docId: string) => {
+      if (docId === "vault__broken") throw new HttpError("internal error", 500);
+      if (docId === "vault__forbidden") throw new HttpError("forbidden", 403);
+      return tokenFor(docId);
+    });
+
+    await expect(getClientToken(instance, "vault__broken")).rejects.toThrow("internal error");
+    await expect(getClientToken(instance, "vault__forbidden")).rejects.toThrow("forbidden");
+    const started = Date.now();
+    await expect(getClientToken(instance, "vault__healthy")).resolves.toEqual(
+      expect.objectContaining({ docId: "vault__healthy" }),
+    );
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
+  it("backs off every document when the server is unreachable or failing", async () => {
+    vi.useFakeTimers();
+    try {
+      resetTokenRetryStateForTests(30_000);
+      const instance = plugin();
+      let failure: Error | null = new Error("net::ERR_INTERNET_DISCONNECTED");
+      instance.auth.docToken.mockImplementation(async (_vault: string, docId: string) => {
+        if (failure) throw failure;
+        return tokenFor(docId);
+      });
+
+      await expect(getClientToken(instance, "vault__a")).rejects.toThrow("DISCONNECTED");
+      failure = null;
+      const delayed = getClientToken(instance, "vault__b");
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(instance.auth.docToken).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(delayed).resolves.toEqual(expect.objectContaining({ docId: "vault__b" }));
+
+      // Repeated server errors across documents also mean the server is down.
+      failure = new HttpError("internal error", 500);
+      for (const docId of ["vault__c", "vault__d", "vault__e"]) {
+        await expect(getClientToken(instance, docId)).rejects.toThrow("internal error");
+      }
+      failure = null;
+      const afterServerErrors = getClientToken(instance, "vault__f");
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(instance.auth.docToken).toHaveBeenCalledTimes(5);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(afterServerErrors).resolves.toEqual(
+        expect.objectContaining({ docId: "vault__f" }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

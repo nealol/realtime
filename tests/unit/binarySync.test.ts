@@ -715,4 +715,95 @@ describe("BinarySync", () => {
       B.indexDoc.destroy();
     }
   });
+
+  it("keeps an upload that fails while offline and completes it after reconnecting", async () => {
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const data = bytes([4, 2, 4, 2]);
+    vault.binaries.set("offline.bin", data);
+    const indexDoc = new Y.Doc();
+    const bs = new BinarySync(
+      plugin as any,
+      { isTextSyncBusy: () => false, recordTrash: () => {} } as any,
+      indexDoc,
+    );
+    let offline = true;
+    let attempts = 0;
+    const uploaded: string[] = [];
+    plugin.auth.blobExists = async () => {
+      attempts++;
+      if (offline) throw new Error("net::ERR_INTERNET_DISCONNECTED");
+      return false;
+    };
+    plugin.auth.putBlob = async (_vault: string, _path: string, hash: string) => {
+      uploaded.push(hash);
+    };
+    try {
+      await bs.reconcileAll([]);
+      bs.onLocalChanged("offline.bin");
+      await waitFor(() => attempts === 1, { label: "first upload attempt" });
+      // Well past the old five-attempt limit.
+      for (let expected = 2; expected <= 8; expected++) {
+        bs.retryNow();
+        await waitFor(() => attempts === expected, { label: `upload attempt ${expected}` });
+      }
+      expect(notices.some((n) => n.includes("failed to upload"))).toBe(false);
+
+      offline = false;
+      bs.retryNow();
+      const hash = await sha256Hex(data);
+      await waitFor(
+        () => indexDoc.getMap<BinaryMeta>("binaries").get("offline.bin")?.hash === hash,
+        {
+          label: "offline upload published after reconnect",
+        },
+      );
+      expect(uploaded).toEqual([hash]);
+    } finally {
+      bs.destroy();
+      indexDoc.destroy();
+    }
+  });
+
+  it("never writes downloaded bytes that do not match the blob hash", async () => {
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const good = bytes([1, 2, 3, 4, 5]);
+    const hash = await sha256Hex(good);
+    const indexDoc = new Y.Doc();
+    indexDoc.getMap<BinaryMeta>("binaries").set("torn.bin", { hash, size: 5 });
+    const bs = new BinarySync(
+      plugin as any,
+      { isTextSyncBusy: () => false, recordTrash: () => {} } as any,
+      indexDoc,
+    );
+    let downloads = 0;
+    plugin.auth.getBlob = async () => {
+      downloads++;
+      return bytes([1, 2]); // a torn copy of the blob
+    };
+    try {
+      await bs.reconcileAll([]);
+      await waitFor(() => downloads >= 1, { label: "download attempted" });
+      await new Promise((r) => setTimeout(r, 300));
+      expect(vault.binaries.has("torn.bin")).toBe(false);
+
+      plugin.auth.getBlob = async () => {
+        downloads++;
+        return good;
+      };
+      bs.retryNow();
+      await waitFor(() => asArray(vault.binaries.get("torn.bin")) !== null, {
+        label: "verified bytes written",
+      });
+      expect(asArray(vault.binaries.get("torn.bin"))).toEqual([1, 2, 3, 4, 5]);
+    } finally {
+      bs.destroy();
+      indexDoc.destroy();
+    }
+  });
 });

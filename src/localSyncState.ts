@@ -17,6 +17,23 @@ export interface LocalPathState {
   candidate?: boolean;
   /** SHA-256 of the local content whose bootstrap decision is still pending. */
   candidateFingerprint?: string;
+  /**
+   * Epoch-scoped fingerprint (`storedContentFingerprint` in SyncedDoc) of the
+   * file content last known to be on disk while the document's (`identity`)
+   * local store durably contained it. A disk file that still matches it was
+   * not edited locally since, however far the document has moved on.
+   */
+  diskFingerprint?: string;
+}
+
+/** Keep `diskFingerprint` only while it describes the same identity. */
+function carriedDiskFingerprint(
+  current: LocalPathState | null,
+  identity: string | null,
+): { diskFingerprint?: string } {
+  return current?.diskFingerprint && current.identity === identity
+    ? { diskFingerprint: current.diskFingerprint }
+    : {};
 }
 
 /**
@@ -90,6 +107,7 @@ export class LocalSyncState {
       ...(current?.fingerprint ? { fingerprint: current.fingerprint } : {}),
       candidate: true,
       ...(pendingFingerprint ? { candidateFingerprint: pendingFingerprint } : {}),
+      ...carriedDiskFingerprint(current, identity),
     });
   }
 
@@ -115,6 +133,7 @@ export class LocalSyncState {
       ...(current?.candidateFingerprint
         ? { candidateFingerprint: current.candidateFingerprint }
         : {}),
+      ...carriedDiskFingerprint(current, identity),
     });
   }
 
@@ -137,7 +156,22 @@ export class LocalSyncState {
       ...(candidate && current?.candidateFingerprint
         ? { candidateFingerprint: current.candidateFingerprint }
         : {}),
+      ...carriedDiskFingerprint(current, identity),
     });
+  }
+
+  /** Record disk content the document for `identity` durably contains. */
+  markDisk(path: string, kind: MaterializedKind, identity: string, diskFingerprint: string): void {
+    const current = this.get(path);
+    if (!current || current.identity !== identity || current.diskFingerprint === diskFingerprint) {
+      return;
+    }
+    this.paths.set(path, { ...current, kind, diskFingerprint });
+  }
+
+  diskFingerprint(path: string, identity: string): string | null {
+    const state = this.get(path);
+    return state?.identity === identity ? (state.diskFingerprint ?? null) : null;
   }
 
   candidateIdentity(path: string, kind: MaterializedKind): string | null {

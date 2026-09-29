@@ -8,6 +8,7 @@ import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHel
 import { openBinaryConflictModal, type ConflictChoice } from "./BinaryConflictModal";
 import type { LocalSyncState } from "./localSyncState";
 import { preserveBinaryConflict } from "./conflictRecovery";
+import { HttpError, isServerUnavailableStatus } from "./httpError";
 
 /**
  * Upload-queue state surfaced to the status bar:
@@ -29,14 +30,31 @@ export interface BinaryMeta {
 /** Files at or above this size are uploaded in the background, deferred while
  *  notes are actively syncing, so a large attachment can't stall note sync. */
 const LARGE_FILE_BYTES = 5 * 1024 * 1024;
-/** Max upload attempts before giving up (with a Notice). */
+/** Max attempts for an upload the server rejects outright (with a Notice). */
 const MAX_UPLOAD_ATTEMPTS = 5;
+/** Cap for the backoff between retries while the server is unreachable. */
+const MAX_RETRY_MS = 60_000;
 /** Startup reconcile pool: parallel paths, and bytes held in memory at once. */
 const RECONCILE_CONCURRENCY = 6;
 const MOBILE_RECONCILE_CONCURRENCY = 3;
 const RECONCILE_MAX_BYTES_IN_FLIGHT = 32 * 1024 * 1024;
 /** Delay before re-draining the upload queue when deferred / after a failure. */
 const DRAIN_RETRY_MS = 2000;
+
+/** Exponential backoff from DRAIN_RETRY_MS, capped at MAX_RETRY_MS. */
+function retryDelay(failures: number): number {
+  return Math.min(MAX_RETRY_MS, DRAIN_RETRY_MS * 2 ** Math.max(0, Math.min(failures - 1, 5)));
+}
+
+/**
+ * Failures that do not say the server rejected this transfer: no response at
+ * all (offline), the server being unavailable, or a rejected session (kept
+ * until the user signs in again). Retry them for as long as it takes.
+ */
+function isTransientTransferError(error: unknown): boolean {
+  if (!(error instanceof HttpError)) return true;
+  return isServerUnavailableStatus(error.status) || error.status >= 500;
+}
 
 interface UploadJob {
   path: string;
@@ -81,6 +99,8 @@ export class BinarySync {
   private deferredInitialPulls = new Set<string>();
   /** Remote files whose disk materialization has not succeeded yet. */
   private pendingDownloads = new Set<string>();
+  /** Consecutive failed downloads per path, for retry backoff. */
+  private downloadFailures = new Map<string, number>();
   /** Paths we are currently writing to disk, to ignore the resulting vault event. */
   private writing = new Set<string>();
   /** Paths migrated away from binary sync during this session. */
@@ -450,10 +470,18 @@ export class BinarySync {
     } catch (e) {
       if (this.destroyed) return false;
       console.error(`[Realtime] blob download failed for ${path}`, e);
-      window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
+      this.retryDownloadLater(path);
       return false;
     }
     if (this.destroyed) return false;
+    // Never write bytes that are not the blob the index names (e.g. a copy
+    // the server stored torn): the disk copy would then be corrupt too.
+    if ((await sha256Hex(bytes)) !== hash) {
+      if (this.destroyed) return false;
+      console.error(`[Realtime] downloaded bytes for ${path} do not match blob ${hash}`);
+      this.retryDownloadLater(path);
+      return false;
+    }
     if (this.paused) {
       this.pendingDownloads.delete(path);
       this.deferReconcile(path);
@@ -470,7 +498,7 @@ export class BinarySync {
       return false;
     }
     if (!(await this.writeDisk(path, bytes))) {
-      if (!this.destroyed) window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
+      if (!this.destroyed) this.retryDownloadLater(path);
       return false;
     }
     if (this.destroyed) return false;
@@ -478,16 +506,24 @@ export class BinarySync {
     if (writtenHash !== hash) {
       if (!this.destroyed) {
         console.error(`[Realtime] binary write verification failed for ${path}`);
-        window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
+        this.retryDownloadLater(path);
       }
       return false;
     }
+    this.downloadFailures.delete(path);
     this.lastSyncedHash.set(path, hash);
     this.pendingDownloads.delete(path);
     this.localSyncState?.markSynced(path, "binary", hash, hash, true);
     this.urgentPaths.delete(path);
     dbg("binary downloaded", path, hash, bytes.byteLength);
     return true;
+  }
+
+  /** Retry a failed download with exponential backoff instead of every 2s. */
+  private retryDownloadLater(path: string): void {
+    const failures = (this.downloadFailures.get(path) ?? 0) + 1;
+    this.downloadFailures.set(path, failures);
+    window.setTimeout(() => void this.reconcile(path), retryDelay(failures));
   }
 
   private async writeDisk(path: string, bytes: ArrayBuffer): Promise<boolean> {
@@ -670,7 +706,13 @@ export class BinarySync {
           }
         } catch (e) {
           job.attempts++;
-          if (job.attempts < MAX_UPLOAD_ATTEMPTS) {
+          if (isTransientTransferError(e)) {
+            // Offline or the server is down: keep the upload and back off.
+            // Giving up here would strand a file added offline until the
+            // next restart; a reconnect also retries immediately.
+            this.uploadQueue.push(job);
+            this.scheduleDrain(retryDelay(job.attempts));
+          } else if (job.attempts < MAX_UPLOAD_ATTEMPTS) {
             this.uploadQueue.push(job);
             this.scheduleDrain(DRAIN_RETRY_MS);
           } else {
@@ -691,7 +733,9 @@ export class BinarySync {
   }
 
   private async doUpload(job: UploadJob): Promise<boolean> {
-    const exists = await this.plugin.auth.blobExists(this.vaultId, job.path, job.hash);
+    // With the size, a stored copy of the wrong length (a torn write) counts
+    // as missing, so this upload repairs it.
+    const exists = await this.plugin.auth.blobExists(this.vaultId, job.path, job.hash, job.size);
     if (this.destroyed) return true;
     if (this.paused) return false;
     if (!exists) {
@@ -831,6 +875,22 @@ export class BinarySync {
   private deferReconcile(path: string, initialPull = this.pullingMissingRemote): void {
     this.deferredReconciles.add(path);
     if (initialPull) this.deferredInitialPulls.add(path);
+  }
+
+  /**
+   * Connectivity is back: retry queued uploads and failed downloads now
+   * instead of waiting out their backoff.
+   */
+  retryNow(): void {
+    if (this.destroyed || this.paused) return;
+    if (this.drainTimer !== null) {
+      window.clearTimeout(this.drainTimer);
+      this.drainTimer = null;
+    }
+    if (this.uploadQueue.length > 0) this.scheduleDrain();
+    const failed = [...this.downloadFailures.keys()];
+    this.downloadFailures.clear();
+    for (const path of failed) void this.reconcile(path);
   }
 
   setPaused(paused: boolean): void {

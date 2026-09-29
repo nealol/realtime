@@ -84,8 +84,9 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   private status: ConnectionStatus = "offline";
   /** Attachment upload activity; overrides the "live" label when connected. */
   private uploadStatus: UploadStatus = "idle";
-  private epochRestartQueued = false;
-  private epochRestartRequested = false;
+  /** Pending epoch restart: `sql` rebuilds plugin databases, `all` all sync. */
+  private epochRestartScope: "sql" | "all" | null = null;
+  private epochRestartRunning = false;
   private unloading = false;
 
   async onload(): Promise<void> {
@@ -357,35 +358,47 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 
   /**
    * Persist a server-proposed document epoch before the transport acknowledges
-   * it, then rebuild every Y.Doc transport against epoch-scoped IndexedDB.
+   * it, then rebuild what holds that document's retired-epoch state: just the
+   * file document, the plugin databases, or (for the vault index) all sync.
    */
   acceptDocumentEpoch(documentId: string, epoch: number): void {
     const changed = setDocumentEpoch(this, documentId, epoch);
-    if (!changed) return;
-    if (this.epochRestartQueued) {
-      this.epochRestartRequested = true;
-      return;
+    if (!changed || this.unloading) return;
+    const vaultId = this.settings.activeVaultId;
+    if (vaultId && documentId.startsWith(`${vaultId}__plugindb__`)) {
+      this.requestEpochRestart("sql");
+    } else if (vaultId && documentId.startsWith(`${vaultId}__`)) {
+      queueMicrotask(() => this.vaultSync?.rebuildDocumentForEpoch(documentId));
+    } else {
+      this.requestEpochRestart("all");
     }
-    if (this.unloading) return;
-    this.epochRestartQueued = true;
-    queueMicrotask(() => void this.restartForDocumentEpoch());
   }
 
-  private async restartForDocumentEpoch(): Promise<void> {
+  private requestEpochRestart(scope: "sql" | "all"): void {
+    this.epochRestartScope = scope === "all" || this.epochRestartScope === "all" ? "all" : "sql";
+    if (this.epochRestartRunning) return;
+    this.epochRestartRunning = true;
+    queueMicrotask(() => void this.runEpochRestarts());
+  }
+
+  private async runEpochRestarts(): Promise<void> {
     try {
-      this.stopSync();
-      await this.sqlApi.destroy();
-      if (this.unloading) return;
-      this.sqlApi = new RealtimeSqlAPI(this);
-      await this.maybeStartSync();
-      new Notice(`${PLUGIN_NAME}: document history was compacted; sync reconnected.`);
-    } finally {
-      this.epochRestartQueued = false;
-      if (this.epochRestartRequested && !this.unloading) {
-        this.epochRestartRequested = false;
-        this.epochRestartQueued = true;
-        queueMicrotask(() => void this.restartForDocumentEpoch());
+      while (this.epochRestartScope !== null && !this.unloading) {
+        const scope = this.epochRestartScope;
+        this.epochRestartScope = null;
+        try {
+          if (scope === "all") this.stopSync();
+          await this.sqlApi.destroy();
+          if (this.unloading) return;
+          this.sqlApi = new RealtimeSqlAPI(this);
+          if (scope === "all") await this.maybeStartSync();
+          new Notice(`${PLUGIN_NAME}: document history was compacted; sync reconnected.`);
+        } catch (error) {
+          console.error(`[${PLUGIN_NAME}] restart after an epoch change failed`, error);
+        }
       }
+    } finally {
+      this.epochRestartRunning = false;
     }
   }
 

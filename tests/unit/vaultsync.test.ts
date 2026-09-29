@@ -12,6 +12,8 @@ import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { waitFor } from "../support/util";
 import { CompatibilityError } from "../../src/caps";
+import { HttpError } from "../../src/httpError";
+import { setDocumentEpoch } from "../../src/documentEpoch";
 import { CanvasDocument } from "../../src/CanvasDocument";
 import { parseCanvas, reconcileCanvas, serializeCanvas } from "../../src/structured/canvas";
 import { toValue } from "../../src/structured/reconcile";
@@ -1534,6 +1536,132 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("keeps syncing other documents while a queued one cannot connect", async () => {
+    (Platform as any).isMobile = true; // a single connection slot
+    const vault = await harness.createVault(aliceToken, "stuck-document");
+    const stuck = await createNote(vault.id, "stuck.md", "stuck v1");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    let stuckAttempts = 0;
+    const docToken = plugin.auth.docToken.bind(plugin.auth);
+    plugin.auth.docToken = async (...args: Parameters<typeof docToken>) => {
+      if (args[1] === `${vault.id}__${stuck.guid}`) {
+        stuckAttempts++;
+        throw new HttpError("internal error", 500);
+      }
+      return docToken(...args);
+    };
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      // The failing document takes the only slot first...
+      await waitFor(() => stuckAttempts > 0, { label: "stuck document attempted" });
+      // ...and documents created afterwards must still get through.
+      const others = ["a.md", "b.md", "c.md"];
+      for (const path of others) await createNote(vault.id, path, `${path} v1`);
+      await waitFor(() => others.every((path) => localVault.files.get(path) === `${path} v1`), {
+        timeout: 20_000,
+        label: "other documents synced past the stuck one",
+      });
+      expect(localVault.files.has("stuck.md")).toBe(false);
+    } finally {
+      sync.destroy();
+      (Platform as any).isMobile = false;
+    }
+  });
+
+  it("does not reload an evicted mobile document for every remote write", async () => {
+    (Platform as any).isMobile = true;
+    const vault = await harness.createVault(aliceToken, "mobile-invalidation-burst");
+    const paths = Array.from({ length: 6 }, (_, index) => `burst-${index}.md`);
+    for (const path of paths) await createNote(vault.id, path, `${path} v1`);
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    // Four recent notes fill the resident set, so a remotely edited note is
+    // the only document that can be evicted again.
+    plugin.settings.mobileMaxResidentDocs = 4;
+    plugin.settings.mobileRecentResidentDocs = 4;
+    plugin.settings.recentPaths = paths.slice(0, 4);
+    const target = paths[5];
+    const tokenRequests = new Map<string, number>();
+    const docToken = plugin.auth.docToken.bind(plugin.auth);
+    plugin.auth.docToken = async (...args: Parameters<typeof docToken>) => {
+      tokenRequests.set(args[1], (tokenRequests.get(args[1]) ?? 0) + 1);
+      return docToken(...args);
+    };
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(
+        () =>
+          paths.every((path) => localVault.files.get(path) === `${path} v1`) &&
+          (sync as any).docQueue.size === 0 &&
+          (sync as any).activeDocConnections === 0,
+        { timeout: 30_000, label: "mobile bootstrap" },
+      );
+      await waitFor(() => !sync.getDocumentForPath(target), { label: "target evicted" });
+      const documentId = `${vault.id}__${(await readNote(vault.id, target)).guid}`;
+      const before = tokenRequests.get(documentId) ?? 0;
+
+      for (let version = 2; version <= 7; version++) {
+        await replaceNote(vault.id, target, `${target} v${version}`);
+        await new Promise((r) => setTimeout(r, 1_000));
+      }
+      await waitFor(() => localVault.files.get(target) === `${target} v7`, {
+        timeout: 20_000,
+        label: "the last remote write reached the device",
+      });
+      expect((tokenRequests.get(documentId) ?? 0) - before).toBeLessThanOrEqual(3);
+      await waitFor(() => sync.allDocuments().length <= 4, { label: "resident cap kept" });
+    } finally {
+      sync.destroy();
+      (Platform as any).isMobile = false;
+    }
+  });
+
+  it("rebuilds only the document whose epoch changed", async () => {
+    const vault = await harness.createVault(aliceToken, "per-document-epoch");
+    const rolled = await createNote(vault.id, "rolled.md", "rolled v1");
+    await createNote(vault.id, "steady.md", "steady v1");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(
+        () =>
+          localVault.files.get("rolled.md") === "rolled v1" &&
+          localVault.files.get("steady.md") === "steady v1",
+        { label: "both notes synced" },
+      );
+      const rolledBefore = sync.getDocumentForPath("rolled.md")!;
+      const steadyBefore = sync.getDocumentForPath("steady.md")!;
+      const documentId = `${vault.id}__${rolled.guid}`;
+
+      setDocumentEpoch(plugin as any, documentId, 1);
+      sync.rebuildDocumentForEpoch(documentId);
+
+      expect(rolledBefore.isDestroyed()).toBe(true);
+      await waitFor(() => sync.getDocumentForPath("rolled.md") !== undefined, {
+        label: "rolled note rebuilt",
+      });
+      const rolledAfter = sync.getDocumentForPath("rolled.md")!;
+      expect(rolledAfter).not.toBe(rolledBefore);
+      expect(rolledAfter.epoch).toBe(1);
+      expect(sync.getDocumentForPath("steady.md")).toBe(steadyBefore);
+      expect(steadyBefore.isDestroyed()).toBe(false);
+      expect(steadyBefore.provider.status).toBe("connected");
+    } finally {
+      sync.destroy();
+    }
+  });
+
   it("keeps every mobile document resident when the server lacks invalidations", async () => {
     (Platform as any).isMobile = true;
     const vault = await harness.createVault(aliceToken, "mobile-without-invalidations");
@@ -1736,7 +1864,7 @@ describe("VaultSync index", () => {
             path,
             {
               guid,
-              provider: { status: "offline" },
+              provider: { status: "offline", on: () => {}, off: () => {} },
               isReady: () => true,
               whenNextServerSync: () => completion.promise,
               whenReady: () => Promise.resolve(),
@@ -1893,7 +2021,7 @@ describe("VaultSync index", () => {
       indexProvider,
       plugin: { setStatus: vi.fn() },
       runInitialSync: vi.fn(async () => undefined),
-      binarySync: { setPaused: setBinaryPaused },
+      binarySync: { setPaused: setBinaryPaused, retryNow: vi.fn() },
       configSync: { setPaused: setConfigPaused },
       queueMobileReconnects,
       connectIndexAfterCompatibilityCheck: vi.fn(async () => undefined),
@@ -1931,7 +2059,7 @@ describe("VaultSync index", () => {
       indexProvider,
       plugin: { setStatus: vi.fn() },
       runInitialSync: vi.fn(async () => undefined),
-      binarySync: { setPaused: vi.fn() },
+      binarySync: { setPaused: vi.fn(), retryNow: vi.fn() },
       configSync: { setPaused: vi.fn() },
       queueMobileReconnects,
       connectIndexAfterCompatibilityCheck: vi.fn(async () => undefined),

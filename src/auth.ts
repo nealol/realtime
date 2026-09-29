@@ -7,6 +7,9 @@ import {
   serverSupportsCapability,
   type CapName,
 } from "./caps";
+import { HttpError } from "./httpError";
+
+export { HttpError, isServerUnavailableStatus } from "./httpError";
 
 /** Identity returned by `GET /api/me`. */
 export interface MeResponse {
@@ -475,8 +478,13 @@ export class AuthClient {
 
     if (res.status === 401) await this.unauthorized(baseUrl, token ?? "");
     if (res.status < 200 || res.status >= 300) {
-      const msg = (res.json as { error?: string })?.error ?? `HTTP ${res.status}`;
-      throw new Error(msg);
+      let msg = `HTTP ${res.status}`;
+      try {
+        msg = (res.json as { error?: string })?.error ?? msg;
+      } catch {
+        // Non-JSON error bodies (e.g. from a proxy) keep the status message.
+      }
+      throw new HttpError(msg, res.status);
     }
     return res.json as T;
   }
@@ -782,12 +790,7 @@ export class AuthClient {
     serverUrl = this.baseUrl,
     serverId = this.plugin.settings.authServerId,
   ): void {
-    const session = this.knownSession(
-      me,
-      tokenKey,
-      serverUrl,
-      serverId,
-    );
+    const session = this.knownSession(me, tokenKey, serverUrl, serverId);
     this.saveKnownSessions([
       session,
       ...this.knownSessions().filter((existing) => existing.tokenKey !== tokenKey),
@@ -1090,25 +1093,44 @@ export class AuthClient {
   // from the JSON API (these carry raw bytes, not JSON). All three are vault
   // scoped: the server requires membership of `vaultId`.
 
-  private blobUrl(vaultId: string, path: string, hash: string): string {
-    return `${this.baseUrl}/api/vaults/${vaultId}/blobs/${hash}?path=${encodeURIComponent(path)}`;
+  /**
+   * `path` scopes the request to one vault path (the server then serves only
+   * the hash that path currently maps to). `null` requests the blob by hash
+   * alone, which the server permits for principals with uniform vault access.
+   */
+  private blobUrl(
+    vaultId: string,
+    path: string | null,
+    hash: string,
+    extra: Record<string, string> = {},
+  ): string {
+    const params = new URLSearchParams(extra);
+    if (path !== null) params.set("path", path);
+    const query = params.toString();
+    return `${this.baseUrl}/api/vaults/${vaultId}/blobs/${hash}${query ? `?${query}` : ""}`;
   }
 
-  /** True if the server already holds the blob (lets callers skip re-upload). */
-  async blobExists(vaultId: string, path: string, hash: string): Promise<boolean> {
+  /**
+   * True if the server already holds the blob (lets callers skip re-upload).
+   * With `size`, a stored copy of a different length (a torn write) does not
+   * count, so the caller re-uploads and repairs it.
+   */
+  async blobExists(vaultId: string, path: string, hash: string, size?: number): Promise<boolean> {
     const token = this.getToken();
     const res = await requestUrl({
-      url: this.blobUrl(vaultId, path, hash),
+      url: this.blobUrl(vaultId, path, hash, size === undefined ? {} : { size: String(size) }),
       method: "HEAD",
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       throw: false,
     });
     if (res.status === 401) await this.unauthorized(this.baseUrl, token);
-    return res.status >= 200 && res.status < 300;
+    if (res.status >= 200 && res.status < 300) return true;
+    if (res.status === 404) return false;
+    throw new HttpError(`blob lookup failed: HTTP ${res.status}`, res.status);
   }
 
-  /** Download blob bytes by hash. */
-  async getBlob(vaultId: string, path: string, hash: string): Promise<ArrayBuffer> {
+  /** Download blob bytes by hash (see {@link blobUrl} for `path`). */
+  async getBlob(vaultId: string, path: string | null, hash: string): Promise<ArrayBuffer> {
     const token = this.getToken();
     const res = await requestUrl({
       url: this.blobUrl(vaultId, path, hash),
@@ -1118,7 +1140,7 @@ export class AuthClient {
     });
     if (res.status === 401) await this.unauthorized(this.baseUrl, token);
     if (res.status < 200 || res.status >= 300) {
-      throw new Error(`blob download failed: ${blobErrorMessage(res)}`);
+      throw new HttpError(`blob download failed: ${blobErrorMessage(res)}`, res.status);
     }
     return res.arrayBuffer;
   }
@@ -1136,7 +1158,7 @@ export class AuthClient {
     });
     if (res.status === 401) await this.unauthorized(this.baseUrl, token);
     if (res.status < 200 || res.status >= 300) {
-      throw new Error(`blob upload failed: ${blobErrorMessage(res)}`);
+      throw new HttpError(`blob upload failed: ${blobErrorMessage(res)}`, res.status);
     }
   }
 
@@ -1168,18 +1190,22 @@ export class AuthClient {
     return `/api/vaults/${vaultId}/plugin-dbs/${p}/${n}${suffix}`;
   }
 
-  /** Pull the server replica's changeset past `cursor` (bootstrap / rebase). */
+  /**
+   * Pull the server replica's changeset past `cursor` (bootstrap / rebase),
+   * with the per-site cursor the changeset covers (absent on older servers).
+   */
   async pluginDbChanges(
     vaultId: string,
     pluginId: string,
     name: string,
     cursor: Record<string, number>,
-  ): Promise<import("./pluginDb/types").ChangeRow[]> {
+  ): Promise<{ changes: import("./pluginDb/types").ChangeRow[]; cursor?: Record<string, number> }> {
     const since = encodeURIComponent(JSON.stringify(cursor ?? {}));
-    const res = await this.api<{ changes: import("./pluginDb/types").ChangeRow[] }>(
-      this.pluginDbPath(vaultId, pluginId, name, `/changes?since=${since}`),
-    );
-    return res.changes ?? [];
+    const res = await this.api<{
+      changes?: import("./pluginDb/types").ChangeRow[];
+      cursor?: Record<string, number>;
+    }>(this.pluginDbPath(vaultId, pluginId, name, `/changes?since=${since}`));
+    return { changes: res.changes ?? [], cursor: res.cursor };
   }
 
   /** Tell the server a publish happened, so it replicates + commits to git. */

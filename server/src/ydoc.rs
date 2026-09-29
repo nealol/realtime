@@ -64,6 +64,26 @@ pub async fn set_text(state: &AppState, doc_id: &str, new_content: &str) -> AppR
     write_update_at_epoch(state, doc_id, epoch, update).await
 }
 
+/// Edit a note's text relative to one snapshot: `edit` computes the new text
+/// from the snapshot the update is then built against. Edits other clients
+/// apply after that snapshot are merged by the CRDT instead of being reverted
+/// (which is what diffing an earlier read against a later snapshot would do).
+/// Returns the snapshot's text and the edited text.
+pub async fn update_text<F>(state: &AppState, doc_id: &str, edit: F) -> AppResult<(String, String)>
+where
+    F: FnOnce(&str) -> AppResult<String>,
+{
+    let (epoch, current) = read_update_for_write(state, doc_id).await?;
+    let before =
+        decode_text(&current, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
+    let after = edit(&before)?;
+    let update = build_set_text_update(&current, "contents", &after)?;
+    if !update.is_empty() {
+        write_update_at_epoch(state, doc_id, epoch, update).await?;
+    }
+    Ok((before, after))
+}
+
 pub async fn set_structured(state: &AppState, doc_id: &str, value: &JsonValue) -> AppResult<()> {
     let (epoch, current) = read_update_for_write(state, doc_id).await?;
     let update = build_structured_update(&current, value)?;
@@ -560,29 +580,24 @@ fn should_use_text(key: Option<&str>, value: &JsonValue) -> bool {
     }) || value.len() > 256
 }
 
+/// Replace only the changed middle of `ytext`. Server documents use yrs'
+/// default byte offsets, and `common_affixes` returns byte offsets on
+/// character boundaries, so the splice never splits a character. Replacing
+/// the whole text instead would move concurrent insertions to the start of
+/// the document and undo concurrent deletions.
 fn apply_string_to_ytext(txn: &mut yrs::TransactionMut, ytext: &yrs::TextRef, next: &str) {
     let old = ytext.get_string(txn);
     if old == next {
         return;
     }
-    let ascii_splice = old.is_ascii() && next.is_ascii();
-    let (prefix, old_suffix, new_suffix) = if ascii_splice {
-        common_affixes(&old, next)
-    } else {
-        (0, old.len(), next.len())
-    };
-    let prefix_units = old[..prefix].chars().count() as u32;
-    let delete_len = if ascii_splice {
-        old[prefix..old_suffix].chars().count() as u32
-    } else {
-        old[prefix..old_suffix].len() as u32
-    };
+    let (prefix, old_suffix, new_suffix) = common_affixes(&old, next);
+    let delete_len = (old_suffix - prefix) as u32;
     if delete_len > 0 {
-        ytext.remove_range(txn, prefix_units, delete_len);
+        ytext.remove_range(txn, prefix as u32, delete_len);
     }
     let insert = &next[prefix..new_suffix];
     if !insert.is_empty() {
-        ytext.insert(txn, prefix_units, insert);
+        ytext.insert(txn, prefix as u32, insert);
     }
 }
 
@@ -621,28 +636,9 @@ fn build_set_text_update(
     if old_content == new_content {
         return Ok(Vec::new());
     }
-
-    let ascii_splice = old_content.is_ascii() && new_content.is_ascii();
-    let (prefix, old_suffix, new_suffix) = if ascii_splice {
-        common_affixes(&old_content, new_content)
-    } else {
-        (0, old_content.len(), new_content.len())
-    };
-    let prefix_units = old_content[..prefix].chars().count() as u32;
-    let delete_len = if ascii_splice {
-        old_content[prefix..old_suffix].chars().count() as u32
-    } else {
-        old_content[prefix..old_suffix].len() as u32
-    };
-    let insert_text = &new_content[prefix..new_suffix];
     {
         let mut txn = doc.transact_mut();
-        if delete_len > 0 {
-            text.remove_range(&mut txn, prefix_units, delete_len);
-        }
-        if !insert_text.is_empty() {
-            text.insert(&mut txn, prefix_units, insert_text);
-        }
+        apply_string_to_ytext(&mut txn, &text, new_content);
     }
     let update = doc.transact().encode_state_as_update_v1(&before);
     Ok(update)
@@ -1168,6 +1164,85 @@ mod tests {
             decode_text(&merged, "contents").unwrap(),
             "hello bold world"
         );
+    }
+
+    /// A client edit concurrent with a server text edit, both made on `base`.
+    fn concurrent_client_edit(
+        base: &[u8],
+        edit: impl FnOnce(&yrs::TextRef, &mut yrs::TransactionMut),
+    ) -> Vec<u8> {
+        let doc = doc_from_update(base).unwrap();
+        let before = doc.transact().state_vector();
+        let text = doc.get_or_insert_text("contents");
+        {
+            let mut txn = doc.transact_mut();
+            edit(&text, &mut txn);
+        }
+        let update = doc.transact().encode_state_as_update_v1(&before);
+        update
+    }
+
+    #[test]
+    fn set_text_on_non_ascii_note_keeps_concurrent_edits_in_place() {
+        let original = "Café notes\nline two\nline three\n";
+        let base = text_update("contents", original);
+        let server =
+            build_set_text_update(&base, "contents", "Café notes\nline two\nline THREE\n").unwrap();
+        let client = concurrent_client_edit(&base, |text, txn| {
+            let two = original.find("two").unwrap() as u32;
+            text.remove_range(txn, two, 3);
+            text.insert(txn, "Café notes".len() as u32, " (edited)");
+        });
+        let merged = apply_update(&apply_update(&base, &server), &client);
+        assert_eq!(
+            decode_text(&merged, "contents").unwrap(),
+            "Café notes (edited)\nline \nline THREE\n"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_text_keeps_edits_applied_after_its_snapshot() {
+        let root = std::env::temp_dir().join(format!("realtime-ydoc-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut config = crate::config::Config::test_default();
+        config.database_url = format!("sqlite://{}?mode=rwc", root.join("state.db").display());
+        config.crdt_store_dir = root.join("crdt").to_string_lossy().into_owned();
+        config.blob_dir = root.join("blobs").to_string_lossy().into_owned();
+        config.git_data_dir = root.join("git").to_string_lossy().into_owned();
+        config.git_enabled = false;
+        let state = crate::build_state(config).await.unwrap();
+        let doc_id = "vault__note";
+        state
+            .documents
+            .apply_update(doc_id, &text_update("contents", "Café\nbeta\ngamma\n"))
+            .await
+            .unwrap();
+        let base = state.documents.read_update(doc_id).await.unwrap();
+        let concurrent = concurrent_client_edit(&base, |text, txn| {
+            text.insert(txn, "Café".len() as u32, " (typed meanwhile)");
+        });
+
+        let handle = tokio::runtime::Handle::current();
+        let documents = state.documents.clone();
+        let (before, after) = update_text(&state, doc_id, |content| {
+            // A client edit lands after the snapshot the edit is computed from.
+            tokio::task::block_in_place(|| {
+                handle.block_on(documents.apply_update(doc_id, &concurrent))
+            })
+            .unwrap();
+            Ok(content.replace("gamma", "GAMMA"))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(before, "Café\nbeta\ngamma\n");
+        assert_eq!(after, "Café\nbeta\nGAMMA\n");
+        let current = state.documents.read_update(doc_id).await.unwrap();
+        assert_eq!(
+            decode_text(&current, "contents").unwrap(),
+            "Café (typed meanwhile)\nbeta\nGAMMA\n"
+        );
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
 
     #[test]

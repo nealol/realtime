@@ -35,10 +35,17 @@ export class Document extends SyncedDoc {
 
   /** Number of CodeMirror editors currently bound to this document. */
   private boundEditors = 0;
-  /** True while we are writing ytext content to disk (to ignore the echo). */
-  private writingToDisk = false;
-  /** Text currently being written to disk, used to identify our own echo event. */
+  /** Text of the disk write in progress, so its own modify event is not an edit. */
   private writingTextToDisk: string | null = null;
+  /**
+   * Content this device last wrote to, or read from, the file. A disk read
+   * that still returns it (for example the late event of an older write)
+   * is not an edit; anything else is someone else's change.
+   */
+  private diskKnownContent: string | null = null;
+  /** Disk writes run one at a time; a request during one coalesces behind it. */
+  private writeRunning: Promise<boolean> | null = null;
+  private writeQueued: Promise<boolean> | null = null;
   /** Disk content captured at startup, before remote sync (for conflict checks). */
   private diskAtStartup: string | null = null;
   /** Locally persisted Y.Text content before the first remote sync. */
@@ -105,7 +112,7 @@ export class Document extends SyncedDoc {
     // duplicating the just-typed text (and that merge gets re-sent to peers).
     window.setTimeout(() => {
       if (this.destroyed || this.boundEditors > 0 || this.isOpenInEditableMarkdown()) return;
-      void this.writeToDisk(this.content);
+      void this.writeToDisk();
     }, 0);
   }
 
@@ -138,14 +145,23 @@ export class Document extends SyncedDoc {
   private async captureStartupDisk(): Promise<void> {
     const disk = await this.readFromDisk();
     let stale = false;
-    if (disk !== null && this.staleLocalFingerprint !== null) {
-      stale = (await sha256Text(disk)) === this.staleLocalFingerprint;
+    let unchangedSinceSync = false;
+    if (disk !== null) {
+      const fingerprint = await sha256Text(disk);
+      stale = this.staleLocalFingerprint !== null && fingerprint === this.staleLocalFingerprint;
+      // The file still holds content this document's store contains: the
+      // disk merely lags the document (a pending write was interrupted by a
+      // restart, or an editor save was), so it is not a local edit.
+      unchangedSinceSync = await this.storeContainsDiskContent(disk);
     }
+    if (this.destroyed) return;
     this.diskAtStartup = disk;
+    this.diskKnownContent = disk;
     // An untouched copy of a note deleted remotely (and since re-created at
     // this path) is not a local change: let the new document replace it.
     if (stale) this.forceBootstrapConflict = false;
-    this.localChangedAtStartup = disk !== null && !stale && disk !== this.baselineAtStartup;
+    this.localChangedAtStartup =
+      disk !== null && !stale && !unchangedSinceSync && disk !== this.baselineAtStartup;
     this.startupDiskReadPending = false;
   }
 
@@ -229,7 +245,7 @@ export class Document extends SyncedDoc {
       // writing through vault.modify would make Obsidian merge an external change.
       let materialized = this.getFile() !== null;
       if (!this.hasBoundEditor && !this.isOpenInEditableMarkdown()) {
-        materialized = await this.writeToDisk(this.content);
+        materialized = await this.writeToDisk();
       } else if (materialized) {
         this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
       }
@@ -359,43 +375,77 @@ export class Document extends SyncedDoc {
         this.isOpenInEditableMarkdown()
       )
         return;
-      void this.writeToDisk(this.content);
+      void this.writeToDisk();
     }, delayMs);
   }
 
-  /** Called by VaultSync when the local file changed and no editor is bound. */
+  /**
+   * Called by VaultSync when the file changed on disk. Our own writes (and
+   * late events for older ones) are recognised by content, not timing; any
+   * other content is a real edit, merged with changes the document gained
+   * since the file last matched it.
+   */
   async onDiskChanged(): Promise<void> {
-    if (this.destroyed || this.hasBoundEditor) return;
-    if (this.writingToDisk) {
-      // Usually this is our own vault.modify echo. If disk already differs from
-      // Y.Text, treat it as a real concurrent disk edit and fold it immediately
-      // so the in-flight stale write can abort before overwriting it.
-      const disk = await this.readFromDisk();
-      if (
-        this.destroyed ||
-        disk === null ||
-        disk === this.writingTextToDisk ||
-        disk === this.content
-      )
-        return;
-      this.plugin.vaultSync?.noteTextActivity();
-      this.applyText(disk);
+    if (this.destroyed) return;
+    const disk = await this.readFromDisk();
+    if (this.destroyed || disk === null) return;
+    if (this.hasBoundEditor) {
+      // Obsidian owns the file while an editor is bound, and LiveEdit keeps
+      // that editor in step with the shared text: its saves are not edits.
+      if (disk === this.content) this.noteDiskContent(disk);
+      else this.diskKnownContent = disk;
       return;
     }
-    const disk = await this.readFromDisk();
-    if (disk === null) return;
-    if (this.destroyed) return;
-    if (disk === this.content) return;
+    if (disk === this.diskKnownContent || disk === this.writingTextToDisk) return;
+    if (disk === this.content) {
+      this.noteDiskContent(disk);
+      return;
+    }
+    await this.foldDiskEdit(disk);
+  }
+
+  /**
+   * Fold a disk edit into the shared text. The document may have moved on
+   * since the file last matched it (typically remote edits whose disk write
+   * was still pending), so merge against that last known disk content rather
+   * than letting the file overwrite them.
+   */
+  private async foldDiskEdit(disk: string): Promise<void> {
     this.plugin.vaultSync?.noteTextActivity();
+    const base = this.diskKnownContent;
+    const shared = this.content;
+    const merge = base !== null ? mergeText(base, disk, shared) : null;
     dbg(
       "onDiskChanged FOLD disk->ytext",
       this.path,
       "disk",
       snip(disk),
       "ytext",
-      snip(this.content),
+      snip(shared),
+      "merge",
+      merge?.kind ?? "none",
     );
-    this.applyText(disk);
+    if (merge?.kind === "conflict" && shared !== base) {
+      const preservedPath = await preserveTextConflict(this.plugin, this.path, shared, "remote");
+      if (this.destroyed) return;
+      new Notice(
+        `Realtime: "${this.path}" was edited on disk while newer changes were arriving; ` +
+          `kept the disk version and preserved the other as "${preservedPath}".`,
+      );
+    }
+    const latest = await this.readFromDisk();
+    if (this.destroyed || latest !== disk) return;
+    this.applyText(merge?.kind === "merged" ? merge.content : disk);
+    this.noteDiskContent(disk);
+  }
+
+  /** The file is known to hold `text`, which this document now contains. */
+  private noteDiskContent(text: string): void {
+    this.diskKnownContent = text;
+    // Read-only documents do not persist local folds, so a restart could not
+    // rely on the document containing this content.
+    if (this.provider.clientToken?.authorization === "read-only") return;
+    void this.recordStoredDiskContent("text", text);
   }
 
   private getFile(): TFile | null {
@@ -410,7 +460,8 @@ export class Document extends SyncedDoc {
     return (
       !this.hasBoundEditor &&
       !this.isOpenInEditableMarkdown() &&
-      !this.writingToDisk &&
+      this.writeRunning === null &&
+      this.writeQueued === null &&
       this.writeTimer === null
     );
   }
@@ -421,9 +472,34 @@ export class Document extends SyncedDoc {
     return await this.plugin.app.vault.read(file);
   }
 
-  private async writeToDisk(text: string): Promise<boolean> {
+  /**
+   * Write the current shared text to disk. Writes never overlap: a request
+   * made while one is running waits for it and then writes whatever the text
+   * is by then, so an older write's content can never land after a newer one.
+   */
+  private writeToDisk(): Promise<boolean> {
+    if (this.writeQueued) return this.writeQueued;
+    const running = this.writeRunning;
+    if (!running) return this.startDiskWrite();
+    const queued = running.then(() => {
+      this.writeQueued = null;
+      return this.startDiskWrite();
+    });
+    this.writeQueued = queued;
+    return queued;
+  }
+
+  private startDiskWrite(): Promise<boolean> {
+    const running: Promise<boolean> = this.writeCurrentContent().finally(() => {
+      if (this.writeRunning === running) this.writeRunning = null;
+    });
+    this.writeRunning = running;
+    return running;
+  }
+
+  private async writeCurrentContent(): Promise<boolean> {
     if (this.destroyed) return false;
-    this.writingToDisk = true;
+    const text = this.content;
     this.writingTextToDisk = text;
     try {
       const file = this.getFile();
@@ -445,16 +521,18 @@ export class Document extends SyncedDoc {
           this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
           return true;
         }
-        if ((await this.plugin.app.vault.read(file)) === text) {
+        const current = await this.plugin.app.vault.read(file);
+        // Re-check destroyed after the await: a doc replaced mid-write (rename,
+        // guid change) must not clobber the file its successor now owns.
+        if (this.destroyed) return false;
+        if (current === text) {
+          this.noteDiskContent(text);
           this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
           if (this.startupReady && !this.provider.hasLocalChanges) {
             await this.recordAcknowledgedContent(true);
           }
           return true;
         }
-        // Re-check destroyed after the await: a doc replaced mid-write (rename,
-        // guid change) must not clobber the file its successor now owns.
-        if (this.destroyed) return false;
         if (this.hasBoundEditor || this.isOpenInEditableMarkdown()) {
           dbg(
             "writeToDisk SKIP after read (open/bound)",
@@ -467,7 +545,15 @@ export class Document extends SyncedDoc {
           this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
           return true;
         }
+        // The shared text moved on during the read; the write it scheduled
+        // will carry the newer text.
         if (this.content !== text) return false;
+        if (this.diskKnownContent !== null && current !== this.diskKnownContent) {
+          // Someone edited the file and its modify event has not been handled
+          // yet: fold that edit in instead of overwriting it.
+          await this.foldDiskEdit(current);
+          return false;
+        }
         dbg(
           "%cwriteToDisk MODIFY",
           "color:orange",
@@ -486,6 +572,10 @@ export class Document extends SyncedDoc {
         if (this.destroyed || this.content !== text) return false;
         await this.plugin.app.vault.create(path, text);
       }
+      // A document replaced while the write was in flight must not record
+      // state for the path its successor now owns.
+      if (this.destroyed) return false;
+      this.noteDiskContent(text);
       this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
       if (this.startupReady && !this.provider.hasLocalChanges) {
         await this.recordAcknowledgedContent(true);
@@ -493,15 +583,14 @@ export class Document extends SyncedDoc {
       return true;
     } catch (e) {
       console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);
-      if (!this.destroyed) this.scheduleWriteToDisk(DISK_WRITE_RETRY_MS);
+      if (!this.destroyed) {
+        // Whatever the failed write left on disk is ours, not a user edit.
+        this.diskKnownContent = await this.readFromDisk().catch(() => this.diskKnownContent);
+        this.scheduleWriteToDisk(DISK_WRITE_RETRY_MS);
+      }
       return false;
     } finally {
-      // Release on the next tick so the resulting vault 'modify' event,
-      // which is dispatched asynchronously, is still treated as our own.
-      window.setTimeout(() => {
-        this.writingToDisk = false;
-        this.writingTextToDisk = null;
-      }, 250);
+      this.writingTextToDisk = null;
     }
   }
 

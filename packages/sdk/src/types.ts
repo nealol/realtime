@@ -385,6 +385,11 @@ export interface DocTokenResponse {
   token?: string;
   /** Logical CRDT epoch. A changed value requires a fresh local Y.Doc. */
   epoch?: number;
+  /**
+   * `epoch` is still being activated; connections to it are refused until it
+   * is. Retry the token instead of connecting to an older epoch.
+   */
+  epochPending?: boolean;
   [key: string]: unknown;
 }
 

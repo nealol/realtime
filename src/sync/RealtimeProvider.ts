@@ -3,7 +3,7 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import * as syncProtocol from "y-protocols/sync";
 import * as awarenessProtocol from "y-protocols/awareness";
-import type { ClientToken } from "./clientToken";
+import { DocumentEpochPendingError, type ClientToken } from "./clientToken";
 import { handleEpochProposal } from "../documentEpoch";
 
 const MESSAGE_SYNC = 0;
@@ -19,9 +19,19 @@ const SOCKET_OPEN = 1;
 const SOCKET_RETRIES_PER_TOKEN = 3;
 const RECONNECT_INITIAL_MS = 500;
 const TOKEN_RETRY_MS = 3_000;
+/** Cap for the per-document backoff after repeated token failures. */
+const MAX_TOKEN_RETRY_MS = 60_000;
+/** Retry cadence while the server finishes activating a pending epoch. */
+const EPOCH_PENDING_RETRY_MS = 2_000;
 const MAX_RECONNECT_MS = 5_000;
 const HEARTBEAT_MS = 2_000;
 const RESPONSE_TIMEOUT_MS = 3_000;
+/**
+ * A socket (or mux channel) that never opens must not stall the connect loop.
+ * Generous, because mux OPENs are paced client-side: after a network drop a
+ * large vault queues hundreds of channels that legitimately open over ~a minute.
+ */
+const CONNECT_TIMEOUT_MS = 60_000;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export const SYNC_EVENT_STATUS = "connection-status";
@@ -105,8 +115,16 @@ export class RealtimeProvider {
   private shouldConnect = false;
   private destroyed = false;
   private retries = 0;
+  private tokenFailures = 0;
   private localVersion = 0;
   private acknowledgedVersion = -1;
+  /**
+   * Local content a read-only connection holds that the server does not have
+   * (and will never accept). It keeps `hasLocalChanges` true: the server
+   * still answers sync-status probes on read-only connections, but those
+   * answers do not mean this content was saved.
+   */
+  private readOnlyDivergence = false;
   private receivedServerSyncStep1 = false;
   private heartbeatTimer: number | null = null;
   private responseTimer: number | null = null;
@@ -137,14 +155,13 @@ export class RealtimeProvider {
     origin: unknown,
   ): void => {
     if (origin === this || this.destroyed) return;
-    const clients = added.concat(updated, removed);
-    const encoder = encoding.createEncoder();
-    encoding.writeVarUint(encoder, MESSAGE_AWARENESS);
-    encoding.writeVarUint8Array(
-      encoder,
-      awarenessProtocol.encodeAwarenessUpdate(this.awareness, clients),
-    );
-    this.send(encoding.toUint8Array(encoder));
+    // Only this client's own presence is ours to publish. Remote states that
+    // expire locally (origin "timeout") are bookkeeping: the server removes a
+    // peer when its connection closes, and it rejects updates that name a
+    // client other than the connection's own.
+    const local = this.document.clientID;
+    if (!added.includes(local) && !updated.includes(local) && !removed.includes(local)) return;
+    this.sendAwareness([local]);
   };
 
   constructor(
@@ -162,7 +179,7 @@ export class RealtimeProvider {
   }
 
   get hasLocalChanges(): boolean {
-    return this.acknowledgedVersion < this.localVersion;
+    return this.readOnlyDivergence || this.acknowledgedVersion < this.localVersion;
   }
 
   /** Start one idempotent reconnect loop and resolve after connect or cancellation. */
@@ -259,12 +276,25 @@ export class RealtimeProvider {
       let token: ClientToken;
       try {
         token = await this.ensureClientToken();
+        this.tokenFailures = 0;
       } catch (error) {
         if (!this.canContinue(lifecycle)) return;
-        console.warn("Realtime: failed to get a document token", error);
         this.setStatus(SYNC_STATUS_ERROR);
         this.retries += 1;
-        await this.sleep(TOKEN_RETRY_MS, lifecycle);
+        if (error instanceof DocumentEpochPendingError) {
+          // The server is still collecting acknowledgements for the epoch this
+          // client already accepted; poll until it activates.
+          this.lastConnectionError = error.message;
+          await this.sleep(EPOCH_PENDING_RETRY_MS, lifecycle);
+          continue;
+        }
+        console.warn("Realtime: failed to get a document token", error);
+        this.lastConnectionError = error instanceof Error ? error.message : String(error);
+        // Back off per document so one persistently failing document cannot
+        // keep hammering the token endpoint every few seconds.
+        const delay = Math.min(MAX_TOKEN_RETRY_MS, TOKEN_RETRY_MS * 2 ** this.tokenFailures);
+        this.tokenFailures += 1;
+        await this.sleep(delay, lifecycle);
         continue;
       }
       if (!this.canContinue(lifecycle)) return;
@@ -332,12 +362,21 @@ export class RealtimeProvider {
       resolve(connected);
     };
 
+    // Bound the time to open as well as the handshake: a socket (or mux
+    // channel whose open reply was lost) that never opens would otherwise
+    // leave this attempt, and the whole connect loop, waiting forever.
+    this.handshakeTimer = window.setTimeout(() => {
+      if (this.status !== SYNC_STATUS_CONNECTED)
+        this.failSocket(socket, lifecycle, "connect timeout");
+    }, CONNECT_TIMEOUT_MS);
+
     socket.onopen = () => {
       if (!this.isCurrentSocket(socket, lifecycle)) return;
       this.setStatus(SYNC_STATUS_HANDSHAKING);
       this.sendSyncStep1();
       this.broadcastAwareness();
       this.resetHeartbeat();
+      this.clearHandshakeTimeout();
       this.handshakeTimer = window.setTimeout(() => {
         if (this.status !== SYNC_STATUS_CONNECTED) {
           this.failSocket(socket, lifecycle, "handshake timeout");
@@ -437,10 +476,12 @@ export class RealtimeProvider {
     const encoder = encoding.createEncoder();
     encoding.writeVarUint(encoder, MESSAGE_SYNC);
     const messageType = syncProtocol.readSyncMessage(decoder, encoder, this.document, this);
-    if (encoding.length(encoder) > 1) this.send(encoding.toUint8Array(encoder));
+    const reply = encoding.toUint8Array(encoder);
+    if (reply.length > 1) this.send(reply);
 
     if (messageType === syncProtocol.messageYjsSyncStep1) {
       this.receivedServerSyncStep1 = true;
+      if (this.clientToken?.authorization === "read-only") this.noteReadOnlyDivergence(reply);
       this.checkSync();
     } else if (messageType === syncProtocol.messageYjsSyncStep2) {
       this.clearHandshakeTimeout();
@@ -464,7 +505,8 @@ export class RealtimeProvider {
         );
         break;
       case MESSAGE_QUERY_AWARENESS:
-        this.sendAwareness(Array.from(this.awareness.getStates().keys()));
+        // Answer for this client only (see awarenessUpdateListener).
+        this.broadcastAwareness();
         break;
       case MESSAGE_SYNC_STATUS: {
         const versionDecoder = decoding.createDecoder(decoding.readVarUint8Array(decoder));
@@ -527,8 +569,30 @@ export class RealtimeProvider {
 
   private acknowledgeVersion(version: number): void {
     const wasPending = this.hasLocalChanges;
+    // Over a full-access connection the acknowledgement also covers whatever
+    // this connection's handshake sent, including earlier read-only divergence.
+    if (this.clientToken?.authorization !== "read-only") this.readOnlyDivergence = false;
     this.acknowledgedVersion = Math.max(this.acknowledgedVersion, version);
     if (wasPending && !this.hasLocalChanges) this.emit(SYNC_EVENT_LOCAL_CHANGES, false);
+  }
+
+  /**
+   * A read-only server never accepts this client's content. If the handshake
+   * shows local items the server lacks (edits persisted before the grant
+   * turned out to be read-only), keep them pending: the server still answers
+   * sync-status probes, but those replies must not mark this content saved.
+   */
+  private noteReadOnlyDivergence(reply: Uint8Array): void {
+    const decoder = decoding.createDecoder(reply);
+    decoding.readVarUint(decoder);
+    if (decoding.readVarUint(decoder) !== syncProtocol.messageYjsSyncStep2) return;
+    const update = decoding.readVarUint8Array(decoder);
+    // Only inserted structs are evidence: Yjs always encodes the whole delete
+    // set, so deletions cannot be compared against the server's state vector.
+    if (Y.decodeUpdate(update).structs.length === 0) return;
+    const wasPending = this.hasLocalChanges;
+    this.readOnlyDivergence = true;
+    if (!wasPending) this.emit(SYNC_EVENT_LOCAL_CHANGES, true);
   }
 
   private checkSync(): void {

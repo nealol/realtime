@@ -61,3 +61,57 @@ describe("applyTextToYText", () => {
     expect(ta.toString()).toBe("the slow brown fox!");
   });
 });
+
+/** Apply the diff on one peer, round-trip the update, and return both texts. */
+function applyAndSync(initial: string, target: string, separateItems = false) {
+  const local = new Y.Doc();
+  const text = local.getText("contents");
+  if (separateItems) {
+    for (const char of Array.from(initial)) text.insert(text.length, char);
+  } else if (initial) {
+    text.insert(0, initial);
+  }
+  local.transact(() => applyTextToYText(text, target));
+  const remote = new Y.Doc();
+  Y.applyUpdate(remote, Y.encodeStateAsUpdate(local));
+  return { local: text.toString(), remote: remote.getText("contents").toString() };
+}
+
+describe("applyTextToYText with astral characters", () => {
+  it.each([
+    ["replaces one emoji with another from the same block", "Status: 🟢 done", "Status: 🔴 done"],
+    ["inserts an emoji before another from the same block", "x😀y", "x😃😀y"],
+    ["deletes an emoji followed by another from the same block", "😃😀", "😀"],
+    ["deletes an emoji preceded by another from the same block", "😀😃", "😀"],
+    ["replaces a character whose low surrogate is unchanged", "\u{1F389}", "\u{1F789}"],
+    ["appends after an emoji", "😀", "😀😃"],
+  ])("%s", (_label, initial, target) => {
+    for (const separateItems of [false, true]) {
+      const { local, remote } = applyAndSync(initial, target, separateItems);
+      expect(local).toBe(target);
+      expect(remote).toBe(target);
+    }
+  });
+
+  it("never corrupts random edits of emoji-heavy text", () => {
+    const alphabet = ["a", "b", " ", "\n", "😀", "😃", "🟢", "🔴", "🎉", "é", "中"];
+    let seed = 42;
+    const random = () => {
+      seed = (seed * 1103515245 + 12345) % 2 ** 31;
+      return seed / 2 ** 31;
+    };
+    const word = (length: number) =>
+      Array.from({ length }, () => alphabet[Math.floor(random() * alphabet.length)]).join("");
+    for (let round = 0; round < 500; round++) {
+      const initial = Array.from(word(1 + Math.floor(random() * 12)));
+      const edited = [...initial];
+      const at = Math.floor(random() * (edited.length + 1));
+      const remove = Math.floor(random() * Math.min(3, edited.length - at + 1));
+      edited.splice(at, remove, ...Array.from(word(Math.floor(random() * 3))));
+      const target = edited.join("");
+      const { local, remote } = applyAndSync(initial.join(""), target, random() < 0.5);
+      expect(local).toBe(target);
+      expect(remote).toBe(target);
+    }
+  });
+});

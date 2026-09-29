@@ -314,6 +314,7 @@ class MuxConnection {
     this.openRetryTimer = setTimeout(() => {
       this.openRetryTimer = null;
       this.flushOpens();
+      this.teardownIfIdle();
     }, waitMs);
   }
 
@@ -389,9 +390,15 @@ class MuxConnection {
   }
 
   private teardownIfIdle(): void {
-    if (this.channels.size === 0 && this.pendingOpens.size === 0 && this.openBlockedUntil === 0) {
+    if (this.channels.size !== 0 || this.pendingOpens.size !== 0) return;
+    const waitMs = this.openBlockedUntil - Date.now();
+    if (waitMs <= 0) {
       this.teardown();
+      return;
     }
+    // Keep the socket through the OPEN backoff so a reconnecting channel still
+    // honours it; the retry timer drops the socket afterwards if still idle.
+    this.scheduleOpenRetry(waitMs);
   }
 
   private startHeartbeat(): void {

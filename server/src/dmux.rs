@@ -64,6 +64,10 @@ const MAX_OPENS_PER_CONNECTION: usize = 4_096;
 const OPEN_RATE_WINDOW: Duration = Duration::from_secs(10);
 /// The browser client sends mux PING frames every five seconds.
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest the read loop waits to queue a control reply. A client that has
+/// not drained its socket for this long is not reading, so the connection is
+/// closed (the client reconnects) instead of leaving the loop parked.
+const CONTROL_SEND_TIMEOUT: Duration = CLIENT_IDLE_TIMEOUT;
 
 struct OpenLimiter {
     seen_channels: HashSet<u64>,
@@ -153,7 +157,13 @@ async fn handle(client: WebSocket, state: AppState) {
                     }) => {
                         if !open_limiter.admit(channel, channels.len(), Instant::now()) {
                             state.sync_metrics.document_channel_rejected();
-                            let _ = out_tx.try_send(encode_simple(FRAME_OPEN_ERR, channel));
+                            // Queued even when the outbound queue is full: a
+                            // dropped OPEN_ERR leaves the client's channel
+                            // waiting to open forever.
+                            let rejected = encode_simple(FRAME_OPEN_ERR, channel);
+                            if !send_control(&out_tx, rejected, CONTROL_SEND_TIMEOUT).await {
+                                break;
+                            }
                             tracing::warn!(
                                 channel,
                                 active_channels = channels.len(),
@@ -188,8 +198,11 @@ async fn handle(client: WebSocket, state: AppState) {
                                 Err(TrySendError::Full(_)) => {
                                     remove_channel(&mut channels, channel, &state);
                                     state.sync_metrics.document_channel_backpressure_reset();
-                                    let _ = out_tx.try_send(encode_simple(FRAME_CLOSE, channel));
                                     tracing::warn!(channel, "dmux: document backpressure; reset channel");
+                                    let reset = encode_simple(FRAME_CLOSE, channel);
+                                    if !send_control(&out_tx, reset, CONTROL_SEND_TIMEOUT).await {
+                                        break;
+                                    }
                                 }
                                 Err(TrySendError::Closed(_)) => {
                                     remove_channel(&mut channels, channel, &state);
@@ -200,12 +213,15 @@ async fn handle(client: WebSocket, state: AppState) {
                     Some(Frame::OversizedData { channel }) => {
                         remove_channel(&mut channels, channel, &state);
                         state.sync_metrics.document_channel_backpressure_reset();
-                        let _ = out_tx.try_send(encode_simple(FRAME_CLOSE, channel));
                         tracing::warn!(
                             channel,
                             payload_limit = MAX_DATA_FRAME_BYTES,
                             "dmux: oversized document frame; reset channel"
                         );
+                        let reset = encode_simple(FRAME_CLOSE, channel);
+                        if !send_control(&out_tx, reset, CONTROL_SEND_TIMEOUT).await {
+                            break;
+                        }
                     }
                     Some(Frame::Close { channel }) => {
                         // Dropping the sender ends that channel's upstream pump.
@@ -238,6 +254,16 @@ async fn handle(client: WebSocket, state: AppState) {
     writer.abort();
     let _ = writer.await;
     state.sync_metrics.physical_connection_closed();
+}
+
+/// Queue a control frame from the read loop, waiting at most `wait` for room.
+/// `false` means it cannot be delivered: the writer is gone, or the client
+/// has stopped reading.
+async fn send_control(out_tx: &mpsc::Sender<Vec<u8>>, frame: Vec<u8>, wait: Duration) -> bool {
+    matches!(
+        tokio::time::timeout(wait, out_tx.send(frame)).await,
+        Ok(Ok(()))
+    )
 }
 
 fn remove_channel(
@@ -464,6 +490,27 @@ fn encode_data(channel: u64, payload: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[tokio::test]
+    async fn control_frames_wait_for_room_but_not_forever() {
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(1);
+        out_tx.send(vec![1]).await.unwrap();
+        // A client that drains its queue still gets the frame...
+        let drain = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let first = out_rx.recv().await;
+            let second = out_rx.recv().await;
+            (first, second, out_rx)
+        });
+        assert!(send_control(&out_tx, vec![2], Duration::from_secs(5)).await);
+        let (first, second, out_rx) = drain.await.unwrap();
+        assert_eq!((first, second), (Some(vec![1]), Some(vec![2])));
+        // ...one that stops reading ends the wait instead of parking it.
+        out_tx.send(vec![3]).await.unwrap();
+        assert!(!send_control(&out_tx, vec![4], Duration::from_millis(20)).await);
+        drop(out_rx);
+        assert!(!send_control(&out_tx, vec![5], Duration::from_secs(5)).await);
+    }
 
     #[test]
     fn varint_roundtrips() {

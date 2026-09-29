@@ -83,6 +83,7 @@ instead of letting an incompatible binary use the database.
 | `CRDT_EPOCH_MAX_UPDATES` | `100000` | Update-count threshold for early epoch replacement |
 | `CRDT_EPOCH_MAX_STATE_BYTES` | `33554432` | Encoded-state growth allowed above the epoch's logical baseline |
 | `CRDT_EPOCH_MAX_DELETE_SET_BYTES` | `8388608` | Encoded delete-set growth allowed above the epoch's logical baseline |
+| `CRDT_EPOCH_ACK_TIMEOUT_MS` | `30000` | How long a proposed epoch waits for connected peers to acknowledge it before activating anyway |
 | `UPLOAD_TOKEN` | `dev-upload-token-change-me` | HMAC key for signed single-use browser upload links; set a long random secret in production |
 | `ATTACHMENT_ALLOWED_EXTENSIONS` | common images, `pdf`, `txt` | Comma-separated extensions allowed for signed and server-fetched uploads; `*` allows every extension and extensionless files |
 | `ATTACHMENT_MAX_BYTES` | raw blob max | Per-attachment upload/fetch size cap; separate from the raw content-addressed blob store cap |

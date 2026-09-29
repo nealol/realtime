@@ -13,12 +13,12 @@ import { TFile, TAbstractFile, Notice, Platform, type EventRef } from "obsidian"
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./sync/clientToken";
 import { createMuxSocket } from "./sync/mux";
-import { epochPersistenceName } from "./documentEpoch";
+import { epochPersistenceName, getDocumentEpoch } from "./documentEpoch";
 import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
 import type { StructuredDocument } from "./StructuredDocument";
-import type { DocumentBootstrapOptions } from "./SyncedDoc";
+import type { DocumentBootstrapOptions, SyncedDoc } from "./SyncedDoc";
 import { BinarySync, type BinaryMeta } from "./BinarySync";
 import { ConfigSync, type ConfigMeta } from "./ConfigSync";
 import { categoryForConfigPath, enabledConfigCategories } from "./configCategories";
@@ -43,6 +43,11 @@ interface StructuredMeta {
   guid: string;
   kind: StructuredKind;
 }
+
+/** Longest a queued document may hold a connection slot before the next starts. */
+const QUEUE_SLOT_TIMEOUT_MS = 30_000;
+/** Reload an evicted document for invalidations at most this often. */
+const INVALIDATION_RELOAD_WINDOW_MS = 5_000;
 
 function isStructuredMeta(value: unknown): value is StructuredMeta {
   if (!value || typeof value !== "object") return false;
@@ -190,6 +195,9 @@ export class VaultSync {
   private mobileTrimRunning = false;
   private mobileCatchUpPending = false;
   private mobileResumeInProgress = false;
+  /** Evicted documents recently reloaded because of an invalidation. */
+  private invalidationReloads = new Set<string>();
+  private invalidationReloadPending = new Set<string>();
   private invalidationListener: (documentId: string) => void;
 
   constructor(plugin: RealtimePlugin) {
@@ -225,14 +233,16 @@ export class VaultSync {
     // Connect only after the persisted index has loaded (see init()), so local
     // offline map changes merge with the server instead of racing it. The index
     // doc keeps the bare vault id; file docs are namespaced as `${vaultId}__${guid}`.
+    // Pin the epoch: an index epoch change restarts sync with a fresh store.
+    const indexEpoch = getDocumentEpoch(plugin, vaultId);
     this.indexProvider = new RealtimeProvider(
       vaultId,
       this.indexDoc,
-      () => getClientToken(plugin, vaultId),
+      () => getClientToken(plugin, vaultId, undefined, indexEpoch),
       { connect: false, socketFactory: createMuxSocket },
     );
     this.indexPersistence = new IndexeddbPersistence(
-      epochPersistenceName(plugin, vaultId, `realtime:index:${localScope}`),
+      epochPersistenceName(plugin, vaultId, `realtime:index:${localScope}`, indexEpoch),
       this.indexDoc,
     );
 
@@ -263,6 +273,7 @@ export class VaultSync {
       this.wasConnected = true;
       this.plugin.setStatus("connected");
       void this.runInitialSync();
+      this.binarySync.retryNow();
       if (Platform?.isMobile && this.mobileCatchUpPending && !this.mobileResumeInProgress) {
         this.mobileCatchUpPending = false;
         this.binarySync.setPaused(false);
@@ -363,6 +374,24 @@ export class VaultSync {
     this.localSyncState.markSynced(path, kind, identity, fingerprint, reconciled);
   }
 
+  /** Record disk content the document for `identity` durably contains. */
+  noteDiskContent(
+    path: string,
+    kind: MaterializedKind,
+    identity: string,
+    fingerprint: string,
+  ): void {
+    if (this.destroyed) return;
+    this.localSyncState.markDisk(path, kind, identity, fingerprint);
+  }
+
+  /** Fingerprint of disk content the document for `identity` last contained. */
+  async diskFingerprint(path: string, identity: string): Promise<string | null> {
+    await this.localSyncState.whenSynced;
+    if (this.destroyed) return null;
+    return this.localSyncState.diskFingerprint(path, identity);
+  }
+
   /** Nudge the index provider and every document to reconnect if stalled. */
   reconnectAll(): void {
     if (this.destroyed || this.mobileSuspended) return;
@@ -446,6 +475,30 @@ export class VaultSync {
     this.pumpDocQueue();
   }
 
+  /**
+   * A file document moved to a new epoch: its resident Y.Doc and IndexedDB
+   * store hold retired-epoch state and must not reconnect. Replace just that
+   * document; every other document keeps syncing undisturbed.
+   */
+  rebuildDocumentForEpoch(documentId: string): void {
+    if (this.destroyed) return;
+    const prefix = `${this.plugin.settings.activeVaultId}__`;
+    if (!documentId.startsWith(prefix)) return;
+    const guid = documentId.slice(prefix.length);
+    for (const [path, doc] of [...this.documents]) {
+      if (doc.guid !== guid) continue;
+      this.removeDocument(path);
+      this.enqueueDoc({ path, guid, kind: "text" }, true);
+    }
+    for (const [path, doc] of [...this.structuredDocuments]) {
+      if (doc.guid !== guid) continue;
+      const kind: StructuredKind = doc instanceof CanvasDocument ? "canvas" : "base";
+      this.removeStructuredDocument(path);
+      this.enqueueDoc({ path, guid, kind }, true);
+    }
+    this.pumpDocQueue();
+  }
+
   private onDocumentInvalidated(documentId: string): void {
     if (!Platform?.isMobile || this.destroyed) return;
     const prefix = `${this.plugin.settings.activeVaultId}__`;
@@ -454,6 +507,26 @@ export class VaultSync {
     if (!guid) return;
     const path = this.pathForGuid(guid);
     if (!path) return;
+    // The server sends one invalidation per remote write. Count that activity
+    // as use, so a document being edited elsewhere stays resident (and live)
+    // instead of being evicted right after each reload and reloaded again.
+    this.mobileLastUsedAt.set(path, Date.now());
+    const resident = this.documents.has(path) || this.structuredDocuments.has(path);
+    if (!resident) {
+      // Reload an evicted document at most once per window; a later write in
+      // the window is picked up by one trailing reload.
+      if (this.invalidationReloads.has(path)) {
+        this.invalidationReloadPending.add(path);
+        return;
+      }
+      this.invalidationReloads.add(path);
+      window.setTimeout(() => {
+        this.invalidationReloads.delete(path);
+        if (this.invalidationReloadPending.delete(path) && !this.destroyed) {
+          this.onDocumentInvalidated(documentId);
+        }
+      }, INVALIDATION_RELOAD_WINDOW_MS);
+    }
     this.enqueueKnownPath(path, true, true);
     this.pumpDocQueue();
   }
@@ -1040,7 +1113,7 @@ export class VaultSync {
           ? doc.whenNextServerSync()
           : doc.whenReady();
       doc.connect();
-      void completion.finally(() => {
+      void this.whenQueueSlotFree(doc, completion).then(() => {
         if (generation !== this.docConnectionGeneration) return;
         this.activeDocConnections = Math.max(0, this.activeDocConnections - 1);
         this.prioritizedPaths.delete(item.path);
@@ -1053,6 +1126,31 @@ export class VaultSync {
         this.pumpDocQueue();
       });
     }
+  }
+
+  /**
+   * The queue throttles concurrent handshakes; it must not wait on a document
+   * that cannot connect (it keeps retrying on its own) or on one that is
+   * waiting for the user to resolve a startup conflict. With one or two
+   * slots, either would otherwise stop every other document from syncing.
+   */
+  private whenQueueSlotFree(doc: SyncedDoc, completion: Promise<void>): Promise<void> {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        window.clearTimeout(timer);
+        doc.provider.off(SYNC_EVENT_STATUS, onStatus);
+        resolve();
+      };
+      const onStatus = (status: SyncStatus) => {
+        if (status === SYNC_STATUS_ERROR) finish();
+      };
+      const timer = window.setTimeout(finish, QUEUE_SLOT_TIMEOUT_MS);
+      doc.provider.on(SYNC_EVENT_STATUS, onStatus);
+      void completion.then(finish, finish);
+    });
   }
 
   private startBackgroundSyncAfterPriorityDrain(): void {

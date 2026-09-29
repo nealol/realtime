@@ -3,6 +3,7 @@ import * as Y from "yjs";
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import * as syncProtocol from "y-protocols/sync";
+import * as awarenessProtocol from "y-protocols/awareness";
 import {
   RealtimeProvider,
   SYNC_EVENT_DOCUMENT_INVALIDATED,
@@ -10,7 +11,8 @@ import {
   type SyncSocket,
 } from "../../src/sync/RealtimeProvider";
 import { resetDocumentEpochStateForTests, setEpochProposalHandler } from "../../src/documentEpoch";
-import type { ClientToken } from "../../src/sync/clientToken";
+import { DocumentEpochPendingError, type ClientToken } from "../../src/sync/clientToken";
+import { HttpError } from "../../src/httpError";
 
 const TOKEN: ClientToken = {
   url: "ws://sync.test/d/vault__doc/ws",
@@ -293,4 +295,139 @@ describe("RealtimeProvider", () => {
       f.destroy();
     }
   });
+
+  it("publishes only this client's presence, never a remote client's timeout", async () => {
+    const f = fixture();
+    try {
+      const socket = await openAndHandshake(f);
+      const remote = new awarenessProtocol.Awareness(new Y.Doc());
+      remote.setLocalState({ user: { name: "remote" } });
+      const encoder = encoding.createEncoder();
+      encoding.writeVarUint(encoder, 1);
+      encoding.writeVarUint8Array(
+        encoder,
+        awarenessProtocol.encodeAwarenessUpdate(remote, [remote.clientID]),
+      );
+      socket.deliver(encoding.toUint8Array(encoder));
+      expect(f.provider.awareness.getStates().has(remote.clientID)).toBe(true);
+
+      const before = socket.sent.length;
+      awarenessProtocol.removeAwarenessStates(f.provider.awareness, [remote.clientID], "timeout");
+      expect(socket.sent.slice(before).map(messageType)).not.toContain(1);
+
+      f.provider.awareness.setLocalStateField("user", { name: "me" });
+      const published = socket.sent.slice(before).filter((message) => messageType(message) === 1);
+      expect(published).toHaveLength(1);
+      expect(awarenessClients(published[0])).toEqual([f.doc.clientID]);
+      remote.destroy();
+    } finally {
+      f.destroy();
+    }
+  });
+
+  it("gives up on a socket that never opens and tries again", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    try {
+      void f.provider.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(f.sockets).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(59_000);
+      expect(f.sockets[0].closeCount).toBe(0);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(f.sockets[0].closeCount).toBe(1);
+      expect(f.provider.lastConnectionError).toBe("connect timeout");
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(f.sockets).toHaveLength(2);
+    } finally {
+      f.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps content a read-only server lacks pending after sync-status replies", async () => {
+    let authorization: "full" | "read-only" = "read-only";
+    const f = fixture(() => Promise.resolve({ ...TOKEN, authorization }));
+    try {
+      // Persisted before the grant turned out to be read-only.
+      f.doc.getText("contents").insert(0, "offline edit");
+      const socket = await openAndHandshake(f);
+      socket.deliver(syncAcknowledgement(1));
+      expect(f.provider.hasLocalChanges).toBe(true);
+
+      // Once a full-access connection's handshake carries the content and the
+      // server acknowledges it, it is saved.
+      authorization = "full";
+      f.provider.clientToken = null;
+      socket.drop();
+      await vi.waitFor(() => expect(f.sockets).toHaveLength(2));
+      const next = f.sockets[1];
+      next.open();
+      const server = new Y.Doc();
+      next.deliver(serverStep1(server));
+      next.deliver(serverStep2(server));
+      await vi.waitFor(() => expect(f.provider.status).toBe("connected"));
+      next.deliver(syncAcknowledgement(1));
+      expect(f.provider.hasLocalChanges).toBe(false);
+      server.destroy();
+    } finally {
+      f.destroy();
+    }
+  });
+
+  it("backs off token retries per document", async () => {
+    vi.useFakeTimers();
+    const tokenSource = vi.fn(() => Promise.reject(new HttpError("forbidden", 403)));
+    const f = fixture(tokenSource);
+    try {
+      void f.provider.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(tokenSource).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(tokenSource).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(tokenSource).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(tokenSource).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(tokenSource).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(tokenSource).toHaveBeenCalledTimes(4);
+    } finally {
+      f.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it("polls quickly while the server activates an epoch this client accepted", async () => {
+    vi.useFakeTimers();
+    const tokenSource = vi.fn(() =>
+      Promise.reject(new DocumentEpochPendingError("vault__doc", 2, 1)),
+    );
+    const f = fixture(tokenSource);
+    try {
+      void f.provider.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(2_000 * 5);
+      expect(tokenSource).toHaveBeenCalledTimes(6);
+      expect(f.sockets).toHaveLength(0);
+    } finally {
+      f.destroy();
+      vi.useRealTimers();
+    }
+  });
 });
+
+function awarenessClients(message: Uint8Array): number[] {
+  const decoder = decoding.createDecoder(message);
+  decoding.readVarUint(decoder);
+  const update = decoding.createDecoder(decoding.readVarUint8Array(decoder));
+  const count = decoding.readVarUint(update);
+  const clients: number[] = [];
+  for (let i = 0; i < count; i++) {
+    clients.push(decoding.readVarUint(update));
+    decoding.readVarUint(update);
+    decoding.readVarString(update);
+  }
+  return clients;
+}

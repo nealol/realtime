@@ -43,8 +43,8 @@ export function epochPersistenceName(
   plugin: RealtimePlugin,
   documentId: string,
   baseName: string,
+  epoch = getDocumentEpoch(plugin, documentId),
 ): string {
-  const epoch = getDocumentEpoch(plugin, documentId);
   return epoch === 0 ? baseName : `${baseName}:epoch:${epoch}`;
 }
 

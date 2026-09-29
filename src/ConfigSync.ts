@@ -543,8 +543,10 @@ export class ConfigSync {
     const decoder = new TextDecoder();
     const baseHash = this.lastSyncedHash.get(path);
     if (baseHash) {
+      // Fetch the baseline by hash alone: a path-scoped request only serves
+      // the hash the path currently maps to, which is the remote version.
       const baseBytes = await this.plugin.auth
-        .getBlob(this.vaultId, path, baseHash)
+        .getBlob(this.vaultId, null, baseHash)
         .catch(() => null);
       if (!this.canApply(generation)) {
         if (!this.destroyed) void this.reconcile(path);

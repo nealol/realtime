@@ -84,6 +84,7 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
             max_update_count: config.crdt_epoch_max_updates,
             max_encoded_state_bytes: config.crdt_epoch_max_state_bytes,
             max_delete_set_bytes: config.crdt_epoch_max_delete_set_bytes,
+            ack_timeout_ms: config.crdt_epoch_ack_timeout_ms,
         },
     )
     .await?;

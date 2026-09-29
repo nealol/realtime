@@ -1,5 +1,6 @@
 import type RealtimePlugin from "../main";
 import { getDocumentEpoch } from "../documentEpoch";
+import { HttpError, isServerUnavailableStatus } from "../httpError";
 
 /** Token fields used by Realtime's native document provider. */
 export type ClientToken = {
@@ -9,6 +10,8 @@ export type ClientToken = {
   token?: string;
   authorization?: "full" | "read-only";
   epoch?: number;
+  /** The server is still activating `epoch`; it accepts connections once active. */
+  epochPending?: boolean;
 };
 
 export class DocumentEpochChangedError extends Error {
@@ -35,9 +38,15 @@ export class DocumentEpochPendingError extends Error {
 }
 
 const TOKEN_RETRY_DELAY_MS = 30_000;
+/**
+ * Server errors on this many token requests in a row (with no success in
+ * between) mean the server is failing generally rather than for one document.
+ */
+const SERVER_FAILURES_BEFORE_BACKOFF = 3;
 
 let tokenRetryDelayMs = TOKEN_RETRY_DELAY_MS;
 let nextTokenAttemptAt = 0;
+let consecutiveServerFailures = 0;
 let tokenAttemptQueue: Promise<void> = Promise.resolve();
 
 /**
@@ -49,7 +58,31 @@ let tokenAttemptQueue: Promise<void> = Promise.resolve();
 export function resetTokenRetryStateForTests(delayMs = TOKEN_RETRY_DELAY_MS): void {
   tokenRetryDelayMs = delayMs;
   nextTokenAttemptAt = 0;
+  consecutiveServerFailures = 0;
   tokenAttemptQueue = Promise.resolve();
+}
+
+/**
+ * Whether a failed token request should delay every document's next request.
+ * Only failures that say the server or the session is unavailable qualify: an
+ * error specific to one document (a 4xx, or one document's 500) must not stall
+ * the rest of the vault behind it.
+ */
+function backsOffEveryDocument(error: unknown): boolean {
+  if (error instanceof DocumentEpochChangedError || error instanceof DocumentEpochPendingError) {
+    return false;
+  }
+  if (error instanceof HttpError) {
+    if (isServerUnavailableStatus(error.status)) return true;
+    if (error.status >= 500) {
+      consecutiveServerFailures += 1;
+      return consecutiveServerFailures >= SERVER_FAILURES_BEFORE_BACKOFF;
+    }
+    return false;
+  }
+  // No HTTP response (offline, DNS, TLS), a rejected session, or a malformed
+  // token: nothing else can succeed right now either.
+  return true;
 }
 
 function delay(ms: number): Promise<void> {
@@ -72,16 +105,28 @@ async function waitForTokenAttemptSlot(): Promise<() => void> {
  *
  * `docId` is the *namespaced* id (`{vaultId}` for the index, `{vaultId}__{guid}`
  * for a file); the vault is always the active vault.
+ *
+ * `expectedEpoch` is the epoch the caller's local Y.Doc and persistence were
+ * built for. Once the durable epoch moves past it, that instance holds state
+ * from a retired epoch and must never connect again: its items would be new
+ * to the replacement document and duplicate its content.
  */
 export async function getClientToken(
   plugin: RealtimePlugin,
   docId: string,
   path?: string,
+  expectedEpoch?: number,
 ): Promise<ClientToken> {
   const vaultId = plugin.settings.activeVaultId;
   if (!vaultId) {
     throw new Error("Realtime: no active vault; sign in and set up a vault before syncing.");
   }
+  const staleEpoch = () => {
+    const localEpoch = getDocumentEpoch(plugin, docId);
+    return expectedEpoch !== undefined && localEpoch !== expectedEpoch ? localEpoch : null;
+  };
+  const staleBeforeRequest = staleEpoch();
+  if (staleBeforeRequest !== null) throw new DocumentEpochChangedError(docId, staleBeforeRequest);
 
   const release = await waitForTokenAttemptSlot();
   try {
@@ -90,6 +135,7 @@ export async function getClientToken(
 
     const token = await plugin.auth.docToken(vaultId, docId, path);
     nextTokenAttemptAt = 0;
+    consecutiveServerFailures = 0;
     if (!token || !token.url) {
       throw new Error(`Realtime: auth server returned an invalid token for "${docId}".`);
     }
@@ -100,24 +146,23 @@ export async function getClientToken(
       throw new DocumentEpochChangedError(docId, serverEpoch);
     }
     if (serverEpoch < localEpoch) {
-      // The client may have persisted an epoch proposal immediately before it
-      // crashed or was restarted, leaving the server waiting for its
-      // acknowledgement. It must reconnect to the retiring epoch to receive
-      // the proposal again, but must not publish fresh-epoch state into that
-      // retiring document. Use a read-only grant for that recovery handshake.
-      const recoveryToken = await plugin.auth.docToken(vaultId, docId, path, "read-only");
-      if (
-        !recoveryToken?.url ||
-        recoveryToken.authorization !== "read-only" ||
-        (recoveryToken.epoch ?? 0) !== serverEpoch
-      ) {
-        throw new DocumentEpochPendingError(docId, localEpoch, serverEpoch);
-      }
-      return recoveryToken;
+      // This client already accepted a proposed epoch that the server has not
+      // activated yet (it is waiting for other peers to acknowledge, for at
+      // most its acknowledgement timeout). Wait for it: connecting to the
+      // retiring epoch would load its items into the fresh local document,
+      // and the next full-access connection would upload them into the
+      // replacement as duplicate content.
+      throw new DocumentEpochPendingError(docId, localEpoch, serverEpoch);
     }
+    if (token.epochPending) {
+      // Newer servers name the pending epoch in tokens while it activates.
+      throw new DocumentEpochPendingError(docId, localEpoch, serverEpoch);
+    }
+    const staleAfterRequest = staleEpoch();
+    if (staleAfterRequest !== null) throw new DocumentEpochChangedError(docId, staleAfterRequest);
     return token;
   } catch (e) {
-    if (!(e instanceof DocumentEpochChangedError) && !(e instanceof DocumentEpochPendingError)) {
+    if (backsOffEveryDocument(e)) {
       nextTokenAttemptAt = Date.now() + tokenRetryDelayMs;
     }
     throw e;

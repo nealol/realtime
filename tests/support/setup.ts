@@ -21,6 +21,20 @@ beforeEach(() => {
 // implementation both providers drive without that mismatch.
 (globalThis as any).WebSocket = WS as unknown as typeof WebSocket;
 
+// Node 25+ defines its own global `localStorage` accessor, which returns
+// undefined unless the process runs with --localstorage-file. The accessor
+// shadows jsdom's Storage, so restore the jsdom window's one for tests.
+if (typeof localStorage === "undefined") {
+  const storage = (globalThis as any).jsdom?.window?.localStorage;
+  if (storage) {
+    Object.defineProperty(globalThis, "localStorage", {
+      value: storage,
+      configurable: true,
+      writable: true,
+    });
+  }
+}
+
 // Opt-in sync diagnostics for debugging test failures:
 //   REALTIME_DEBUG=1 npx vitest run tests/unit/document.test.ts
 if (process.env.REALTIME_DEBUG) {

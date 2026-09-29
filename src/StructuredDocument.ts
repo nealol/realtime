@@ -15,12 +15,21 @@ import { sha256Text } from "./hash";
 import { getDocumentEpoch } from "./documentEpoch";
 
 export const DISK_ORIGIN = Symbol("realtime-structured-disk");
+const DISK_WRITE_RETRY_MS = 2_000;
 
 export abstract class StructuredDocument extends SyncedDoc {
   readonly root: Y.Map<any>;
   private rootObserver: (events: Array<Y.YEvent<any>>, txn: Y.Transaction) => void;
   /** Serialized value currently being written, used to identify our own echo. */
   private writingTextToDisk: string | null = null;
+  /**
+   * Serialized file content this device last wrote or read. A disk read that
+   * still matches it (e.g. the late event of an older write) is not an edit.
+   */
+  private diskKnownText: string | null = null;
+  /** Disk writes run one at a time; a request during one coalesces behind it. */
+  private writeRunning: Promise<boolean> | null = null;
+  private writeQueued: Promise<boolean> | null = null;
   private writeTimer: number | null = null;
   private startupReconciled = false;
   /** True only after startup content is durably present on this device. */
@@ -86,15 +95,22 @@ export abstract class StructuredDocument extends SyncedDoc {
     this.baselineTextAtStartup = this.serialize(this.baselineAtStartup);
     const disk = await this.readParsedFromDisk();
     let stale = false;
-    if (disk !== null && this.staleLocalFingerprint !== null) {
-      stale = (await sha256Text(this.serialize(disk))) === this.staleLocalFingerprint;
+    let unchangedSinceSync = false;
+    const diskText = disk === null ? null : this.serialize(disk);
+    if (diskText !== null) {
+      const fingerprint = await sha256Text(diskText);
+      stale = this.staleLocalFingerprint !== null && fingerprint === this.staleLocalFingerprint;
+      // The file still holds content this document's store contains: it
+      // merely lags the document, so it is not a local edit.
+      unchangedSinceSync = await this.storeContainsDiskContent(diskText);
     }
     this.diskAtStartup = disk;
+    this.diskKnownText = diskText;
     // An untouched copy of a file deleted remotely (and since re-created at
     // this path) is not a local change: let the new document replace it.
     if (stale) this.forceBootstrapConflict = false;
     this.localChangedAtStartup =
-      disk !== null && !stale && this.serialize(disk) !== this.baselineTextAtStartup;
+      diskText !== null && !stale && !unchangedSinceSync && diskText !== this.baselineTextAtStartup;
   }
 
   protected async finishStartupReconcile(): Promise<void> {
@@ -145,7 +161,7 @@ export abstract class StructuredDocument extends SyncedDoc {
 
       let materialized = this.getFile() !== null;
       if (!this.suppressedWhileOpen() && !this.diskParseFailed) {
-        materialized = await this.writeToDisk(this.serialize(this.value));
+        materialized = await this.writeToDisk();
       } else if (materialized) {
         this.plugin.vaultSync?.noteMaterialized(
           this.path,
@@ -222,15 +238,79 @@ export abstract class StructuredDocument extends SyncedDoc {
     );
   }
 
+  /**
+   * Called by VaultSync when the file changed on disk. Our own writes (and
+   * late events for older ones) are recognised by content, not timing; any
+   * other content is a real edit, merged with changes the document gained
+   * since the file last matched it.
+   */
   async onDiskChanged(): Promise<void> {
-    if (this.destroyed || this.suppressedWhileOpen()) return;
+    if (this.destroyed) return;
     const disk = await this.readParsedFromDisk();
     if (disk === null) return;
     if (this.destroyed) return;
     const serialized = this.serialize(disk);
-    if (serialized === this.writingTextToDisk || serialized === this.serialize(this.value)) return;
+    if (this.suppressedWhileOpen()) {
+      // The live view owns the file while bound, and the binding keeps it in
+      // step with the document: its saves are not edits to fold.
+      if (serialized === this.serialize(this.value)) this.noteDiskContent(serialized);
+      else this.diskKnownText = serialized;
+      return;
+    }
+    if (serialized === this.diskKnownText || serialized === this.writingTextToDisk) return;
+    if (serialized === this.serialize(this.value)) {
+      this.noteDiskContent(serialized);
+      return;
+    }
+    await this.foldDiskEdit(disk);
+  }
+
+  /**
+   * Fold a disk edit into the document, merging it against the content the
+   * file last matched so changes the document gained since (typically remote
+   * edits whose disk write was pending) survive.
+   */
+  private async foldDiskEdit(disk: JsonValue): Promise<void> {
     this.plugin.vaultSync?.noteTextActivity();
-    this.applyValue(disk, DISK_ORIGIN);
+    const diskText = this.serialize(disk);
+    // Compare file-level shapes: the CRDT value also carries internal state
+    // (e.g. canvas tombstone maps) that never reaches disk.
+    const sharedText = this.serialize(this.value);
+    const shared = this.parse(sharedText);
+    const base = this.diskKnownText === null ? null : this.parse(this.diskKnownText);
+    let next: JsonValue = disk;
+    if (base !== null) {
+      const merge = mergeStructuredStartupResult(base, disk, shared);
+      next = merge.value;
+      if (merge.conflicted && sharedText !== this.diskKnownText) {
+        const preservedPath = await preserveTextConflict(
+          this.plugin,
+          this.path,
+          sharedText,
+          "remote",
+        );
+        if (this.destroyed) return;
+        new Notice(
+          `Realtime: "${this.path}" was edited on disk while newer changes were arriving; ` +
+            `merged them and preserved the other version as "${preservedPath}".`,
+        );
+      }
+    }
+    const latest = await this.readParsedFromDisk();
+    if (this.destroyed || latest === null || this.serialize(latest) !== diskText) return;
+    this.applyValue(next, DISK_ORIGIN);
+    this.noteDiskContent(diskText);
+  }
+
+  /** The file is known to hold `text`, which this document now contains. */
+  private noteDiskContent(text: string): void {
+    this.diskKnownText = text;
+    if (this.provider.clientToken?.authorization === "read-only") return;
+    void this.recordStoredDiskContent(this.materializedKind(), text);
+  }
+
+  private materializedKind(): "canvas" | "base" {
+    return this.path.endsWith(".canvas") ? "canvas" : "base";
   }
 
   protected applyValue(value: JsonValue, origin: unknown = DISK_ORIGIN): void {
@@ -245,13 +325,13 @@ export abstract class StructuredDocument extends SyncedDoc {
     this.scheduleWriteToDisk();
   }
 
-  private scheduleWriteToDisk(): void {
+  private scheduleWriteToDisk(delayMs = 100): void {
     if (this.writeTimer !== null) window.clearTimeout(this.writeTimer);
     this.writeTimer = window.setTimeout(() => {
       this.writeTimer = null;
       if (this.destroyed || !this.startupReady || this.suppressedWhileOpen()) return;
-      void this.writeToDisk(this.serialize(this.value));
-    }, 100);
+      void this.writeToDisk();
+    }, delayMs);
   }
 
   protected getFile(): TFile | null {
@@ -263,7 +343,12 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   protected canHibernateLocally(): boolean {
-    return !this.isOpen() && this.writingTextToDisk === null && this.writeTimer === null;
+    return (
+      !this.isOpen() &&
+      this.writeRunning === null &&
+      this.writeQueued === null &&
+      this.writeTimer === null
+    );
   }
 
   private async readParsedFromDisk(): Promise<JsonValue | null> {
@@ -284,43 +369,73 @@ export abstract class StructuredDocument extends SyncedDoc {
     }
   }
 
-  protected async writeToDisk(text: string): Promise<boolean> {
+  /**
+   * Write the current value to disk. Writes never overlap: a request made
+   * while one is running waits for it and then writes whatever the value is
+   * by then, so an older write can never land after a newer one.
+   */
+  protected writeToDisk(): Promise<boolean> {
+    if (this.writeQueued) return this.writeQueued;
+    const running = this.writeRunning;
+    if (!running) return this.startDiskWrite();
+    const queued = running.then(() => {
+      this.writeQueued = null;
+      return this.startDiskWrite();
+    });
+    this.writeQueued = queued;
+    return queued;
+  }
+
+  private startDiskWrite(): Promise<boolean> {
+    const running: Promise<boolean> = this.writeCurrentValue().finally(() => {
+      if (this.writeRunning === running) this.writeRunning = null;
+    });
+    this.writeRunning = running;
+    return running;
+  }
+
+  private async writeCurrentValue(): Promise<boolean> {
     if (this.destroyed) return false;
+    const text = this.serialize(this.value);
     this.writingTextToDisk = text;
     try {
       const file = this.getFile();
       if (file) {
         if (this.suppressedWhileOpen()) {
-          this.plugin.vaultSync?.noteMaterialized(
-            this.path,
-            this.path.endsWith(".canvas") ? "canvas" : "base",
-            this.guid,
-          );
+          this.plugin.vaultSync?.noteMaterialized(this.path, this.materializedKind(), this.guid);
           return true;
         }
-        if ((await this.plugin.app.vault.read(file)) === text) {
-          this.plugin.vaultSync?.noteMaterialized(
-            this.path,
-            this.path.endsWith(".canvas") ? "canvas" : "base",
-            this.guid,
-          );
+        const raw = await this.plugin.app.vault.read(file);
+        // Re-check destroyed after the await: a doc replaced mid-write (rename,
+        // guid change) must not clobber the file its successor now owns.
+        if (this.destroyed) return false;
+        if (raw === text) {
+          this.noteDiskContent(text);
+          this.plugin.vaultSync?.noteMaterialized(this.path, this.materializedKind(), this.guid);
           if (this.startupReady && !this.provider.hasLocalChanges) {
             await this.recordAcknowledgedContent(true);
           }
           return true;
         }
-        // Re-check destroyed after the await: a doc replaced mid-write (rename,
-        // guid change) must not clobber the file its successor now owns.
-        if (this.destroyed) return false;
         if (this.suppressedWhileOpen()) {
-          this.plugin.vaultSync?.noteMaterialized(
-            this.path,
-            this.path.endsWith(".canvas") ? "canvas" : "base",
-            this.guid,
-          );
+          this.plugin.vaultSync?.noteMaterialized(this.path, this.materializedKind(), this.guid);
           return true;
         }
         if (this.serialize(this.value) !== text) return false;
+        if (this.diskKnownText !== null && !this.diskParseFailed) {
+          let current: JsonValue | null = null;
+          try {
+            current = this.parse(raw);
+          } catch {
+            current = null;
+          }
+          if (current !== null && this.serialize(current) !== this.diskKnownText) {
+            // Someone edited the file and its modify event has not been
+            // handled yet: fold that edit in instead of overwriting it.
+            await this.foldDiskEdit(current);
+            return false;
+          }
+        }
         await this.plugin.app.vault.modify(file, text);
       } else {
         const path = normalizePath(this.path);
@@ -329,22 +444,29 @@ export abstract class StructuredDocument extends SyncedDoc {
         if (this.serialize(this.value) !== text) return false;
         await this.plugin.app.vault.create(path, text);
       }
-      this.plugin.vaultSync?.noteMaterialized(
-        this.path,
-        this.path.endsWith(".canvas") ? "canvas" : "base",
-        this.guid,
-      );
+      if (this.destroyed) return false;
+      this.noteDiskContent(text);
+      this.plugin.vaultSync?.noteMaterialized(this.path, this.materializedKind(), this.guid);
       if (this.startupReady && !this.provider.hasLocalChanges) {
         await this.recordAcknowledgedContent(true);
       }
       return true;
     } catch (e) {
       console.error(`[Realtime] structured writeToDisk failed for ${this.path}`, e);
+      if (!this.destroyed) {
+        const file = this.getFile();
+        if (file) {
+          try {
+            this.diskKnownText = this.serialize(this.parse(await this.plugin.app.vault.read(file)));
+          } catch {
+            // Keep the previous belief about the file.
+          }
+        }
+        this.scheduleWriteToDisk(DISK_WRITE_RETRY_MS);
+      }
       return false;
     } finally {
-      window.setTimeout(() => {
-        this.writingTextToDisk = null;
-      }, 250);
+      this.writingTextToDisk = null;
     }
   }
 

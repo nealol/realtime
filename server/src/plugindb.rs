@@ -425,13 +425,18 @@ impl PluginDbService {
     /// Y.Doc batch log when the loadable extension is unavailable. If the log
     /// was compacted and no replica exists, this errors rather than silently
     /// returning an incomplete changeset.
+    ///
+    /// Also returns the per-site cursor the changeset covers. A client cannot
+    /// derive it from the rows: the replica only keeps each cell's winning
+    /// change, so a site whose later changes were all overwritten would look
+    /// behind the log's compaction marks forever and keep rebasing.
     pub async fn bootstrap_changes(
         &self,
         vault: &str,
         plugin: &str,
         name: &str,
         since: &Cursor,
-    ) -> Result<Vec<ChangeRow>> {
+    ) -> Result<(Vec<ChangeRow>, Cursor)> {
         let view = self.fetch_doc(&Self::doc_id(vault, plugin, name)).await?;
 
         if self.ext_available() {
@@ -456,7 +461,7 @@ impl PluginDbService {
             match res {
                 Ok((new_cursor, rows)) => {
                     self.store_cursor(vault, plugin, name, &new_cursor).await?;
-                    return Ok(rows);
+                    return Ok((rows, new_cursor));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -475,7 +480,10 @@ impl PluginDbService {
             ));
         }
         let mut out = Vec::new();
+        let mut cursor = since.clone();
         for batch in &view.batches {
+            let covered = cursor.entry(batch.site_id.clone()).or_insert(0);
+            *covered = (*covered).max(batch.to_db_version);
             let floor = since.get(&batch.site_id).copied().unwrap_or(0);
             if batch.to_db_version <= floor {
                 continue;
@@ -492,7 +500,7 @@ impl PluginDbService {
                 .then(a.db_version.cmp(&b.db_version))
                 .then(a.seq.cmp(&b.seq))
         });
-        Ok(out)
+        Ok((out, cursor))
     }
 
     /// Purge: delete the replica file, mark the DB tombstoned, and trim the Y.Doc.
@@ -2662,12 +2670,14 @@ pub mod routes {
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())
             .unwrap_or_default();
-        let changes = state
+        let (changes, cursor) = state
             .plugindb
             .bootstrap_changes(&vault_id, &plugin, &name, &since)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        Ok(Json(serde_json::json!({ "changes": changes })))
+        Ok(Json(
+            serde_json::json!({ "changes": changes, "cursor": cursor }),
+        ))
     }
 
     /// `POST /api/vaults/{id}/plugin-dbs/{plugin}/{name}/touch`

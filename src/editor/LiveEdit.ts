@@ -39,8 +39,14 @@ export class LiveEditPluginValue implements PluginValue {
   private doc: Document | null = null;
   private ytext: Y.Text | null = null;
   private observer: (() => void) | null = null;
+  private unsubscribeDestroy: (() => void) | null = null;
   private destroyed = false;
   private editorTextAtBind: string | null = null;
+  /**
+   * Editor text before the first change made while no document was bound
+   * (e.g. while one was being rebuilt), so binding still pushes that change.
+   */
+  private unpushedBaseline: string | null = null;
 
   constructor(editor: EditorView) {
     this.editor = editor;
@@ -57,8 +63,17 @@ export class LiveEditPluginValue implements PluginValue {
     }
     this.doc = doc;
     this.ytext = doc.ytext;
-    this.editorTextAtBind = this.editor.state.doc.toString();
+    this.editorTextAtBind = this.unpushedBaseline ?? this.editor.state.doc.toString();
+    this.unpushedBaseline = null;
     doc.bindEditor();
+    // A document can be replaced while the editor stays open (e.g. rebuilt
+    // for a new epoch): rebind right away instead of waiting for a keystroke,
+    // so remote changes keep reaching the editor.
+    this.unsubscribeDestroy = doc.onDestroy(() => {
+      if (this.doc !== doc) return;
+      this.detachDoc();
+      queueMicrotask(() => this.tryBind());
+    });
 
     const observer = () => this.onYTextChanged();
     this.observer = observer;
@@ -129,6 +144,8 @@ export class LiveEditPluginValue implements PluginValue {
   }
 
   private detachDoc(): void {
+    this.unsubscribeDestroy?.();
+    this.unsubscribeDestroy = null;
     if (this.observer && this.ytext) this.ytext.unobserve(this.observer);
     if (this.doc) this.doc.unbindEditor();
     this.observer = null;
@@ -180,12 +197,9 @@ export class LiveEditPluginValue implements PluginValue {
   /** Push local editor edits into the shared Y.Text. */
   update(update: ViewUpdate): void {
     if (this.destroyed) return;
-    if (!this.doc) {
-      this.tryBind();
-      return;
-    }
-    if (this.doc.isDestroyed()) {
-      this.detachDoc();
+    if (!this.doc || this.doc.isDestroyed()) {
+      if (update.docChanged) this.unpushedBaseline ??= update.startState?.doc.toString() ?? null;
+      if (this.doc) this.detachDoc();
       this.tryBind();
       return;
     }

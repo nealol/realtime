@@ -378,27 +378,27 @@ pub(crate) async fn patch_note_inner(
     }
     let file = require_note_access(state, principal, vault_id, path, true).await?;
     let doc_id = doc_id(vault_id, &file.guid);
-    let update = ydoc::read_update(state, &doc_id).await?;
-    let content =
-        ydoc::decode_text(&update, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
-    let matches = content.matches(&body.old).count();
-    if matches == 0 {
-        return Err(AppError::BadRequest("anchor_not_found".into()));
-    }
-    if matches > 1 && !body.replace_all {
-        return Err(AppError::Conflict("ambiguous".into()));
-    }
-
-    let new_content = if body.replace_all {
-        content.replace(&body.old, &body.new)
-    } else {
-        content.replacen(&body.old, &body.new, 1)
-    };
-    if new_content == content {
-        return Err(AppError::Conflict("no_op".into()));
-    }
-
-    ydoc::set_text(state, &doc_id, &new_content).await?;
+    // Compute the patch from the snapshot the update is built against, so
+    // concurrent edits elsewhere in the note are merged, not reverted.
+    let (content, new_content) = ydoc::update_text(state, &doc_id, |content| {
+        let matches = content.matches(&body.old).count();
+        if matches == 0 {
+            return Err(AppError::BadRequest("anchor_not_found".into()));
+        }
+        if matches > 1 && !body.replace_all {
+            return Err(AppError::Conflict("ambiguous".into()));
+        }
+        let new_content = if body.replace_all {
+            content.replace(&body.old, &body.new)
+        } else {
+            content.replacen(&body.old, &body.new, 1)
+        };
+        if new_content == content {
+            return Err(AppError::Conflict("no_op".into()));
+        }
+        Ok(new_content)
+    })
+    .await?;
     best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
     mark_note_write(state, vault_id, principal).await;
     audit::record(
@@ -552,29 +552,20 @@ pub(crate) async fn rewrite_references_after_move(
                     continue;
                 }
                 let doc_id = doc_id(vault_id, &cand.guid);
-                let update = match ydoc::read_update(state, &doc_id).await {
-                    Ok(update) => update,
-                    Err(e) => {
-                        tracing::warn!("read backlink candidate {} failed: {e}", cand.path);
-                        continue;
+                let rewritten = ydoc::update_text(state, &doc_id, |content| {
+                    Ok(crate::search::rewrite_links(content, old_path, new_path).0)
+                })
+                .await;
+                match rewritten {
+                    Ok((before, new_content)) if new_content != before => {
+                        best_effort_index(state, vault_id, &cand.guid, &cand.path, &new_content)
+                            .await;
+                        count += 1;
                     }
-                };
-                let content = match ydoc::decode_text(&update, "contents") {
-                    Ok(content) => content,
+                    Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!("decode backlink candidate {} failed: {e}", cand.path);
-                        continue;
-                    }
-                };
-                let (new_content, changed) =
-                    crate::search::rewrite_links(&content, old_path, new_path);
-                if changed {
-                    if let Err(e) = ydoc::set_text(state, &doc_id, &new_content).await {
                         tracing::warn!("rewrite backlink {} failed: {e}", cand.path);
-                        continue;
                     }
-                    best_effort_index(state, vault_id, &cand.guid, &cand.path, &new_content).await;
-                    count += 1;
                 }
             }
             if count > 0 {
@@ -727,10 +718,12 @@ pub(crate) async fn patch_frontmatter_inner(
     path: &str,
     body: PatchFrontmatterBody,
 ) -> AppResult<NoteResponse> {
-    let (file, content) = read_note_content(state, principal, vault_id, path, true).await?;
-    let new_content = patch_frontmatter_content(&content, body)?;
+    let file = require_note_access(state, principal, vault_id, path, true).await?;
     let doc_id = doc_id(vault_id, &file.guid);
-    ydoc::set_text(state, &doc_id, &new_content).await?;
+    let (content, new_content) = ydoc::update_text(state, &doc_id, |content| {
+        patch_frontmatter_content(content, body)
+    })
+    .await?;
     best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
     mark_note_write(state, vault_id, principal).await;
     audit::record(
@@ -757,13 +750,15 @@ pub(crate) async fn replace_body_inner(
     path: &str,
     body: String,
 ) -> AppResult<NoteResponse> {
-    let (file, content) = read_note_content(state, principal, vault_id, path, true).await?;
-    let new_content = if let Some((_yaml, body_start)) = frontmatter_bounds(&content) {
-        format!("{}{}", &content[..body_start], body)
-    } else {
-        body
-    };
-    ydoc::set_text(state, &doc_id(vault_id, &file.guid), &new_content).await?;
+    let file = require_note_access(state, principal, vault_id, path, true).await?;
+    let (content, new_content) =
+        ydoc::update_text(state, &doc_id(vault_id, &file.guid), |content| {
+            Ok(match frontmatter_bounds(content) {
+                Some((_yaml, body_start)) => format!("{}{}", &content[..body_start], body),
+                None => body,
+            })
+        })
+        .await?;
     best_effort_index(state, vault_id, &file.guid, &file.path, &new_content).await;
     mark_note_write(state, vault_id, principal).await;
     audit::record(
@@ -886,13 +881,16 @@ pub(crate) async fn periodic_note_append_inner(
     if level == Level::ReadOnly {
         return Err(AppError::Forbidden);
     }
-    let before = existing.content;
-    let mut content = before.clone();
-    if !content.is_empty() && !content.ends_with('\n') {
-        content.push('\n');
-    }
-    content.push_str(&body.text);
-    ydoc::set_text(state, &doc_id(vault_id, &file.guid), &content).await?;
+    // Append to the note as it is now, not as it was when it was looked up.
+    let (before, content) = ydoc::update_text(state, &doc_id(vault_id, &file.guid), |current| {
+        let mut content = current.to_string();
+        if !content.is_empty() && !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(&body.text);
+        Ok(content)
+    })
+    .await?;
     best_effort_index(state, vault_id, &file.guid, &existing.path, &content).await;
     mark_note_write(state, vault_id, principal).await;
     audit::record(

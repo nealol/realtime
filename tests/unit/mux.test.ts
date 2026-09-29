@@ -315,6 +315,23 @@ describe("MuxWebSocket", () => {
     expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(4);
   });
 
+  it("closes the idle real socket once an OPEN backoff has passed", () => {
+    vi.useFakeTimers();
+    const socket = new MuxWebSocket(DOC_URL);
+    const server = FakeServerSocket.instances[0];
+    server.open();
+    const channel = openChannelId(server, "/d/vault__abc/ws/vault__abc?token=t-abc");
+    server.deliver(simpleFrame(3 /* OPEN_ERR */, channel));
+    expect(socket.readyState).toBe(MuxWebSocket.CLOSED);
+
+    // Kept through the backoff, so a reconnecting channel honours it...
+    vi.advanceTimersByTime(500);
+    expect(server.readyState).toBe(1);
+    // ...then released instead of heartbeating an empty connection forever.
+    vi.advanceTimersByTime(600);
+    expect(server.readyState).toBe(3);
+  });
+
   it("flushes queued retries when an older OPEN succeeds after cooldown", () => {
     vi.useFakeTimers();
     const first = new MuxWebSocket(DOC_URL);

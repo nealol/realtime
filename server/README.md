@@ -22,7 +22,10 @@ shared y-sweet key runs on the server.
 through Yjs because that would bloat the CRDT. Instead the plugin syncs only
 a `path → sha256` mapping through the CRDT index and stores the bytes in a
 **content-addressed blob store** served by this server. The raw sync blob store is
-under `/api/vaults/{id}/blobs/{hash}` for the matching plugin, while consumer-facing
+under `/api/vaults/{id}/blobs/{hash}` for the matching plugin (a `HEAD` with
+`?size=` reports a stored copy of another length as missing, so the uploader
+repairs it, and path-scoped downloads refuse a copy whose length differs from
+the index), while consumer-facing
 attachment APIs live under `/api/vaults/{id}/attachments/*`. Attachments enforce an
 extension allowlist, an attachment-specific size cap, SSRF checks for from-URL
 fetches, and signed single-use public upload links via `/upload`. Vault members can
@@ -111,6 +114,7 @@ in the Obsidian plugin's **Auth server URL**.
 | `CRDT_EPOCH_MAX_UPDATES` | `100000` | Update-count threshold for early replacement |
 | `CRDT_EPOCH_MAX_STATE_BYTES` | `33554432` | Encoded-state growth allowed above the epoch's logical baseline |
 | `CRDT_EPOCH_MAX_DELETE_SET_BYTES` | `8388608` | Encoded delete-set growth allowed above the epoch's logical baseline |
+| `CRDT_EPOCH_ACK_TIMEOUT_MS` | `30000` | How long a proposed epoch waits for connected peers to acknowledge it before activating anyway |
 | `BLOB_DIR` | `./blobs` | filesystem directory for the content-addressed binary blob store (use a path on the persistent volume, e.g. `/data/blobs`) |
 | `OIDC_MODE` | `oidc` | `oidc` for a real IdP, `mock` for the in-process test issuer |
 | `OIDC_ISSUER` / `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` / `OIDC_REDIRECT_URL` | — | OIDC config (real mode) |
@@ -244,7 +248,12 @@ server accepts any later write from that connection. The replacement contains
 the same logical Y.Text, Y.Map, and Y.Array content with fresh CRDT identities.
 Epochs are monotonic on the client: after acknowledging a proposal, a client
 retries token acquisition until that epoch activates rather than reopening the
-older namespace while another client is still acknowledging.
+older namespace while another client is still acknowledging. While a proposal
+is pending, newly minted document tokens name the pending epoch and carry
+`epochPending: true`; connections to it are refused until it activates, so no
+client joins the retiring epoch after the proposal (its items would otherwise
+be re-uploaded into the replacement as duplicate content). Activation waits
+for connected peers to acknowledge for at most `CRDT_EPOCH_ACK_TIMEOUT_MS`.
 The old physical document remains immutable for
 `CRDT_EPOCH_RECOVERY_DAYS`; tokens for a retired epoch receive HTTP 409 and
 clients obtain a fresh token and Y.Doc. The epoch manifest is the activation

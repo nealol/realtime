@@ -42,7 +42,6 @@ const EPOCH_PROPOSAL_MESSAGE: u8 = 103;
 const EPOCH_ACK_MESSAGE: u8 = 104;
 const DOCUMENT_INVALIDATED_MESSAGE: u8 = 105;
 const RETIRED_EPOCH_RETRY_MS: u64 = 60_000;
-const EPOCH_ACK_TIMEOUT_MS: u64 = 30_000;
 
 /// Access level encoded in client tokens and enforced on every content update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,6 +443,12 @@ impl DocumentStore {
     ) -> Result<CrdtConnection, CrdtError> {
         let (epoch, document) = self.get_or_load(document_id).await?;
         if let Some(requested) = requested_epoch {
+            if requested > epoch {
+                return Err(CrdtError::EpochTransition {
+                    document_id: document_id.to_string(),
+                    epoch: requested,
+                });
+            }
             if requested != epoch {
                 return Err(CrdtError::RetiredEpoch {
                     document_id: document_id.to_string(),
@@ -641,13 +646,28 @@ impl DocumentStore {
         Ok(epoch)
     }
 
+    /// Epoch a newly minted sync token targets, and whether it is still
+    /// pending. Once an epoch is proposed, no new client may join the retiring
+    /// one: its fresh local document would load the retiring items and later
+    /// upload them into the replacement, duplicating the content. Tokens name
+    /// the pending epoch instead, which accepts connections once activated.
+    pub async fn token_epoch(&self, document_id: &str) -> Result<(u64, bool), CrdtError> {
+        validate_document_id(document_id)?;
+        let runtime = self.epoch_runtime(document_id).await?;
+        let runtime = runtime.lock().await;
+        Ok(match &runtime.manifest.pending {
+            Some(pending) => (pending.epoch, true),
+            None => (runtime.manifest.current.epoch, false),
+        })
+    }
+
     pub async fn epoch_metrics(
         &self,
         document_id: &str,
     ) -> Result<DocumentEpochMetrics, CrdtError> {
         let (epoch, document) = self.get_or_load(document_id).await?;
         let (encoded_state_bytes, delete_set_bytes, update_count) =
-            document.epoch_measurements().await?;
+            document.epoch_measurements(None).await?;
         let runtime = self.epoch_runtime(document_id).await?;
         let runtime = runtime.lock().await;
         if runtime.manifest.current.epoch != epoch {
@@ -735,8 +755,24 @@ impl DocumentStore {
         drop(write_guard);
         if activate_now {
             self.maybe_activate_epoch(document_id).await?;
+        } else {
+            self.schedule_ack_timeout_activation(document_id);
         }
         Ok(Some(pending_epoch))
+    }
+
+    /// Activate a pending epoch once its acknowledgement window closes even if
+    /// no client request or connection event happens to trigger the check.
+    fn schedule_ack_timeout_activation(&self, document_id: &str) {
+        let store = self.clone();
+        let document_id = document_id.to_string();
+        let delay = Duration::from_millis(self.0.policy.ack_timeout_ms);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Err(error) = store.maybe_activate_epoch(&document_id).await {
+                tracing::warn!(%error, %document_id, "scheduled document epoch activation failed");
+            }
+        });
     }
 
     async fn reject_server_write_during_transition(
@@ -878,7 +914,7 @@ impl DocumentStore {
             return Ok(());
         }
         let (encoded_state_bytes, delete_set_bytes, update_count) =
-            document.epoch_measurements().await?;
+            document.epoch_measurements(Some(&self.0.policy)).await?;
         let (
             started_at_ms,
             baseline_encoded_state_bytes,
@@ -900,7 +936,7 @@ impl DocumentStore {
                     .count() as u64,
             )
         };
-        let metrics = DocumentEpochMetrics {
+        let mut metrics = DocumentEpochMetrics {
             epoch,
             encoded_state_bytes,
             delete_set_bytes,
@@ -911,6 +947,17 @@ impl DocumentStore {
             started_at_ms,
             age_ms: crdt_epoch::now_millis().saturating_sub(started_at_ms),
         };
+        if !self.0.policy.should_rollover(&metrics) {
+            return Ok(());
+        }
+        // The sizes may be an estimate, which overstates growth when updates
+        // repeat content the document already has. Roll over only on an exact
+        // measurement.
+        let (encoded_state_bytes, delete_set_bytes, update_count) =
+            document.epoch_measurements(None).await?;
+        metrics.encoded_state_bytes = encoded_state_bytes;
+        metrics.delete_set_bytes = delete_set_bytes;
+        metrics.update_count = update_count;
         if self.0.policy.should_rollover(&metrics) {
             self.begin_epoch_transition_for(document_id, Some(epoch))
                 .await?;
@@ -956,7 +1003,7 @@ impl DocumentStore {
                 .values()
                 .any(|connection| connection.epoch == current_epoch && !connection.acknowledged);
             let timed_out = crdt_epoch::now_millis().saturating_sub(pending.proposed_at_ms)
-                >= EPOCH_ACK_TIMEOUT_MS;
+                >= self.0.policy.ack_timeout_ms;
             if runtime.activating || (waiting && !timed_out) {
                 return Ok(());
             }
@@ -1214,7 +1261,24 @@ struct PersistentDocument {
     compaction_scheduled: AtomicBool,
     events: broadcast::Sender<Vec<u8>>,
     sync_metrics: SyncMetrics,
+    /// Bytes of every update applied since load; never reset.
+    applied_update_bytes: AtomicU64,
+    /// Last full size measurement (see [`Self::epoch_measurements`]).
+    measurement: StdMutex<Option<Measurement>>,
+    full_measurements: AtomicU64,
 }
+
+/// A full encode of the document, taken occasionally rather than per write.
+#[derive(Clone, Copy)]
+struct Measurement {
+    encoded_state_bytes: u64,
+    delete_set_bytes: u64,
+    update_count: u64,
+    applied_update_bytes: u64,
+}
+
+/// Re-measure the document after this many records at the latest.
+const MEASURE_EVERY_RECORDS: u64 = 64;
 
 impl PersistentDocument {
     fn new(doc: Doc, persistence: DocumentPersistence, sync_metrics: SyncMetrics) -> Self {
@@ -1226,6 +1290,9 @@ impl PersistentDocument {
             compaction_scheduled: AtomicBool::new(false),
             events,
             sync_metrics,
+            applied_update_bytes: AtomicU64::new(0),
+            measurement: StdMutex::new(None),
+            full_measurements: AtomicU64::new(0),
         }
     }
 
@@ -1254,7 +1321,40 @@ impl PersistentDocument {
         self.snapshot()
     }
 
-    async fn epoch_measurements(&self) -> Result<(u64, u64, u64), CrdtError> {
+    /// Encoded state size, delete-set size, and update count for the epoch
+    /// policy. A full measurement encodes the whole document while holding
+    /// the mutation lock, so after-write checks reuse the last one (grown by
+    /// the bytes applied since) until `MEASURE_EVERY_RECORDS` records or a
+    /// sixteenth of the smallest byte bound has been appended.
+    async fn epoch_measurements(
+        &self,
+        policy: Option<&EpochPolicy>,
+    ) -> Result<(u64, u64, u64), CrdtError> {
+        if let Some(policy) = policy {
+            let update_count = self.persistence.lock().await.total_records();
+            let applied = self.applied_update_bytes.load(Ordering::Acquire);
+            let cached = *self
+                .measurement
+                .lock()
+                .map_err(|_| CrdtError::Protocol("measurement lock poisoned".into()))?;
+            if let Some(cached) = cached {
+                let grown = applied.saturating_sub(cached.applied_update_bytes);
+                let byte_budget = (policy
+                    .max_encoded_state_bytes
+                    .min(policy.max_delete_set_bytes)
+                    / 16)
+                    .max(1);
+                if update_count.saturating_sub(cached.update_count) < MEASURE_EVERY_RECORDS
+                    && grown < byte_budget
+                {
+                    return Ok((
+                        cached.encoded_state_bytes.saturating_add(grown),
+                        cached.delete_set_bytes,
+                        update_count,
+                    ));
+                }
+            }
+        }
         let _mutation = self.mutation.lock().await;
         let doc = {
             let awareness = self
@@ -1270,6 +1370,15 @@ impl PersistentDocument {
                     CrdtError::Protocol(format!("epoch measurements join: {error}"))
                 })?;
         let update_count = self.persistence.lock().await.total_records();
+        self.full_measurements.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut measurement) = self.measurement.lock() {
+            *measurement = Some(Measurement {
+                encoded_state_bytes,
+                delete_set_bytes,
+                update_count,
+                applied_update_bytes: self.applied_update_bytes.load(Ordering::Acquire),
+            });
+        }
         Ok((encoded_state_bytes, delete_set_bytes, update_count))
     }
 
@@ -1329,6 +1438,8 @@ impl PersistentDocument {
                 .map_err(|_| CrdtError::Protocol("document lock poisoned".into()))?;
             awareness.doc_mut().transact_mut().apply_update(decoded);
         }
+        self.applied_update_bytes
+            .fetch_add(update.len() as u64, Ordering::AcqRel);
 
         let message = Message::Sync(SyncMessage::Update(update.to_vec())).encode_v1();
         let _ = self.events.send(message);
@@ -1577,28 +1688,49 @@ async fn run_connection(
                                 );
                             }
                         }
-                        Message::Awareness(update) => {
+                        Message::Awareness(mut update) => {
                             if bytes.len() > MAX_AWARENESS_BYTES {
                                 return Err(CrdtError::Protocol(format!(
                                     "awareness update exceeds {MAX_AWARENESS_BYTES} bytes"
                                 )));
                             }
-                            if update.clients.len() != 1 {
-                                return Err(CrdtError::Protocol(
-                                    "awareness update must contain exactly one client".into(),
-                                ));
-                            }
-                            let client_id = *update.clients.keys().next().expect("one client");
-                            match awareness_client {
-                                Some(bound) if bound != client_id => {
-                                    return Err(CrdtError::Protocol(
-                                        "awareness client does not match this connection".into(),
-                                    ));
+                            let bound = match awareness_client {
+                                Some(bound) => bound,
+                                None => {
+                                    // The first update binds the connection to
+                                    // one client id; it must name exactly one.
+                                    if update.clients.len() != 1 {
+                                        return Err(CrdtError::Protocol(
+                                            "awareness update must contain exactly one client".into(),
+                                        ));
+                                    }
+                                    let client_id =
+                                        *update.clients.keys().next().expect("one client");
+                                    awareness_client = Some(client_id);
+                                    client_id
                                 }
-                                None => awareness_client = Some(client_id),
-                                _ => {}
+                            };
+                            // Only the connection's own presence is published.
+                            // Clients also forward local timeouts of *other*
+                            // clients (y-protocols emits those as updates);
+                            // drop such entries instead of closing an
+                            // otherwise healthy connection.
+                            let Some(entry) = update.clients.remove(&bound) else {
+                                tracing::debug!(
+                                    ignored = update.clients.len(),
+                                    "ignored awareness entries for other clients"
+                                );
+                                continue;
+                            };
+                            if !update.clients.is_empty() {
+                                tracing::debug!(
+                                    ignored = update.clients.len(),
+                                    "ignored awareness entries for other clients"
+                                );
                             }
-                            document.apply_awareness(update)?;
+                            document.apply_awareness(yrs::sync::AwarenessUpdate {
+                                clients: HashMap::from([(bound, entry)]),
+                            })?;
                         }
                         Message::AwarenessQuery => {
                             send_outgoing(&outgoing, document.awareness_snapshot()?).await?;
@@ -1870,17 +2002,23 @@ pub async fn mint_client_token(
     level: Level,
 ) -> AppResult<Value> {
     validate_document_id(document_id)?;
-    let epoch = state.documents.current_epoch(document_id).await?;
+    let (epoch, epoch_pending) = state.documents.token_epoch(document_id).await?;
     let (url, base_url) = client_urls(&state.config.public_base_url, document_id)
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    Ok(json!({
+    let mut token = json!({
         "url": url,
         "baseUrl": base_url,
         "docId": document_id,
         "token": nanoid::nanoid!(48),
         "authorization": level.as_str(),
         "epoch": epoch,
-    }))
+    });
+    if epoch_pending {
+        // The token's epoch accepts connections only once activated; clients
+        // that understand this wait instead of retrying the connection.
+        token["epochPending"] = Value::Bool(true);
+    }
+    Ok(token)
 }
 
 fn client_urls(public_base_url: &str, document_id: &str) -> Result<(String, String), CrdtError> {
@@ -2454,7 +2592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn later_multi_client_awareness_update_cannot_inject_or_retain_an_id() {
+    async fn later_foreign_awareness_entries_are_dropped_without_closing() {
         let directory = temp_store();
         let store = DocumentStore::new(&directory).await.unwrap();
         let mut connection = store
@@ -2463,14 +2601,25 @@ mod tests {
             .unwrap();
         connection.recv().await.unwrap();
         connection.recv().await.unwrap();
-        let entry = |name: &str| AwarenessUpdateEntry {
-            clock: 1,
+        let entry = |name: &str, clock: u32| AwarenessUpdateEntry {
+            clock,
             json: format!(r#"{{"user":{{"name":"{name}"}}}}"#),
         };
         connection
             .send(
                 Message::Awareness(AwarenessUpdate {
-                    clients: HashMap::from([(1, entry("one"))]),
+                    clients: HashMap::from([(1, entry("one", 1))]),
+                })
+                .encode_v1(),
+            )
+            .await
+            .unwrap();
+        // A mixed update and a foreign-only removal (what y-protocols emits
+        // when a *remote* peer's presence times out locally).
+        connection
+            .send(
+                Message::Awareness(AwarenessUpdate {
+                    clients: HashMap::from([(1, entry("one", 2)), (2, entry("two", 1))]),
                 })
                 .encode_v1(),
             )
@@ -2479,19 +2628,44 @@ mod tests {
         connection
             .send(
                 Message::Awareness(AwarenessUpdate {
-                    clients: HashMap::from([(1, entry("one")), (2, entry("two"))]),
+                    clients: HashMap::from([(
+                        2,
+                        AwarenessUpdateEntry {
+                            clock: 2,
+                            json: "null".to_string(),
+                        },
+                    )]),
                 })
                 .encode_v1(),
             )
             .await
             .unwrap();
-        timeout(Duration::from_secs(2), async {
-            while connection.recv().await.is_some() {}
-        })
-        .await
-        .unwrap();
+        connection
+            .send(Message::Custom(SYNC_STATUS_MESSAGE, vec![7]).encode_v1())
+            .await
+            .unwrap();
+        loop {
+            let bytes = timeout(Duration::from_secs(2), connection.recv())
+                .await
+                .unwrap()
+                .expect("connection must stay open");
+            if matches!(
+                crate::safe_yrs::decode_v1::<Message>(&bytes).unwrap(),
+                Message::Custom(SYNC_STATUS_MESSAGE, payload) if payload == vec![7]
+            ) {
+                break;
+            }
+        }
         let (_, document) = store.get_or_load("vault__document").await.unwrap();
-        assert!(document.awareness.read().unwrap().clients().is_empty());
+        let clients: Vec<u64> = document
+            .awareness
+            .read()
+            .unwrap()
+            .clients()
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(clients, vec![1]);
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
@@ -2981,6 +3155,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writes_reuse_size_measurements_instead_of_encoding_every_time() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        // Keep the document loaded, as a connected session does; otherwise
+        // every write reloads it and starts from an empty measurement.
+        let (_, document) = store.get_or_load("vault__document").await.unwrap();
+        for index in 0..40 {
+            store
+                .apply_update(
+                    "vault__document",
+                    &map_update(&format!("key-{index}"), "value"),
+                )
+                .await
+                .unwrap();
+        }
+        let full = document.full_measurements.load(Ordering::Relaxed);
+        assert!(
+            full <= 2,
+            "encoded the whole document {full} times for 40 writes"
+        );
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn cached_measurements_still_roll_over_on_state_growth() {
+        let directory = temp_store();
+        let store = DocumentStore::new_with_policy(
+            &directory,
+            EpochPolicy {
+                recovery_window_ms: u64::MAX / 2,
+                max_age_ms: u64::MAX,
+                max_update_count: u64::MAX,
+                max_encoded_state_bytes: 4 * 1024,
+                max_delete_set_bytes: u64::MAX,
+                ack_timeout_ms: 30_000,
+            },
+        )
+        .await
+        .unwrap();
+        // Keep the document loaded so writes use cached measurements.
+        let (_, _document) = store.get_or_load("vault__document").await.unwrap();
+        let value = "x".repeat(100);
+        for index in 0..100 {
+            store
+                .apply_update(
+                    "vault__document",
+                    &map_update(&format!("key-{index}"), &value),
+                )
+                .await
+                .unwrap();
+            if store.current_epoch("vault__document").await.unwrap() > 0 {
+                break;
+            }
+        }
+        assert_eq!(store.current_epoch("vault__document").await.unwrap(), 1);
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn repeated_updates_do_not_roll_over_a_document_under_the_size_bound() {
+        let big = map_update("big", &"x".repeat(1_500));
+        let small = map_update("small", "y");
+        // The exact size of the document both updates produce; the bound sits
+        // just above it, so only an overstated size would cross it.
+        let exact = {
+            let doc = Doc::new();
+            let mut txn = doc.transact_mut();
+            txn.apply_update(crate::safe_yrs::decode_v1::<Update>(&big).unwrap());
+            txn.apply_update(crate::safe_yrs::decode_v1::<Update>(&small).unwrap());
+            drop(txn);
+            crdt_epoch::document_measurements(&doc).0
+        };
+        let directory = temp_store();
+        let store = DocumentStore::new_with_policy(
+            &directory,
+            EpochPolicy {
+                recovery_window_ms: u64::MAX / 2,
+                max_age_ms: u64::MAX,
+                max_update_count: u64::MAX,
+                max_encoded_state_bytes: exact + 1,
+                max_delete_set_bytes: u64::MAX,
+                ack_timeout_ms: 30_000,
+            },
+        )
+        .await
+        .unwrap();
+        // Keep the document loaded so writes use cached measurements.
+        let (_, _document) = store.get_or_load("vault__document").await.unwrap();
+        store.apply_update("vault__document", &big).await.unwrap();
+        // Clients resend updates the server already has (e.g. after a
+        // reconnect); they add no content.
+        for _ in 0..3 {
+            store.apply_update("vault__document", &small).await.unwrap();
+        }
+        assert_eq!(
+            store.token_epoch("vault__document").await.unwrap(),
+            (0, false)
+        );
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
     async fn month_and_year_edit_simulation_bounds_active_epoch_history() {
         let directory = temp_store();
         let store = DocumentStore::new_with_policy(
@@ -2991,6 +3267,7 @@ mod tests {
                 max_update_count: 30,
                 max_encoded_state_bytes: u64::MAX,
                 max_delete_set_bytes: u64::MAX,
+                ack_timeout_ms: 30_000,
             },
         )
         .await
@@ -3004,6 +3281,7 @@ mod tests {
                 max_update_count: u64::MAX,
                 max_encoded_state_bytes: u64::MAX,
                 max_delete_set_bytes: u64::MAX,
+                ack_timeout_ms: 30_000,
             },
         )
         .await

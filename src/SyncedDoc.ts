@@ -10,8 +10,19 @@ import {
   SYNC_STATUS_OFFLINE,
 } from "./sync/RealtimeProvider";
 import { createMuxSocket } from "./sync/mux";
-import { epochPersistenceName } from "./documentEpoch";
+import { epochPersistenceName, getDocumentEpoch } from "./documentEpoch";
 import { preserveTextConflict } from "./conflictRecovery";
+import { sha256Text } from "./hash";
+import type { MaterializedKind } from "./localSyncState";
+
+/**
+ * Fingerprint recording that a document's local store contains `text`.
+ * Scoped to the epoch: each epoch starts from an empty store, so content a
+ * retired instance held says nothing about its replacement.
+ */
+export async function storedContentFingerprint(epoch: number, text: string): Promise<string> {
+  return `${epoch}:${await sha256Text(text)}`;
+}
 
 export interface DocumentBootstrapOptions {
   autoConnect?: boolean;
@@ -29,6 +40,8 @@ export abstract class SyncedDoc {
   readonly path: string;
   readonly guid: string;
   readonly serverDocId: string;
+  /** Epoch this instance's Y.Doc and persistence belong to; never changes. */
+  readonly epoch: number;
   readonly ydoc: Y.Doc;
   readonly provider: RealtimeProvider;
   readonly awareness: Awareness;
@@ -45,6 +58,8 @@ export abstract class SyncedDoc {
   private localChangesListener: (hasLocalChanges: boolean) => void;
   private readonly autoConnect: boolean;
   private persistenceReady = false;
+  /** Whether IndexedDB held any state for this document when it loaded. */
+  private loadedStoredState = false;
   private connectRequested = false;
   /** True once the provider has reported a successful server sync at least once. */
   private syncedOnce = false;
@@ -52,6 +67,7 @@ export abstract class SyncedDoc {
   private readOnlyRecoveryPending = false;
   private readOnlyRecoveryRequested = false;
   private readOnlyRecoveryBaseline: string | null = null;
+  private destroyListeners = new Set<() => void>();
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -67,6 +83,7 @@ export abstract class SyncedDoc {
     this.serverDocId = serverDocId;
     this.isCreator = isCreator;
     this.autoConnect = opts.autoConnect ?? true;
+    this.epoch = getDocumentEpoch(plugin, serverDocId);
     this.ydoc = new Y.Doc();
 
     this.readyPromise = new Promise((resolve) => {
@@ -76,7 +93,9 @@ export abstract class SyncedDoc {
     this.provider = new RealtimeProvider(
       serverDocId,
       this.ydoc,
-      () => getClientToken(plugin, serverDocId, path),
+      // Pin the epoch: once it moves on, this instance holds retired-epoch
+      // state and must be rebuilt rather than reconnected.
+      () => getClientToken(plugin, serverDocId, path, this.epoch),
       {
         connect: false,
         socketFactory: createMuxSocket,
@@ -85,7 +104,7 @@ export abstract class SyncedDoc {
     );
     this.awareness = this.provider.awareness;
     this.persistence = new IndexeddbPersistence(
-      epochPersistenceName(plugin, serverDocId, serverDocId),
+      epochPersistenceName(plugin, serverDocId, serverDocId, this.epoch),
       this.ydoc,
     );
     const storeUpdate = this.persistence._storeUpdate;
@@ -188,6 +207,57 @@ export abstract class SyncedDoc {
     return true;
   }
 
+  /**
+   * Resolve once every update applied so far is committed to IndexedDB.
+   * y-indexeddb stores updates in their own write transactions; a later
+   * transaction on the same store cannot run until those have committed.
+   */
+  protected async flushPersistence(): Promise<void> {
+    if (this.destroyed || !this.persistenceReady) return;
+    await storeState(this.persistence, false);
+  }
+
+  /**
+   * Record that the file holds `text`, which this document contains, so a
+   * restart can tell a file that merely lags the document from a local edit.
+   * Recorded only once IndexedDB holds the updates that produced `text`.
+   */
+  protected async recordStoredDiskContent(kind: MaterializedKind, text: string): Promise<void> {
+    try {
+      // Before the store has loaded there is nothing to flush against.
+      if (!this.persistenceReady) return;
+      const fingerprint = await storedContentFingerprint(this.epoch, text);
+      await this.flushPersistence();
+      if (this.destroyed) return;
+      this.plugin.vaultSync?.noteDiskContent(this.path, kind, this.guid, fingerprint);
+    } catch (error) {
+      console.warn(`[Realtime] could not record disk state for ${this.path}`, error);
+    }
+  }
+
+  /**
+   * Whether disk `text` is content this document's local store already
+   * contains (see {@link recordStoredDiskContent}): the file then merely lags
+   * the document, and is not a local edit.
+   */
+  protected async storeContainsDiskContent(text: string): Promise<boolean> {
+    // A store that loaded nothing (a new epoch, or a lost database) cannot
+    // contain what an earlier store did.
+    if (!this.loadedStoredState) return false;
+    const known = await this.plugin.vaultSync?.diskFingerprint(this.path, this.guid);
+    return known != null && known === (await storedContentFingerprint(this.epoch, text));
+  }
+
+  /** Run `listener` once this instance is destroyed; returns an unsubscribe. */
+  onDestroy(listener: () => void): () => void {
+    if (this.destroyed) {
+      listener();
+      return () => {};
+    }
+    this.destroyListeners.add(listener);
+    return () => this.destroyListeners.delete(listener);
+  }
+
   /** Resolve after the next successful server handshake. */
   whenNextServerSync(): Promise<void> {
     if (this.destroyed) return Promise.resolve();
@@ -213,6 +283,7 @@ export abstract class SyncedDoc {
   protected async init(): Promise<void> {
     try {
       await this.persistence.whenSynced;
+      this.loadedStoredState = this.ydoc.store.clients.size > 0;
       if (!this.destroyed) await this.afterPersistenceSynced();
     } catch (e) {
       console.error(`[Realtime] init failed for ${this.path}`, e);
@@ -264,5 +335,14 @@ export abstract class SyncedDoc {
     this.ydoc.destroy();
     this.resolveNextServerSyncWaiters();
     this.resolveWhenReady();
+    const listeners = [...this.destroyListeners];
+    this.destroyListeners.clear();
+    for (const listener of listeners) {
+      try {
+        listener();
+      } catch (error) {
+        console.error(`[Realtime] destroy listener failed for ${this.path}`, error);
+      }
+    }
   }
 }

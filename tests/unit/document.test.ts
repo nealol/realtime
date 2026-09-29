@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
+import * as Y from "yjs";
 import { Document } from "../../src/Document";
 import { makeFakePlugin, type FakePlugin, type FakeVault } from "../support/fakePlugin";
 import { notices } from "../support/obsidian-mock";
@@ -6,6 +7,35 @@ import { Peer } from "../support/peer";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { waitFor, freshGuid } from "../support/util";
 import { setDocumentEpoch } from "../../src/documentEpoch";
+import { LocalSyncState } from "../../src/localSyncState";
+import { storedContentFingerprint } from "../../src/SyncedDoc";
+
+/**
+ * The slice of VaultSync a Document reports disk/sync state to, backed by a
+ * real LocalSyncState so state survives a simulated restart.
+ */
+function attachLocalSyncState(plugin: FakePlugin): LocalSyncState {
+  const state = new LocalSyncState(`document-test:${freshGuid()}`);
+  (plugin as any).vaultSync = {
+    noteMaterialized: (path: string, kind: any, identity?: string) =>
+      identity ? state.commit(path, kind, identity) : state.mark(path, kind),
+    noteContentAcknowledged: (
+      path: string,
+      kind: any,
+      identity: string,
+      fingerprint: string,
+      reconciled?: boolean,
+    ) => state.markSynced(path, kind, identity, fingerprint, reconciled),
+    noteDiskContent: (path: string, kind: any, identity: string, fingerprint: string) =>
+      state.markDisk(path, kind, identity, fingerprint),
+    diskFingerprint: async (path: string, identity: string) => {
+      await state.whenSynced;
+      return state.diskFingerprint(path, identity);
+    },
+    noteTextActivity: () => {},
+  };
+  return state;
+}
 
 const modalMock = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -422,8 +452,8 @@ describe("Document sync", () => {
       await peer.whenSynced();
       await waitFor(() => peer.getText() === "base", { label: "seed synced" });
 
-      const writePromise = (doc as any).writeToDisk("base");
-      await doc.onDiskChanged(); // deferred because writeToDisk's echo guard is active
+      const writePromise = (doc as any).writeToDisk();
+      await doc.onDiskChanged(); // disk already holds the text being written
       peer.setText("base + remote");
       await writePromise;
 
@@ -444,7 +474,7 @@ describe("Document sync", () => {
     try {
       await doc.whenReady();
 
-      (doc as any).writingToDisk = true;
+      (doc as any).writingTextToDisk = "base";
       vault.files.set("note.md", "external edit");
       await doc.onDiskChanged();
 
@@ -495,7 +525,6 @@ describe("Document sync", () => {
     try {
       await doc.whenReady();
 
-      (doc as any).writingToDisk = true;
       (doc as any).writingTextToDisk = "old echo";
       (doc as any).applyText("newer shared");
       vault.files.set("note.md", "old echo");
@@ -536,7 +565,7 @@ describe("Document sync", () => {
         await originalModify(file, text);
       };
 
-      const writePromise = (doc as any).writeToDisk("stale write");
+      const writePromise = (doc as any).writeToDisk();
       await waitFor(() => readStarted, { label: "write reached pre-modify read" });
       (doc as any).applyText("newer shared");
       if ((doc as any).writeTimer !== null) {
@@ -564,6 +593,11 @@ describe("Document sync", () => {
     const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
     try {
       await doc.whenReady();
+      (doc as any).applyText("new");
+      if ((doc as any).writeTimer !== null) {
+        window.clearTimeout((doc as any).writeTimer);
+        (doc as any).writeTimer = null;
+      }
       let reads = 0;
       let modified = false;
       const originalRead = vault.read.bind(vault);
@@ -583,7 +617,7 @@ describe("Document sync", () => {
         await originalModify(file, text);
       };
 
-      await (doc as any).writeToDisk("new");
+      await (doc as any).writeToDisk();
 
       expect(modified).toBe(false);
       expect(vault.files.get("note.md")).toBe("old");
@@ -861,6 +895,12 @@ describe("Document sync", () => {
       activeVaultId: vaultId,
     });
     vault.files.set("note.md", "draft completed before remote deletion");
+    // Model a server that already rolled the document over to epoch 1.
+    const docToken = plugin.auth.docToken.bind(plugin.auth);
+    plugin.auth.docToken = async (...args: Parameters<typeof docToken>) => ({
+      ...(await docToken(...args)),
+      epoch: 1,
+    });
     setDocumentEpoch(plugin as any, serverDocId, 1);
     const doc = new Document(plugin as any, "note.md", guid, serverDocId, false);
     try {
@@ -1126,6 +1166,273 @@ describe("Document sync", () => {
         label: "sync resumed",
         timeout: 60_000,
       });
+    } finally {
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("keeps a remote edit that reached IndexedDB but not disk before a restart", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("note.md", "base\n");
+    const first = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const peer = new Peer(memberPlugin, docId(guid));
+    try {
+      await first.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "base\n", { label: "peer has base" });
+      const baseFingerprint = await storedContentFingerprint(first.epoch, "base\n");
+      await waitFor(() => state.diskFingerprint("note.md", guid) === baseFingerprint, {
+        label: "disk state recorded",
+      });
+
+      // Another device edits the (locally closed) note; this device quits
+      // inside the disk-write debounce, so only IndexedDB has the edit.
+      peer.setText("base\nremote paragraph\n");
+      await waitFor(() => first.content === "base\nremote paragraph\n", {
+        label: "remote edit reached the Y.Doc",
+      });
+      await new Promise((r) => setTimeout(r, 30));
+      first.destroy();
+      expect(vault.files.get("note.md")).toBe("base\n");
+
+      const second = new Document(plugin as any, "note.md", guid, docId(guid), false);
+      try {
+        await second.whenReady();
+        await waitFor(() => vault.files.get("note.md") === "base\nremote paragraph\n", {
+          label: "stale disk caught up with the document",
+        });
+        expect(second.content).toBe("base\nremote paragraph\n");
+        expect(peer.getText()).toBe("base\nremote paragraph\n");
+      } finally {
+        second.destroy();
+      }
+    } finally {
+      first.destroy();
+      peer.destroy();
+      state.destroy();
+    }
+  });
+
+  it("still folds a disk edit made while the plugin was not running", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("note.md", "base\n");
+    const first = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const peer = new Peer(memberPlugin, docId(guid));
+    try {
+      await first.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "base\n", { label: "peer has base" });
+      const baseFingerprint = await storedContentFingerprint(first.epoch, "base\n");
+      await waitFor(() => state.diskFingerprint("note.md", guid) === baseFingerprint, {
+        label: "disk state recorded",
+      });
+      first.destroy();
+
+      vault.files.set("note.md", "base\nedited while closed\n");
+      const second = new Document(plugin as any, "note.md", guid, docId(guid), false);
+      try {
+        await second.whenReady();
+        await waitFor(() => peer.getText() === "base\nedited while closed\n", {
+          label: "offline disk edit published",
+        });
+      } finally {
+        second.destroy();
+      }
+    } finally {
+      first.destroy();
+      peer.destroy();
+      state.destroy();
+    }
+  });
+
+  it("does not trust disk state a retired epoch's store recorded", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("note.md", "base\n");
+    const retired = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const replacements: Document[] = [];
+    const startReplacement = async (): Promise<Document> => {
+      const doc = new Document(plugin as any, "note.md", guid, docId(guid), false, {
+        autoConnect: false,
+      });
+      replacements.push(doc);
+      await waitFor(() => (doc as any).persistenceReady === true, {
+        label: "replacement store loaded",
+      });
+      return doc;
+    };
+    try {
+      await retired.whenReady();
+      // An offline edit is folded into the retired store (and recorded as
+      // held there) but never uploaded before the epoch moves on.
+      retired.disconnect();
+      vault.files.set("note.md", "base\noffline edit\n");
+      await retired.onDiskChanged();
+      const recorded = await storedContentFingerprint(retired.epoch, "base\noffline edit\n");
+      await waitFor(() => state.diskFingerprint("note.md", guid) === recorded, {
+        label: "offline edit recorded as stored",
+      });
+      retired.destroy();
+      setDocumentEpoch(plugin as any, docId(guid), 1);
+
+      // The new epoch's store starts empty: the file is a local edit.
+      const fresh = await startReplacement();
+      expect((fresh as any).localChangedAtStartup).toBe(true);
+
+      // Still one after the replacement's content reached the new store, if
+      // the app stopped before the first reconcile folded the edit in.
+      const replacement = new Y.Doc();
+      replacement.getText("contents").insert(0, "base\n");
+      Y.applyUpdate(fresh.ydoc, Y.encodeStateAsUpdate(replacement), fresh.provider);
+      await (fresh as any).flushPersistence();
+      fresh.destroy();
+      const restarted = await startReplacement();
+      expect(restarted.content).toBe("base\n");
+      expect((restarted as any).localChangedAtStartup).toBe(true);
+    } finally {
+      retired.destroy();
+      for (const doc of replacements) doc.destroy();
+      state.destroy();
+    }
+  });
+
+  it("does not trust recorded disk state once the document's store is gone", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("note.md", "base\n");
+    const first = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    let second: Document | null = null;
+    try {
+      await first.whenReady();
+      first.disconnect();
+      vault.files.set("note.md", "base\noffline edit\n");
+      await first.onDiskChanged();
+      const recorded = await storedContentFingerprint(first.epoch, "base\noffline edit\n");
+      await waitFor(() => state.diskFingerprint("note.md", guid) === recorded, {
+        label: "offline edit recorded as stored",
+      });
+      first.destroy();
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(docId(guid));
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      });
+
+      second = new Document(plugin as any, "note.md", guid, docId(guid), false, {
+        autoConnect: false,
+      });
+      await waitFor(() => (second as any).persistenceReady === true, { label: "store loaded" });
+      expect(second.content).toBe("");
+      expect((second as any).localChangedAtStartup).toBe(true);
+    } finally {
+      first.destroy();
+      second?.destroy();
+      state.destroy();
+    }
+  });
+
+  it("does not fold an older write's echo back while slow writes overlap remote edits", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("note.md", "v0");
+    const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const peer = new Peer(memberPlugin, docId(guid));
+    try {
+      await doc.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "v0", { label: "peer has v0" });
+
+      // Slow storage: each modify lands 300ms after it starts. VaultSync
+      // forwards every vault modify event to onDiskChanged.
+      const original = vault.modify.bind(vault);
+      vault.modify = async (file, text) => {
+        await new Promise((r) => setTimeout(r, 300));
+        await original(file, text);
+      };
+      let typed = false;
+      vault.on("modify", () => {
+        if (vault.files.get("note.md") === "v1" && !typed) {
+          typed = true;
+          setTimeout(() => peer.text.insert(peer.text.length, " then v3"), 60);
+        }
+        void doc.onDiskChanged();
+      });
+
+      peer.setText("v1");
+      await waitFor(() => doc.content === "v1", { label: "v1 arrived" });
+      await new Promise((r) => setTimeout(r, 150));
+      peer.setText("v1 then v2");
+
+      await waitFor(() => typed && peer.getText().endsWith(" then v3"), {
+        label: "peer kept typing",
+      });
+      await waitFor(() => vault.files.get("note.md") === doc.content, {
+        label: "disk settled",
+        timeout: 10_000,
+      });
+      expect(doc.content).toBe("v1 then v2 then v3");
+      expect(peer.getText()).toBe("v1 then v2 then v3");
+    } finally {
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+
+  it("merges a disk edit with remote changes that had not reached disk yet", async () => {
+    const guid = freshGuid();
+    const { doc, vault } = makeDoc(guid, {
+      file: { path: "note.md", content: "line one\nline two\n" },
+    });
+    const peer = new Peer(memberPlugin, docId(guid));
+    try {
+      await doc.whenReady();
+      await peer.whenSynced();
+      await waitFor(() => peer.getText() === "line one\nline two\n", { label: "seed synced" });
+
+      // Hold the remote change's disk write so the file lags the document.
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      const original = vault.modify.bind(vault);
+      vault.modify = async (file, text) => {
+        await held;
+        await original(file, text);
+      };
+      peer.setText("LINE ONE\nline two\n");
+      await waitFor(() => doc.content === "LINE ONE\nline two\n", { label: "remote arrived" });
+
+      vault.files.set("note.md", "line one\nline two, edited on disk\n");
+      await doc.onDiskChanged();
+      release();
+
+      await waitFor(() => peer.getText() === "LINE ONE\nline two, edited on disk\n", {
+        label: "both edits kept",
+      });
+      await waitFor(() => vault.files.get("note.md") === "LINE ONE\nline two, edited on disk\n", {
+        label: "disk has the merge",
+      });
+      expect(conflictFiles(vault)).toHaveLength(0);
     } finally {
       doc.destroy();
       peer.destroy();

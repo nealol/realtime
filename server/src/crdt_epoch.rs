@@ -28,6 +28,9 @@ pub struct EpochPolicy {
     pub max_update_count: u64,
     pub max_encoded_state_bytes: u64,
     pub max_delete_set_bytes: u64,
+    /// How long a proposed epoch waits for connected peers to acknowledge it
+    /// before activating anyway.
+    pub ack_timeout_ms: u64,
 }
 
 impl Default for EpochPolicy {
@@ -38,6 +41,7 @@ impl Default for EpochPolicy {
             max_update_count: 100_000,
             max_encoded_state_bytes: 32 * 1024 * 1024,
             max_delete_set_bytes: 8 * 1024 * 1024,
+            ack_timeout_ms: 30_000,
         }
     }
 }
@@ -588,6 +592,7 @@ mod tests {
             max_update_count: 20,
             max_encoded_state_bytes: 30,
             max_delete_set_bytes: 40,
+            ack_timeout_ms: 50,
         };
         let base = DocumentEpochMetrics {
             epoch: 0,

@@ -35,6 +35,9 @@ pub struct Config {
     pub crdt_epoch_max_updates: u64,
     pub crdt_epoch_max_state_bytes: u64,
     pub crdt_epoch_max_delete_set_bytes: u64,
+    /// Milliseconds a proposed document epoch waits for connected peers to
+    /// acknowledge before activating anyway.
+    pub crdt_epoch_ack_timeout_ms: u64,
     /// Maximum registered file documents in one vault. Index and plugin-db
     /// documents are separate bounded surfaces.
     pub crdt_max_documents_per_vault: u64,
@@ -145,6 +148,9 @@ impl Config {
             crdt_epoch_max_delete_set_bytes: opt("CRDT_EPOCH_MAX_DELETE_SET_BYTES")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(8 * 1024 * 1024),
+            crdt_epoch_ack_timeout_ms: opt("CRDT_EPOCH_ACK_TIMEOUT_MS")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000),
             crdt_max_documents_per_vault: opt("CRDT_MAX_DOCUMENTS_PER_VAULT")
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100_000),
@@ -250,6 +256,7 @@ impl Config {
             crdt_epoch_max_updates: 100_000,
             crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
             crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+            crdt_epoch_ack_timeout_ms: 30_000,
             crdt_max_documents_per_vault: 100_000,
             blob_dir: String::new(),
             oidc_mode: OidcMode::Mock,

@@ -46,6 +46,7 @@ describe("LiveEdit", () => {
       whenReady: () => ready,
       isReady: () => isReady,
       isDestroyed: () => false,
+      onDestroy: () => () => {},
     };
 
     const editor = makeEditor("remote ready value") as any;
@@ -77,6 +78,7 @@ describe("LiveEdit", () => {
       whenReady: () => Promise.resolve(),
       isReady: () => true,
       isDestroyed: () => oldDestroyed,
+      onDestroy: () => () => {},
     };
     bind.doc = oldDoc;
 
@@ -94,6 +96,7 @@ describe("LiveEdit", () => {
       whenReady: () => Promise.resolve(),
       isReady: () => true,
       isDestroyed: () => false,
+      onDestroy: () => () => {},
     };
 
     oldDestroyed = true;
@@ -124,6 +127,7 @@ describe("LiveEdit", () => {
       whenReady: () => Promise.resolve(),
       isReady: () => true,
       isDestroyed: () => false,
+      onDestroy: () => () => {},
     };
 
     const editor = makeEditor("initial") as any;
@@ -158,6 +162,7 @@ describe("LiveEdit", () => {
       whenReady: () => ready,
       isReady: () => false,
       isDestroyed: () => false,
+      onDestroy: () => () => {},
     };
 
     const editor = makeEditor("stale disk") as any;
@@ -184,6 +189,7 @@ describe("LiveEdit", () => {
       whenReady: () => Promise.resolve(),
       isReady: () => true,
       isDestroyed: () => false,
+      onDestroy: () => () => {},
       isCreator: true,
       hasSyncedOnce: true,
       isProviderOnline: true,
@@ -198,6 +204,86 @@ describe("LiveEdit", () => {
     expect(ytext.toString()).toBe("local");
     expect(bind.requestSave).not.toHaveBeenCalled();
 
+    live.destroy();
+    ydoc.destroy();
+  });
+
+  it("rebinds as soon as its document is destroyed, without waiting for a keystroke", async () => {
+    const listeners: Array<() => void> = [];
+    const oldYdoc = new Y.Doc();
+    const oldDoc = {
+      path: "note.md",
+      ytext: oldYdoc.getText("contents"),
+      bindEditor: vi.fn(),
+      unbindEditor: vi.fn(),
+      whenReady: () => Promise.resolve(),
+      isReady: () => true,
+      isDestroyed: () => false,
+      onDestroy: (listener: () => void) => {
+        listeners.push(listener);
+        return () => {};
+      },
+    };
+    oldDoc.ytext.insert(0, "shared");
+    bind.doc = oldDoc;
+    const editor = makeEditor("shared") as any;
+    const live = new LiveEditPluginValue(editor);
+    await Promise.resolve();
+
+    const newYdoc = new Y.Doc();
+    const newYtext = newYdoc.getText("contents");
+    newYtext.insert(0, "shared");
+    bind.doc = {
+      path: "note.md",
+      ytext: newYtext,
+      bindEditor: vi.fn(),
+      unbindEditor: vi.fn(),
+      whenReady: () => Promise.resolve(),
+      isReady: () => true,
+      isDestroyed: () => false,
+      onDestroy: () => () => {},
+    };
+    for (const listener of listeners) listener();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(oldDoc.unbindEditor).toHaveBeenCalledTimes(1);
+    newYdoc.transact(() => newYtext.insert(newYtext.length, " + remote"));
+    expect(editor.state.doc.toString()).toBe("shared + remote");
+    live.destroy();
+    oldYdoc.destroy();
+    newYdoc.destroy();
+  });
+
+  it("pushes an edit typed while no document was bound", async () => {
+    bind.doc = null;
+    const editor = makeEditor("shared text") as any;
+    const live = new LiveEditPluginValue(editor);
+    editor.setText("shared text + typed");
+    live.update({
+      docChanged: true,
+      state: editor.state,
+      startState: { doc: { toString: () => "shared text" } },
+    } as any);
+
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("contents");
+    ytext.insert(0, "shared text");
+    bind.doc = {
+      path: "note.md",
+      ytext,
+      bindEditor: vi.fn(),
+      unbindEditor: vi.fn(),
+      whenReady: () => Promise.resolve(),
+      isReady: () => true,
+      isDestroyed: () => false,
+      onDestroy: () => () => {},
+    };
+    live.update({ docChanged: false, state: editor.state } as any);
+    await Promise.resolve();
+
+    expect(ytext.toString()).toBe("shared text + typed");
+    expect(editor.state.doc.toString()).toBe("shared text + typed");
     live.destroy();
     ydoc.destroy();
   });

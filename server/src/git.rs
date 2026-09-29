@@ -1719,6 +1719,7 @@ diff --git a/ref.md b/ref.md
             crdt_epoch_max_updates: 100_000,
             crdt_epoch_max_state_bytes: 32 * 1024 * 1024,
             crdt_epoch_max_delete_set_bytes: 8 * 1024 * 1024,
+            crdt_epoch_ack_timeout_ms: 30_000,
             crdt_max_documents_per_vault: 100_000,
             blob_dir: String::new(),
             oidc_mode: crate::config::OidcMode::Mock,
