@@ -216,6 +216,37 @@ export interface StructuredResponse {
   kind: string;
   value: unknown;
   permalink: string;
+  /**
+   * Opaque version of the stored value (newer servers). Pass it as `ifMatch`
+   * to `replace` so the write is refused if the file changed since.
+   */
+  valueHash?: string;
+}
+
+/** Preconditions for a full note replace. */
+export interface ReplaceNoteOptions {
+  /**
+   * Lowercase hex SHA-256 of the note content the replacement is based on.
+   * The server refuses the write (409) if the note changed since.
+   */
+  expectedContentHash?: string;
+}
+
+/** Preconditions for a full Canvas/Base replace. */
+export interface ReplaceStructuredOptions {
+  /** `valueHash` from the read the replacement is based on. */
+  ifMatch?: string;
+}
+
+/** Preconditions for an attachment upload. */
+export interface UploadAttachmentOptions {
+  /**
+   * Content hash (from `list` or an earlier upload) the path must still hold.
+   * The server refuses the upload (409 `stale`) if the attachment changed.
+   */
+  ifMatch?: string;
+  /** `"*"`: refuse the upload (409 `exists`) if the path already holds an attachment. */
+  ifNoneMatch?: "*";
 }
 
 /** Free-form node fields (Obsidian Canvas spec) plus an optional stable id. */
@@ -390,6 +421,11 @@ export interface DocTokenResponse {
    * is. Retry the token instead of connecting to an older epoch.
    */
   epochPending?: boolean;
+  /**
+   * When the server stops accepting `token` (ms since the Unix epoch). Mint a
+   * new token before reconnecting after this; absent on older servers.
+   */
+  expiresAt?: number;
   [key: string]: unknown;
 }
 

@@ -61,6 +61,7 @@ export class Document extends SyncedDoc {
   private startupReconciling = false;
   private forceBootstrapConflict: boolean;
   private readonly staleLocalFingerprint: string | null;
+  private readonly retiredBaselineText: string | null;
   /** Suppress write-through while IndexedDB is replaying the startup baseline. */
   private startupBaselineCaptured = false;
 
@@ -78,6 +79,7 @@ export class Document extends SyncedDoc {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.forceBootstrapConflict = opts.forceBootstrapConflict ?? false;
     this.staleLocalFingerprint = opts.staleLocalFingerprint ?? null;
+    this.retiredBaselineText = opts.retiredBaseline ?? null;
     this.ytext = this.ydoc.getText("contents");
 
     // ytext changes (local edits from other peers, or our own editor) flow to
@@ -121,13 +123,35 @@ export class Document extends SyncedDoc {
   }
 
   /**
+   * An editor kept its own overlapping edits over `shared`: preserve that
+   * shared version beside the note so the other side is not lost.
+   */
+  async preserveSharedConflict(shared: string): Promise<void> {
+    if (this.destroyed) return;
+    try {
+      const preservedPath = await preserveTextConflict(this.plugin, this.path, shared, "remote");
+      new Notice(
+        `Realtime: "${this.path}" was edited here while other changes were arriving; ` +
+          `kept your version and preserved the other as "${preservedPath}".`,
+      );
+    } catch (error) {
+      console.error(`[Realtime] failed to preserve the shared version of ${this.path}`, error);
+    }
+  }
+
+  /**
    * Startup sequence: load the persisted baseline, read local disk, then connect.
    * Local disk edits are deliberately not folded into Y.Text until the first
    * remote sync tells us whether the remote also changed from the baseline.
    */
   protected async afterPersistenceSynced(): Promise<void> {
     try {
-      this.baselineAtStartup = this.content;
+      // A new epoch starts from an empty store; the content it replaced is
+      // then the baseline local and remote changes are measured from.
+      this.baselineAtStartup =
+        !this.loadedStoredState && this.retiredBaselineText !== null
+          ? this.retiredBaselineText
+          : this.content;
       await this.captureStartupDisk();
     } catch (e) {
       // A failed read is not a missing file. Reconciling as if it were would
@@ -564,13 +588,26 @@ export class Document extends SyncedDoc {
           "open",
           this.isOpenInEditableMarkdown(),
         );
-        await this.plugin.app.vault.modify(file, text);
+        const releaseWrite = this.plugin.vaultSync?.beginOwnWrite(file.path);
+        try {
+          await this.plugin.app.vault.modify(file, text);
+        } finally {
+          releaseWrite?.();
+        }
       } else {
         // Remote-created file that does not exist locally yet.
         const path = normalizePath(this.path);
+        // ...unless the user deleted or moved it away before the initial
+        // sync finished: that is about to be published, not undone.
+        if (this.plugin.vaultSync?.isPendingLocalRemoval(path)) return false;
         await ensureParentFolder(this.plugin.app, path);
         if (this.destroyed || this.content !== text) return false;
-        await this.plugin.app.vault.create(path, text);
+        const releaseWrite = this.plugin.vaultSync?.beginOwnWrite(path);
+        try {
+          await this.plugin.app.vault.create(path, text);
+        } finally {
+          releaseWrite?.();
+        }
       }
       // A document replaced while the write was in flight must not record
       // state for the path its successor now owns.

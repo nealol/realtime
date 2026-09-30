@@ -3,7 +3,7 @@ import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import * as syncProtocol from "y-protocols/sync";
 import * as awarenessProtocol from "y-protocols/awareness";
-import { DocumentEpochPendingError, type ClientToken } from "./clientToken";
+import { DocumentEpochPendingError, clientTokenExpired, type ClientToken } from "./clientToken";
 import { handleEpochProposal } from "../documentEpoch";
 
 const MESSAGE_SYNC = 0;
@@ -24,8 +24,20 @@ const MAX_TOKEN_RETRY_MS = 60_000;
 /** Retry cadence while the server finishes activating a pending epoch. */
 const EPOCH_PENDING_RETRY_MS = 2_000;
 const MAX_RECONNECT_MS = 5_000;
+/** Probe interval while local changes await the server's durable acknowledgement. */
 const HEARTBEAT_MS = 2_000;
-const RESPONSE_TIMEOUT_MS = 3_000;
+/**
+ * Probe interval for an idle document. Every document in the vault holds a
+ * channel, so a 2s probe cost thousands of round trips a second in a large
+ * vault while nothing changed; a dead shared socket is caught by the mux's
+ * own 5s ping instead.
+ */
+const IDLE_HEARTBEAT_MS = 30_000;
+/**
+ * How long a probe may go unanswered. Channels share one socket, so a large
+ * sync message ahead of the reply can legitimately delay it by seconds.
+ */
+const RESPONSE_TIMEOUT_MS = 10_000;
 /**
  * A socket (or mux channel) that never opens must not stall the connect loop.
  * Generous, because mux OPENs are paced client-side: after a network drop a
@@ -64,6 +76,13 @@ export interface SyncSocket {
 }
 
 export type SyncSocketFactory = (url: string) => SyncSocket;
+
+/**
+ * `reason` on a socket's error event when the server refused its token
+ * (expired, from before a server restart, or for a retired epoch). A freshly
+ * minted token can open the document, so retrying this one is pointless.
+ */
+export const SOCKET_ERROR_TOKEN_REJECTED = "token-rejected";
 
 export interface RealtimeProviderOptions {
   connect?: boolean;
@@ -116,6 +135,10 @@ export class RealtimeProvider {
   private destroyed = false;
   private retries = 0;
   private tokenFailures = 0;
+  /** The server refused the current attempt's token; it will never open this document. */
+  private tokenRejected = false;
+  /** Tokens refused in a row, so a server that refuses every token is not hammered. */
+  private tokenRejections = 0;
   private localVersion = 0;
   private acknowledgedVersion = -1;
   /**
@@ -300,16 +323,36 @@ export class RealtimeProvider {
       if (!this.canContinue(lifecycle)) return;
 
       for (let attempt = 0; attempt < SOCKET_RETRIES_PER_TOKEN; attempt += 1) {
+        this.tokenRejected = false;
         const connected = await this.attemptConnection(token, lifecycle);
         if (!this.canContinue(lifecycle) || connected) {
-          if (connected) this.retries = 0;
+          if (connected) {
+            this.retries = 0;
+            this.tokenRejections = 0;
+          }
           return;
         }
         this.retries += 1;
+        // The server will not accept this token again (it expired, the server
+        // restarted, or the document moved epochs): mint a new one now instead
+        // of spending the remaining attempts on it.
+        if (this.tokenRejected) break;
         await this.sleep(this.reconnectDelay(), lifecycle);
         if (!this.canContinue(lifecycle)) return;
       }
       this.clientToken = null;
+      if (this.tokenRejected) {
+        this.tokenRejections += 1;
+        // One refusal is routine (an expired token); a fresh token refused
+        // again means something else is wrong, so back off like a failed mint.
+        if (this.tokenRejections > 1) {
+          const delay = Math.min(
+            MAX_TOKEN_RETRY_MS,
+            TOKEN_RETRY_MS * 2 ** (this.tokenRejections - 2),
+          );
+          await this.sleep(delay, lifecycle);
+        }
+      }
     }
   }
 
@@ -318,6 +361,9 @@ export class RealtimeProvider {
   }
 
   private async ensureClientToken(): Promise<ClientToken> {
+    // A reconnect after a long connection (or sleep) must not present a
+    // token the server has already forgotten.
+    if (this.clientToken && clientTokenExpired(this.clientToken)) this.clientToken = null;
     if (!this.clientToken) {
       const token = await this.tokenSource();
       if (!token || token.docId !== this.documentId || !token.url) {
@@ -398,7 +444,12 @@ export class RealtimeProvider {
         );
       }
     };
-    socket.onerror = () => this.failSocket(socket, lifecycle, "socket error");
+    socket.onerror = (event) => {
+      const rejected =
+        (event as { reason?: unknown } | null)?.reason === SOCKET_ERROR_TOKEN_REJECTED;
+      if (rejected && this.isCurrentSocket(socket, lifecycle)) this.tokenRejected = true;
+      this.failSocket(socket, lifecycle, rejected ? "token rejected" : "socket error");
+    };
     socket.onclose = (event) => {
       const close = event as { code?: unknown; reason?: unknown };
       const detail =
@@ -616,11 +667,13 @@ export class RealtimeProvider {
 
   private resetHeartbeat(): void {
     window.clearTimeout(this.heartbeatTimer ?? undefined);
+    const interval =
+      this.receivedServerSyncStep1 && !this.hasLocalChanges ? IDLE_HEARTBEAT_MS : HEARTBEAT_MS;
     this.heartbeatTimer = window.setTimeout(() => {
       this.heartbeatTimer = null;
       if (this.receivedServerSyncStep1) this.checkSync();
       else this.sendSyncStep1();
-    }, HEARTBEAT_MS);
+    }, interval);
   }
 
   private clearResponseTimeout(): void {
@@ -677,11 +730,16 @@ function defaultSocketFactory(url: string): SyncSocket {
   return new WebSocket(url) as unknown as SyncSocket;
 }
 
+/**
+ * Stop reacting to a socket about to be closed. Closing one that is still
+ * connecting reports an error event afterwards, and Node's `ws` throws that
+ * error when nothing listens, so a no-op handler stays attached.
+ */
 function detachSocket(socket: SyncSocket): void {
   socket.onopen = null;
   socket.onmessage = null;
   socket.onclose = null;
-  socket.onerror = null;
+  socket.onerror = () => {};
 }
 
 function toUint8Array(data: unknown): Uint8Array {

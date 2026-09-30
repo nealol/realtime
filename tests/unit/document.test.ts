@@ -9,6 +9,7 @@ import { waitFor, freshGuid } from "../support/util";
 import { setDocumentEpoch } from "../../src/documentEpoch";
 import { LocalSyncState } from "../../src/localSyncState";
 import { storedContentFingerprint } from "../../src/SyncedDoc";
+import { sha256Text } from "../../src/hash";
 
 /**
  * The slice of VaultSync a Document reports disk/sync state to, backed by a
@@ -33,6 +34,10 @@ function attachLocalSyncState(plugin: FakePlugin): LocalSyncState {
       return state.diskFingerprint(path, identity);
     },
     noteTextActivity: () => {},
+    beginOwnWrite: () => () => {},
+    isPendingLocalRemoval: () => false,
+    acknowledgedFingerprint: (path: string, identity: string) =>
+      state.acknowledgedFingerprint(path, identity),
   };
   return state;
 }
@@ -197,6 +202,8 @@ describe("Document sync", () => {
       noteMaterialized,
       noteContentAcknowledged: vi.fn(),
       noteTextActivity: vi.fn(),
+      beginOwnWrite: () => () => {},
+      isPendingLocalRemoval: () => false,
     };
     const originalCreate = vault.create.bind(vault);
     let releaseCreate!: () => void;
@@ -1307,6 +1314,95 @@ describe("Document sync", () => {
     } finally {
       retired.destroy();
       for (const doc of replacements) doc.destroy();
+      state.destroy();
+    }
+  });
+
+  it("takes the remote when an empty store meets a file holding acknowledged content", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("note.md", "line one\nline two\n");
+    const first = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const peer = new Peer(memberPlugin, docId(guid));
+    let second: Document | null = null;
+    try {
+      await first.whenReady();
+      const acknowledged = await sha256Text("line one\nline two\n");
+      await waitFor(() => state.acknowledgedFingerprint("note.md", guid) === acknowledged, {
+        label: "content acknowledged",
+      });
+      first.destroy();
+      // The store is gone (a new epoch, or evicted storage) and another
+      // device changed an existing line meanwhile.
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(docId(guid));
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      });
+      await peer.whenSynced();
+      peer.setText("line ONE\nline two\n");
+      await peer.whenChangesSynced();
+
+      second = new Document(plugin as any, "note.md", guid, docId(guid), false);
+      await second.whenReady();
+      await waitFor(() => vault.files.get("note.md") === "line ONE\nline two\n", {
+        label: "remote written to disk",
+      });
+      expect(modalMock.calls).toHaveLength(0);
+      expect(second.content).toBe("line ONE\nline two\n");
+    } finally {
+      first.destroy();
+      second?.destroy();
+      peer.destroy();
+      state.destroy();
+    }
+  });
+
+  it("merges against the retired epoch's content when the new store starts empty", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("note.md", "line one\nline two\n");
+    const first = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const peer = new Peer(memberPlugin, docId(guid));
+    let second: Document | null = null;
+    try {
+      await first.whenReady();
+      await waitFor(() => !first.provider.hasLocalChanges, { label: "first acknowledged" });
+      const retiredBaseline = first.retiredBaseline();
+      expect(retiredBaseline).toBe("line one\nline two\n");
+      first.destroy();
+      await new Promise<void>((resolve, reject) => {
+        const request = indexedDB.deleteDatabase(docId(guid));
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      });
+      // Remote and local each changed a different line.
+      await peer.whenSynced();
+      peer.setText("line ONE\nline two\n");
+      await peer.whenChangesSynced();
+      vault.files.set("note.md", "line one\nline two, edited here\n");
+
+      second = new Document(plugin as any, "note.md", guid, docId(guid), false, {
+        retiredBaseline,
+      });
+      await second.whenReady();
+      const merged = "line ONE\nline two, edited here\n";
+      await waitFor(() => peer.getText() === merged, { label: "merge reached the peer" });
+      expect(second.content).toBe(merged);
+      expect(vault.files.get("note.md")).toBe(merged);
+      expect(modalMock.calls).toHaveLength(0);
+    } finally {
+      first.destroy();
+      second?.destroy();
+      peer.destroy();
       state.destroy();
     }
   });

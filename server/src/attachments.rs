@@ -238,12 +238,40 @@ pub async fn upload_attachment(
     State(state): State<AppState>,
     principal: ApiPrincipal,
     Path((vault_id, path)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     body: Body,
 ) -> AppResult<axum::Json<UploadAttachmentResponse>> {
+    let expected = crate::structured::if_match_hash(&headers);
+    let precondition = match (expected.as_deref(), require_absent(&headers)?) {
+        (Some(_), true) => {
+            return Err(AppError::BadRequest(
+                "If-Match and If-None-Match cannot be combined".into(),
+            ))
+        }
+        (Some(hash), false) => ydoc::AttachmentPrecondition::Hash(hash),
+        (None, true) => ydoc::AttachmentPrecondition::Absent,
+        (None, false) => ydoc::AttachmentPrecondition::None,
+    };
     let bytes = body_to_bytes(body, state.config.attachment_max_bytes).await?;
     Ok(axum::Json(
-        upload_attachment_bytes_inner(&state, &principal, &vault_id, &path, &bytes).await?,
+        upload_attachment_bytes_inner(&state, &principal, &vault_id, &path, &bytes, precondition)
+            .await?,
     ))
+}
+
+/// Whether the request sent `If-None-Match: *` (the path must be empty).
+/// Entity tags are not supported there: an attachment is named by its hash,
+/// which `If-Match` covers.
+fn require_absent(headers: &axum::http::HeaderMap) -> AppResult<bool> {
+    let Some(value) = headers.get(header::IF_NONE_MATCH) else {
+        return Ok(false);
+    };
+    match value.to_str().map(str::trim) {
+        Ok("*") => Ok(true),
+        _ => Err(AppError::BadRequest(
+            "If-None-Match supports only \"*\"".into(),
+        )),
+    }
 }
 
 pub(crate) async fn upload_attachment_bytes_inner(
@@ -252,6 +280,7 @@ pub(crate) async fn upload_attachment_bytes_inner(
     vault_id: &str,
     path: &str,
     bytes: &[u8],
+    precondition: ydoc::AttachmentPrecondition<'_>,
 ) -> AppResult<UploadAttachmentResponse> {
     principal.require_vault(vault_id)?;
     require_member(state, &principal.user.id, vault_id).await?;
@@ -263,7 +292,7 @@ pub(crate) async fn upload_attachment_bytes_inner(
     reject_html_upload(None, bytes)?;
     validate_magic_for_path(path, bytes)?;
     let (hash, size) = store_bytes(state, vault_id, bytes).await?;
-    ydoc::index_set_binary(state, vault_id, path, &hash, size).await?;
+    ydoc::index_set_binary_if(state, vault_id, path, &hash, size, precondition).await?;
     state
         .git
         .mark_write(

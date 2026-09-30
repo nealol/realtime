@@ -1,17 +1,22 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { NotFoundError, RealtimeClient, type VaultHandle } from "../../src/index";
+import {
+  ConflictError,
+  NotFoundError,
+  RealtimeClient,
+  noteContentHash,
+  type VaultHandle,
+} from "../../src/index";
 import { startAuthHarness, type AuthHarness } from "../support/harness";
 
 let harness: AuthHarness;
+let token: string;
 let client: RealtimeClient;
 let vault: VaultHandle;
 
 beforeAll(async () => {
   harness = await startAuthHarness();
-  client = new RealtimeClient({
-    baseUrl: harness.authUrl,
-    token: await harness.loginUser("alice"),
-  });
+  token = await harness.loginUser("alice");
+  client = new RealtimeClient({ baseUrl: harness.authUrl, token });
   vault = client.vault((await client.vaults.create("Notes Vault")).id);
 });
 
@@ -54,6 +59,43 @@ describe("notes CRUD", () => {
     await vault.notes.create("Perma.md", "x");
     const link = await vault.notes.permalink("Perma.md");
     expect(link.url).toContain("/n/");
+  });
+
+  it("refuses a replace built on stale content", async () => {
+    await vault.notes.create("Stale.md", "# Log\n");
+    const basis = await noteContentHash("# Log\n");
+    await vault.notes.patch("Stale.md", { old: "# Log", new: "# Team log" });
+
+    await expect(
+      vault.notes.replace("Stale.md", "# Log\nclobbered\n", { expectedContentHash: basis }),
+    ).rejects.toThrow(ConflictError);
+    expect((await vault.notes.read("Stale.md")).content).toBe("# Team log\n");
+
+    const current = await noteContentHash("# Team log\n");
+    const replaced = await vault.notes.replace("Stale.md", "# Team log\nkept\n", {
+      expectedContentHash: current,
+    });
+    expect(replaced.content).toBe("# Team log\nkept\n");
+  });
+
+  it("appends after an edit that lands between its read and its write", async () => {
+    await vault.notes.create("Race.md", "# Log\n");
+    let raced = false;
+    const racing = new RealtimeClient({
+      baseUrl: harness.authUrl,
+      token,
+      fetch: async (input, init) => {
+        if (!raced && init?.method === "PUT") {
+          raced = true;
+          await vault.notes.patch("Race.md", { old: "# Log", new: "# Team log" });
+        }
+        return fetch(input, init);
+      },
+    });
+
+    const appended = await racing.vault(vault.vaultId).notes.append("Race.md", "- entry");
+    expect(raced).toBe(true);
+    expect(appended.content).toBe("# Team log\n- entry");
   });
 });
 

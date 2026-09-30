@@ -76,6 +76,10 @@ function attachLocalSyncState(plugin: FakePlugin): LocalSyncState {
       return state.diskFingerprint(path, identity);
     },
     noteTextActivity: () => {},
+    beginOwnWrite: () => () => {},
+    isPendingLocalRemoval: () => false,
+    acknowledgedFingerprint: (path: string, identity: string) =>
+      state.acknowledgedFingerprint(path, identity),
   };
   return state;
 }
@@ -127,6 +131,61 @@ describe("StructuredDocument disk sync", () => {
         second.destroy();
       }
     } finally {
+      first.destroy();
+      peer.destroy();
+      state.destroy();
+    }
+  });
+
+  it("preserves one conflict copy and keeps remote edits that land while writing it", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("conflict.base", serializeBase({ formulas: { a: "1" } }));
+    const first = new BaseDocument(plugin as any, "conflict.base", guid, docId(guid), true);
+    const peer = new StructuredPeer(docId(guid));
+    let second: BaseDocument | null = null;
+    try {
+      await first.whenReady();
+      await waitFor(() => JSON.stringify(peer.value) === '{"formulas":{"a":"1"}}', {
+        label: "peer has the base",
+      });
+      first.destroy();
+
+      // Offline, both sides change the same formula.
+      peer.set({ formulas: { a: "remote" } });
+      vault.files.set("conflict.base", serializeBase({ formulas: { a: "local" } }));
+
+      // Another remote edit arrives while the recovery copy is being written.
+      let copies = 0;
+      const create = vault.create.bind(vault);
+      vault.create = async (path: string, text: string) => {
+        if (/conflicted copy/.test(path)) {
+          copies += 1;
+          if (copies === 1) {
+            peer.set({ formulas: { a: "remote", b: "added" } });
+            await waitFor(() => JSON.stringify(second?.value).includes("added"), {
+              label: "concurrent remote edit arrived",
+            });
+          }
+        }
+        return create(path, text);
+      };
+
+      second = new BaseDocument(plugin as any, "conflict.base", guid, docId(guid), false);
+      await second.whenReady();
+      const expected = { formulas: { a: "local", b: "added" } };
+      await waitFor(() => JSON.stringify(peer.value) === JSON.stringify(expected), {
+        label: "peer sees the merged result",
+      });
+      expect(second.value).toEqual(expected);
+      await new Promise((r) => setTimeout(r, 2_500));
+      expect(copies).toBe(1);
+    } finally {
+      second?.destroy();
       first.destroy();
       peer.destroy();
       state.destroy();

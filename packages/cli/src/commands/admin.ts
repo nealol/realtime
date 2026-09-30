@@ -106,11 +106,19 @@ export function registerAdminCommands(program: Command): void {
     .description("show vault storage usage")
     .option("--gc", "garbage-collect orphaned blobs")
     .option("--min-bytes <n>", "with --gc: only blobs at least this large", (v) => parseInt(v, 10))
-    .action(async (opts: { gc?: boolean; minBytes?: number }) => {
+    .option(
+      "--min-age <seconds>",
+      "with --gc: only blobs written at least this long ago (server default: 3600)",
+      (v) => parseInt(v, 10),
+    )
+    .action(async (opts: { gc?: boolean; minBytes?: number; minAge?: number }) => {
       const ctx = ctxFrom(program);
       const { vault } = vaultClients(ctx);
       if (opts.gc) {
-        const res = await vault.storage.gcBlobs({ minBytes: opts.minBytes });
+        const res = await vault.storage.gcBlobs({
+          minBytes: opts.minBytes,
+          minAgeSeconds: opts.minAge,
+        });
         out(ctx, res, () =>
           process.stdout.write(
             `removed ${res.removed} blob(s), freed ${formatBytes(res.freedBytes)}\n`,

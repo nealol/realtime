@@ -3,7 +3,7 @@
 // WebSocket or token plumbing) and get the same audit log + robot Git
 // attribution as MCP/streaming edits.
 
-import { describe, it, beforeAll, afterAll, expect } from "vitest";
+import { describe, it, beforeAll, afterAll, expect, vi } from "vitest";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { RealtimeCursorsAPI } from "../../src/cursors/api";
@@ -102,6 +102,31 @@ describe("remote cursors plugin API", () => {
     const fresh = await cursors.acquire({ pluginId: "retry-bot" });
     expect(fresh.token).not.toBe(corrupted);
     expect(fresh.cursorId).toBe(cursor.cursorId);
+  });
+
+  it("append keeps an edit that lands between its read and its write", async () => {
+    const { cursors } = await setup("append-race");
+    const writer = await cursors.acquire({ pluginId: "append-bot" });
+    const other = await cursors.acquire({ pluginId: "other-bot" });
+    await writer.notes.create("log.md", "# Log\n");
+
+    const realFetch = globalThis.fetch;
+    let raced = false;
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (!raced && init?.method === "PUT") {
+        raced = true;
+        await other.notes.patch("log.md", { old: "# Log", new: "# Team log" });
+      }
+      return realFetch(input, init);
+    });
+    try {
+      await writer.notes.append("log.md", "- entry");
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(raced).toBe(true);
+    expect((await writer.notes.read("log.md")).content).toBe("# Team log\n- entry");
   });
 
   it("two plugins get distinct cursors in the same vault", async () => {

@@ -315,6 +315,48 @@ describe("MuxWebSocket", () => {
     expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(4);
   });
 
+  it("reports a refused token without slowing other opens on the shard", () => {
+    vi.useFakeTimers();
+    const live = new MuxWebSocket(DOC2_URL);
+    const refused = new MuxWebSocket(DOC_URL);
+    const server = FakeServerSocket.instances[0];
+    server.open();
+    server.deliver(
+      simpleFrame(
+        2 /* OPEN_OK */,
+        openChannelId(server, "/d/vault__def/ws/vault__def?token=t-def"),
+      ),
+    );
+    expect(live.readyState).toBe(MuxWebSocket.OPEN);
+    const channel = openChannelId(server, "/d/vault__abc/ws/vault__abc?token=t-abc");
+    const onerror = vi.fn();
+    refused.onerror = onerror;
+
+    const openErr = encoding.createEncoder();
+    encoding.writeVarUint(openErr, 3 /* OPEN_ERR */);
+    encoding.writeVarUint(openErr, channel);
+    encoding.writeVarUint(openErr, 2 /* token refused */);
+    server.deliver(encoding.toUint8Array(openErr));
+    expect(onerror).toHaveBeenCalledWith({ reason: "token-rejected" });
+
+    // The replacement channel opens immediately: no admission backoff.
+    new MuxWebSocket(DOC_URL);
+    expect(server.frames().filter((frame) => frame?.type === "open")).toHaveLength(3);
+  });
+
+  it("decodes OPEN_ERR with and without a reason", () => {
+    expect(decodeFrame(simpleFrame(3, 4))).toEqual({ type: "open_err", channelId: 4, reason: 0 });
+    const withReason = encoding.createEncoder();
+    encoding.writeVarUint(withReason, 3);
+    encoding.writeVarUint(withReason, 4);
+    encoding.writeVarUint(withReason, 1);
+    expect(decodeFrame(encoding.toUint8Array(withReason))).toEqual({
+      type: "open_err",
+      channelId: 4,
+      reason: 1,
+    });
+  });
+
   it("closes the idle real socket once an OPEN backoff has passed", () => {
     vi.useFakeTimers();
     const socket = new MuxWebSocket(DOC_URL);

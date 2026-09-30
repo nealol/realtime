@@ -1177,9 +1177,14 @@ export class AuthClient {
     });
   }
 
-  /** Reclaim a single orphaned blob (no-op server-side if still referenced). */
-  async deleteBlob(vaultId: string, hash: string): Promise<void> {
-    await this.api(`/api/vaults/${vaultId}/blobs/${hash}`, { method: "DELETE" });
+  /**
+   * Reclaim a single orphaned blob (no-op server-side while still referenced).
+   * `trashEntryId` names the trash entry being deleted, whose own reference to
+   * the blob must not keep it alive; other trash entries still do.
+   */
+  async deleteBlob(vaultId: string, hash: string, trashEntryId?: string): Promise<void> {
+    const query = trashEntryId ? `?trashEntry=${encodeURIComponent(trashEntryId)}` : "";
+    await this.api(`/api/vaults/${vaultId}/blobs/${hash}${query}`, { method: "DELETE" });
   }
 
   // --- plugin databases (synced SQLite) --------------------------------------

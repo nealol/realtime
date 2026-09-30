@@ -10,7 +10,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { VaultHandle } from "@realtime-md/sdk";
+import { ConflictError, type VaultHandle } from "@realtime-md/sdk";
 import {
   CliError,
   writeRtmd,
@@ -132,6 +132,20 @@ interface RemoteContent {
   /** Bytes to write locally on pull. */
   bytes: Uint8Array;
   guid?: string;
+  /** Server version token for a Canvas/Base (`If-Match` on replace). */
+  valueHash?: string;
+}
+
+/**
+ * What a replace must still find on the server: the remote state `push`
+ * compared against. Without it, a remote edit landing between that check and
+ * the write would be silently reverted.
+ */
+interface RemotePrecondition {
+  contentHash?: string;
+  valueHash?: string;
+  /** The remote had nothing at the path; creating must not replace a newcomer. */
+  absent?: boolean;
 }
 
 async function fetchRemote(
@@ -156,6 +170,7 @@ async function fetchRemote(
         hash: hashText(JSON.stringify(res.value)),
         bytes: Buffer.from(`${JSON.stringify(res.value, null, "\t")}\n`, "utf8"),
         guid: res.guid,
+        valueHash: res.valueHash,
       };
     }
     case "attachment": {
@@ -311,12 +326,15 @@ async function uploadLocal(
   relPath: string,
   bytes: Uint8Array,
   exists: boolean,
+  precondition: RemotePrecondition = {},
 ): Promise<string | undefined> {
   switch (kind) {
     case "note": {
       const text = Buffer.from(bytes).toString("utf8");
       const note = exists
-        ? await vault.notes.replace(relPath, text)
+        ? await vault.notes.replace(relPath, text, {
+            expectedContentHash: precondition.contentHash,
+          })
         : await vault.notes.create(relPath, text);
       return note.guid;
     }
@@ -332,12 +350,15 @@ async function uploadLocal(
       }
       const resource = kind === "canvas" ? vault.canvases : vault.bases;
       const res = exists
-        ? await resource.replace(relPath, value)
+        ? await resource.replace(relPath, value, { ifMatch: precondition.valueHash })
         : await resource.create(relPath, value);
       return res.guid;
     }
     case "attachment":
-      await vault.attachments.upload(relPath, bytes);
+      await vault.attachments.upload(relPath, bytes, {
+        ifMatch: precondition.contentHash,
+        ifNoneMatch: precondition.absent ? "*" : undefined,
+      });
       return undefined;
   }
 }
@@ -367,9 +388,11 @@ export async function push(
     const r = remote.get(relPath);
     const localChanged = !snap || l.hash !== snap.hash;
     if (!localChanged) continue;
+    let precondition: RemotePrecondition = {};
     if (r && !opts.force) {
       // Detect a concurrent remote edit before overwriting it.
-      const remoteHash = r.hash ?? (await fetchRemote(vault, r.kind, relPath)).hash;
+      const fetched = r.hash === undefined ? await fetchRemote(vault, r.kind, relPath) : null;
+      const remoteHash = r.hash ?? fetched!.hash;
       if (remoteHash === l.hash) {
         recordLocal(ws.dir, relPath, l.kind, l.hash, snapshot, r.guid);
         continue;
@@ -381,6 +404,8 @@ export async function push(
         });
         continue;
       }
+      // ...and have the server refuse the write if one lands after this check.
+      precondition = { contentHash: remoteHash, valueHash: fetched?.valueHash };
     }
     if (!r && snap && !opts.force) {
       report.conflicts.push({
@@ -389,8 +414,20 @@ export async function push(
       });
       continue;
     }
+    if (!r && !opts.force) precondition = { absent: true };
     const bytes = fs.readFileSync(path.join(ws.dir, relPath));
-    const guid = await uploadLocal(vault, l.kind, relPath, bytes, !!r);
+    let guid: string | undefined;
+    try {
+      guid = await uploadLocal(vault, l.kind, relPath, bytes, !!r, precondition);
+    } catch (error) {
+      if (!(error instanceof ConflictError)) throw error;
+      const hint = opts.force ? "pull, then push again" : "use --force to overwrite";
+      report.conflicts.push({
+        path: relPath,
+        reason: `${r ? "modified" : "created"} remotely during push (${hint})`,
+      });
+      continue;
+    }
     recordLocal(ws.dir, relPath, l.kind, l.hash, snapshot, guid);
     report.applied.push({ action: r ? "update" : "create", path: relPath });
   }

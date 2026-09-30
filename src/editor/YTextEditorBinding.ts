@@ -1,5 +1,6 @@
 import type * as Y from "yjs";
 import { applyTextToYText } from "../diff";
+import { mergeText } from "../textMerge";
 
 export interface TextEditorAdapter {
   getText(): string;
@@ -12,6 +13,8 @@ export interface YTextBindingReadiness {
   whenReady(): Promise<void>;
   isReady(): boolean;
   mayPushToShared(sharedEmpty: boolean): boolean;
+  /** Edits typed before readiness overlapped `shared`, which the editor's text replaced. */
+  onConflict?(shared: string): void;
 }
 
 /** Transport- and editor-independent two-way binding for one editor and one Y.Text. */
@@ -19,6 +22,8 @@ export class YTextEditorBinding {
   private destroyed = false;
   private ready = false;
   private readonly editorAtBind: string;
+  /** The editor already held unsaved edits, so `editorAtBind` is not a shared baseline. */
+  private readonly dirtyAtBind: boolean;
   private readonly removeEditorListener: () => void;
   private readonly yObserver: () => void;
 
@@ -29,6 +34,7 @@ export class YTextEditorBinding {
     private readonly origin: unknown = null,
   ) {
     this.editorAtBind = editor.getText();
+    this.dirtyAtBind = editor.hasLocalChanges?.() ?? false;
     this.yObserver = () => this.pullFromShared();
     ytext.observe(this.yObserver);
     this.removeEditorListener = editor.onChange(() => this.pushFromEditor());
@@ -48,7 +54,18 @@ export class YTextEditorBinding {
     const shared = this.ytext.toString();
     const current = this.editor.getText();
     if (shared === current) return;
-    if ((current !== this.editorAtBind || this.editor.hasLocalChanges?.()) && this.mayPush()) {
+    if (current !== this.editorAtBind && !this.dirtyAtBind && this.mayPush()) {
+      // Typed before the document was ready: merge those edits with changes
+      // the shared text gained meanwhile instead of overwriting them.
+      const merge = mergeText(this.editorAtBind, current, shared);
+      const next = merge.kind === "merged" ? merge.content : current;
+      if (merge.kind !== "merged") this.readiness.onConflict?.(shared);
+      this.writeShared(next);
+      if (this.editor.getText() !== next) this.editor.applyText(next);
+    } else if (
+      (current !== this.editorAtBind || this.editor.hasLocalChanges?.()) &&
+      this.mayPush()
+    ) {
       this.writeShared(current);
     } else if (shared.length > 0) {
       this.editor.applyText(shared);

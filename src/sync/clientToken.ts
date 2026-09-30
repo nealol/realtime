@@ -12,7 +12,17 @@ export type ClientToken = {
   epoch?: number;
   /** The server is still activating `epoch`; it accepts connections once active. */
   epochPending?: boolean;
+  /** When the server stops accepting `token` (ms since the Unix epoch); absent on older servers. */
+  expiresAt?: number;
 };
+
+/** Refresh a token this long before it expires, so a reconnect never presents a dead one. */
+const TOKEN_EXPIRY_MARGIN_MS = 60_000;
+
+/** Whether a cached token can no longer be trusted to open its document. */
+export function clientTokenExpired(token: ClientToken, now = Date.now()): boolean {
+  return typeof token.expiresAt === "number" && now >= token.expiresAt - TOKEN_EXPIRY_MARGIN_MS;
+}
 
 export class DocumentEpochChangedError extends Error {
   constructor(
@@ -44,10 +54,17 @@ const TOKEN_RETRY_DELAY_MS = 30_000;
  */
 const SERVER_FAILURES_BEFORE_BACKOFF = 3;
 
+/**
+ * Token requests in flight at once. Reconnecting a large vault mints one token
+ * per document; strictly one at a time, a few thousand notes took minutes.
+ */
+const MAX_CONCURRENT_TOKEN_REQUESTS = 6;
+
 let tokenRetryDelayMs = TOKEN_RETRY_DELAY_MS;
 let nextTokenAttemptAt = 0;
 let consecutiveServerFailures = 0;
-let tokenAttemptQueue: Promise<void> = Promise.resolve();
+let activeTokenRequests = 0;
+let tokenRequestWaiters: Array<() => void> = [];
 
 /**
  * Test-only: clear the module-global token backoff/queue and optionally shrink
@@ -59,7 +76,8 @@ export function resetTokenRetryStateForTests(delayMs = TOKEN_RETRY_DELAY_MS): vo
   tokenRetryDelayMs = delayMs;
   nextTokenAttemptAt = 0;
   consecutiveServerFailures = 0;
-  tokenAttemptQueue = Promise.resolve();
+  activeTokenRequests = 0;
+  tokenRequestWaiters = [];
 }
 
 /**
@@ -89,14 +107,22 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
-async function waitForTokenAttemptSlot(): Promise<() => void> {
-  let release!: () => void;
-  const previous = tokenAttemptQueue;
-  tokenAttemptQueue = new Promise((resolve) => {
-    release = resolve;
+/** Wait for a free token-request slot; the returned function releases it. */
+function waitForTokenAttemptSlot(): Promise<() => void> {
+  return new Promise((resolve) => {
+    const grant = () => {
+      activeTokenRequests += 1;
+      let released = false;
+      resolve(() => {
+        if (released) return;
+        released = true;
+        activeTokenRequests -= 1;
+        tokenRequestWaiters.shift()?.();
+      });
+    };
+    if (activeTokenRequests < MAX_CONCURRENT_TOKEN_REQUESTS) grant();
+    else tokenRequestWaiters.push(grant);
   });
-  await previous;
-  return release;
 }
 
 /**

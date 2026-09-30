@@ -25,7 +25,12 @@ a `path → sha256` mapping through the CRDT index and stores the bytes in a
 under `/api/vaults/{id}/blobs/{hash}` for the matching plugin (a `HEAD` with
 `?size=` reports a stored copy of another length as missing, so the uploader
 repairs it, and path-scoped downloads refuse a copy whose length differs from
-the index), while consumer-facing
+the index). Clients upload a blob before publishing the index entry that
+references it, so the admin cleanup `POST /api/vaults/{id}/storage/gc-blobs`
+skips orphans written within the last hour (`minAgeSeconds` changes that
+window). Permanently deleting one trash entry removes its blob only when no
+live file or other trash entry references it and it was not just written.
+Consumer-facing
 attachment APIs live under `/api/vaults/{id}/attachments/*`. Attachments enforce an
 extension allowlist, an attachment-specific size cap, SSRF checks for from-URL
 fetches, and signed single-use public upload links via `/upload`. Vault members can
@@ -234,10 +239,13 @@ matching backup, not running a down migration or editing
 An accepted update reaches the live document only after its checksummed log
 record has reached disk. The server compacts long logs in the background and
 treats the manifest swap as the compaction commit. An incomplete final record
-is truncated during startup; checksum failures stop the document instead of
-replacing it with an empty one. If the next record would cross the 512 MiB
-replay limit, the server compacts synchronously before appending it, and the
-append path rejects any segment that still cannot stay within that limit.
+(one that runs past the end of the log, or a zero-filled tail left by a crash
+mid-append) is truncated during startup, and a failed append removes its
+partial record before the document accepts another write. Any other checksum
+failure stops the document instead of replacing it with an empty one. If the
+next record would cross the 512 MiB replay limit, the server compacts
+synchronously before appending it, and the append path rejects any segment
+that still cannot stay within that limit.
 
 Long-lived documents also use logical epochs. The server measures encoded
 state, encoded delete-set size, accepted updates, age, and active connections.

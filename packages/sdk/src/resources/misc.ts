@@ -51,10 +51,14 @@ export class StorageResource {
     return this.http.request("GET", `/api/vaults/${this.vaultId}/storage`);
   }
 
-  /** Delete orphaned blobs at least `minBytes` large (default 0). */
-  gcBlobs(opts: { minBytes?: number } = {}): Promise<GcBlobsResult> {
+  /**
+   * Delete orphaned blobs at least `minBytes` large (default 0) that were
+   * written at least `minAgeSeconds` ago (server default: one hour, so
+   * uploads whose index entry is still being published are kept).
+   */
+  gcBlobs(opts: { minBytes?: number; minAgeSeconds?: number } = {}): Promise<GcBlobsResult> {
     return this.http.request("POST", `/api/vaults/${this.vaultId}/storage/gc-blobs`, {
-      body: { minBytes: opts.minBytes },
+      body: { minBytes: opts.minBytes, minAgeSeconds: opts.minAgeSeconds },
     });
   }
 }

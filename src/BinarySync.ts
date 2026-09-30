@@ -25,6 +25,13 @@ export interface BinaryMeta {
   hash: string;
   /** Byte length, for display and upload scheduling. */
   size: number;
+  /**
+   * The hash this version replaced (null for a new file) — the version its
+   * publisher had agreed on. Lets a device tell an update built on its own
+   * publish from a concurrent one that last-writer-wins chose over it.
+   * Absent on entries from older clients.
+   */
+  prev?: string | null;
 }
 
 /** Files at or above this size are uploaded in the background, deferred while
@@ -40,6 +47,13 @@ const MOBILE_RECONCILE_CONCURRENCY = 3;
 const RECONCILE_MAX_BYTES_IN_FLIGHT = 32 * 1024 * 1024;
 /** Delay before re-draining the upload queue when deferred / after a failure. */
 const DRAIN_RETRY_MS = 2000;
+/** A large upload waits at most this long for note sync to quiet down. */
+const MAX_LARGE_UPLOAD_DEFERRAL_MS = 60_000;
+/** Live (non-startup) transfers: parallel jobs and bytes held in memory at once. */
+const TRANSFER_CONCURRENCY = 4;
+const MOBILE_TRANSFER_CONCURRENCY = 2;
+const TRANSFER_MAX_BYTES_IN_FLIGHT = 32 * 1024 * 1024;
+const MOBILE_TRANSFER_MAX_BYTES_IN_FLIGHT = 16 * 1024 * 1024;
 
 /** Exponential backoff from DRAIN_RETRY_MS, capped at MAX_RETRY_MS. */
 function retryDelay(failures: number): number {
@@ -56,15 +70,48 @@ function isTransientTransferError(error: unknown): boolean {
   return isServerUnavailableStatus(error.status) || error.status >= 500;
 }
 
+/**
+ * A queued upload. Holds no bytes: the file is read when its transfer starts,
+ * so a large import queues paths rather than the vault's attachments in memory.
+ */
 interface UploadJob {
   path: string;
   hash: string;
-  bytes: ArrayBuffer;
   size: number;
   attempts: number;
   urgent: boolean;
   expectedRemoteHash?: string | null;
   diskVersion: number;
+  /** When note sync first held this (large) upload back. */
+  deferredSince?: number;
+}
+
+/** Bounds concurrent transfers and the bytes they hold in memory at once. */
+class TransferLimiter {
+  private active = 0;
+  private bytes = 0;
+  private waiters: Array<() => void> = [];
+
+  constructor(
+    private readonly maxJobs: number,
+    private readonly maxBytes: number,
+  ) {}
+
+  async run<T>(size: number, work: () => Promise<T>): Promise<T> {
+    // A job larger than the whole budget still runs, alone.
+    while (this.active > 0 && (this.active >= this.maxJobs || this.bytes + size > this.maxBytes)) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
+    }
+    this.active += 1;
+    this.bytes += size;
+    try {
+      return await work();
+    } finally {
+      this.active -= 1;
+      this.bytes -= size;
+      for (const wake of this.waiters.splice(0)) wake();
+    }
+  }
 }
 
 /**
@@ -103,6 +150,11 @@ export class BinarySync {
   private downloadFailures = new Map<string, number>();
   /** Paths we are currently writing to disk, to ignore the resulting vault event. */
   private writing = new Set<string>();
+  /**
+   * Paths the user deleted in a live vault event. That is proof of a delete,
+   * so it overrides the "missing means not pulled yet" startup semantics.
+   */
+  private liveDeletes = new Set<string>();
   /** Paths migrated away from binary sync during this session. */
   private ignoredPaths = new Set<string>();
   /** Startup pulls should restore missing files from the moved/persisted index. */
@@ -121,6 +173,17 @@ export class BinarySync {
 
   /** Serializes conflict modals so only one is shown at a time. */
   private conflictChain: Promise<void> = Promise.resolve();
+
+  /** Disk reads for hashing, which hold a whole file in memory. */
+  private readonly readLimiter = new TransferLimiter(
+    Platform?.isMobile ? MOBILE_TRANSFER_CONCURRENCY : TRANSFER_CONCURRENCY,
+    Platform?.isMobile ? MOBILE_TRANSFER_MAX_BYTES_IN_FLIGHT : TRANSFER_MAX_BYTES_IN_FLIGHT,
+  );
+  /** Blob downloads; a remote bulk import must not start them all at once. */
+  private readonly downloadLimiter = new TransferLimiter(
+    Platform?.isMobile ? MOBILE_TRANSFER_CONCURRENCY : TRANSFER_CONCURRENCY,
+    Platform?.isMobile ? MOBILE_TRANSFER_MAX_BYTES_IN_FLIGHT : TRANSFER_MAX_BYTES_IN_FLIGHT,
+  );
 
   /** Observer is a no-op until the startup pass runs (see {@link reconcileAll}). */
   private started = false;
@@ -214,7 +277,9 @@ export class BinarySync {
     let bytesInFlight = 0;
     for (const path of paths) {
       if (this.destroyed) break;
-      const size = this.binaries.get(path)?.size ?? 0;
+      // A local-only file is read (hashed and uploaded), so it costs its size too.
+      const size =
+        this.binaries.get(path)?.size ?? getFileByPath(this.plugin.app, path)?.stat?.size ?? 0;
       while (
         running.size > 0 &&
         (running.size >= maxJobs || bytesInFlight + size > RECONCILE_MAX_BYTES_IN_FLIGHT)
@@ -296,7 +361,14 @@ export class BinarySync {
     if (this.ignoredPaths.has(path)) return;
     if (this.writing.has(path)) return;
     this.bumpDiskVersion(path);
+    this.liveDeletes.add(path);
+    this.deferredInitialPulls.delete(path);
     void this.reconcile(path);
+  }
+
+  /** Whether this sync is writing `path` itself (its vault event is not a user edit). */
+  isWriting(path: string): boolean {
+    return this.writing.has(path);
   }
 
   /** A local binary file was renamed: treat as a delete of old + change of new. */
@@ -348,8 +420,11 @@ export class BinarySync {
     if (this.destroyed) return;
     if (!this.shouldTrack(path)) return;
     if (this.ignoredPaths.has(path)) return;
-    const initialPull = this.pullingMissingRemote || this.deferredInitialPulls.delete(path);
+    const liveDelete = this.liveDeletes.delete(path);
+    const initialPull =
+      !liveDelete && (this.pullingMissingRemote || this.deferredInitialPulls.delete(path));
     if (this.paused) {
+      if (liveDelete) this.liveDeletes.add(path);
       this.deferReconcile(path, initialPull);
       return;
     }
@@ -357,6 +432,7 @@ export class BinarySync {
     const localHash = await this.hashDisk(path);
     if (this.destroyed) return;
     if (this.paused) {
+      if (liveDelete) this.liveDeletes.add(path);
       this.deferReconcile(path, initialPull);
       return;
     }
@@ -403,9 +479,13 @@ export class BinarySync {
 
     // Local absent, remote present.
     if (!localHash && remoteHash) {
-      if (base === remoteHash && !initialPull && !this.pendingDownloads.has(path)) {
+      if (base === remoteHash && !initialPull && (liveDelete || !this.pendingDownloads.has(path))) {
         // We deleted it locally → propagate the delete to the index.
         this.publishDelete(path);
+      } else if (this.vaultSync.isPendingLocalRemoval?.(path)) {
+        // The user removed it before the initial sync finished; that change
+        // is about to be published, so do not restore the file meanwhile.
+        return;
       } else {
         // New remote file, or remote moved while we had no local copy → pull.
         await this.downloadToDisk(path, remoteHash, localHash);
@@ -419,8 +499,25 @@ export class BinarySync {
         // Clean local edit: remote hasn't moved since our baseline.
         await this.queueLocalUpload(path, remoteHash, localHash);
       } else if (base === localHash) {
-        // Clean remote update: local matches baseline, remote moved.
-        await this.downloadToDisk(path, remoteHash, localHash);
+        // Local matches the baseline and the remote moved. That is a clean
+        // remote update only if the remote version was built on our baseline.
+        const remotePrev = remote && "prev" in remote ? (remote.prev ?? null) : undefined;
+        if (remotePrev === base) {
+          await this.downloadToDisk(path, remoteHash, localHash);
+        } else if (remoteHash === this.localSyncState?.get(path)?.replacedIdentity) {
+          // The remote is still exactly the version our last publish replaced:
+          // that publish never reached the shared index (e.g. the index moved
+          // to a new epoch first). Publish it again rather than revert it.
+          await this.queueLocalUpload(path, remoteHash, localHash);
+        } else if (remotePrev === undefined) {
+          // Published by an older client that records no parent: assume, as
+          // before, that it was built on ours.
+          await this.downloadToDisk(path, remoteHash, localHash);
+        } else {
+          // Published concurrently with ours, and last-writer-wins kept
+          // theirs: both versions are real edits.
+          await this.resolveConflict(path);
+        }
       } else {
         // Both diverged from the baseline (or no baseline) → conflict.
         await this.resolveConflict(path);
@@ -434,8 +531,9 @@ export class BinarySync {
     const file = getFileByPath(this.plugin.app, path);
     if (!file) return null;
     try {
-      const buf = await this.plugin.app.vault.readBinary(file);
-      return await sha256Hex(buf);
+      return await this.readLimiter.run(file.stat?.size ?? 0, async () =>
+        sha256Hex(await this.plugin.app.vault.readBinary(file)),
+      );
     } catch (e) {
       console.error(`[Realtime] failed to read binary ${path}`, e);
       return undefined;
@@ -464,6 +562,16 @@ export class BinarySync {
       window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
       return false;
     }
+    const size = this.binaries.get(path)?.size ?? 0;
+    return this.downloadLimiter.run(size, () => this.transferToDisk(path, hash, expectedLocalHash));
+  }
+
+  private async transferToDisk(
+    path: string,
+    hash: string,
+    expectedLocalHash?: string | null,
+  ): Promise<boolean> {
+    if (this.destroyed) return false;
     let bytes: ArrayBuffer;
     try {
       bytes = await this.plugin.auth.getBlob(this.vaultId, path, hash);
@@ -580,7 +688,7 @@ export class BinarySync {
       this.binaries.set(path, meta);
     });
     this.lastSyncedHash.set(path, meta.hash);
-    this.localSyncState?.markSynced(path, "binary", meta.hash, meta.hash, true);
+    this.localSyncState?.markPublished(path, "binary", meta.hash, meta.prev ?? null);
   }
 
   private publishDelete(path: string): void {
@@ -610,45 +718,46 @@ export class BinarySync {
     return false;
   }
 
-  /** Restore a trashed binary: re-publish its index entry and pull the blob. */
-  restoreEntry(path: string, hash: string, size: number): void {
-    if (this.destroyed) return;
+  /**
+   * Restore a trashed binary: re-publish its index entry and pull the blob.
+   * Resolves false (publishing nothing) when the server no longer has the
+   * bytes, e.g. after a storage cleanup reclaimed them.
+   */
+  async restoreEntry(path: string, hash: string, size: number): Promise<boolean> {
+    if (this.destroyed) return false;
+    if (!(await this.plugin.auth.blobExists(this.vaultId, path, hash, size))) return false;
+    if (this.destroyed) return false;
     this.ignoredPaths.delete(path);
     this.lastSyncedHash.delete(path);
     this.indexDoc.transact(() => {
-      this.binaries.set(path, { hash, size });
+      this.binaries.set(path, { hash, size, prev: this.binaries.get(path)?.hash ?? null });
     });
     void this.reconcile(path);
+    return true;
   }
 
   // --- upload queue ----------------------------------------------------------
 
-  /** Read the current local bytes for `path` and enqueue them for upload. */
+  /**
+   * Enqueue the local file at `path` (whose bytes hash to `localHash`) for
+   * upload. The bytes are read, and checked against `localHash`, when the
+   * transfer starts.
+   */
   private async queueLocalUpload(
     path: string,
-    expectedRemoteHash?: string | null,
-    expectedLocalHash?: string,
+    expectedRemoteHash: string | null,
+    localHash: string,
   ): Promise<boolean> {
-    const diskVersion = this.diskVersions.get(path) ?? 0;
-    const bytes = await this.readDisk(path);
-    if (this.destroyed || !bytes) return false;
-    const hash = await sha256Hex(bytes);
-    if (
-      this.destroyed ||
-      (this.diskVersions.get(path) ?? 0) !== diskVersion ||
-      (expectedLocalHash && hash !== expectedLocalHash)
-    ) {
-      return false;
-    }
+    const file = getFileByPath(this.plugin.app, path);
+    if (this.destroyed || !file) return false;
     this.enqueueUpload({
       path,
-      hash,
-      bytes,
-      size: bytes.byteLength,
+      hash: localHash,
+      size: file.stat?.size ?? 0,
       attempts: 0,
       urgent: this.urgentPaths.has(path),
       expectedRemoteHash,
-      diskVersion,
+      diskVersion: this.diskVersions.get(path) ?? 0,
     });
     return true;
   }
@@ -688,14 +797,14 @@ export class BinarySync {
     this.refreshUploadStatus();
     try {
       while (this.uploadQueue.length && !this.destroyed && !this.paused) {
-        const job = this.uploadQueue[0];
-        // Hold large transfers back while notes are actively syncing — they
-        // stay queued and surface as "pending" rather than "uploading".
-        if (!job.urgent && job.size >= LARGE_FILE_BYTES && this.vaultSync.isTextSyncBusy()) {
+        const index = this.nextUploadIndex();
+        if (index < 0) {
+          // Only large transfers remain and notes are actively syncing: they
+          // stay queued and surface as "pending" rather than "uploading".
           this.scheduleDrain(DRAIN_RETRY_MS);
           break;
         }
-        this.uploadQueue.shift();
+        const [job] = this.uploadQueue.splice(index, 1);
         this.activeUpload = true;
         this.refreshUploadStatus();
         try {
@@ -732,14 +841,40 @@ export class BinarySync {
     }
   }
 
+  /**
+   * Index of the next job to upload, or -1 when every queued job is a large
+   * transfer being held back while notes sync. A held-back job never blocks
+   * the smaller ones behind it, and waits at most MAX_LARGE_UPLOAD_DEFERRAL_MS
+   * so continuous note activity cannot starve it.
+   */
+  private nextUploadIndex(): number {
+    const busy = this.vaultSync.isTextSyncBusy();
+    const now = Date.now();
+    return this.uploadQueue.findIndex((job) => {
+      if (job.urgent || job.size < LARGE_FILE_BYTES || !busy) return true;
+      job.deferredSince ??= now;
+      return now - job.deferredSince >= MAX_LARGE_UPLOAD_DEFERRAL_MS;
+    });
+  }
+
   private async doUpload(job: UploadJob): Promise<boolean> {
+    // Read the bytes only now: a queued job holds none.
+    const bytes = await this.readDisk(job.path);
+    if (this.destroyed) return true;
+    if (this.paused) return false;
+    if (!bytes || (await sha256Hex(bytes)) !== job.hash) {
+      // The file changed or vanished since it was queued; reconcile anew.
+      void this.reconcile(job.path);
+      return true;
+    }
     // With the size, a stored copy of the wrong length (a torn write) counts
     // as missing, so this upload repairs it.
-    const exists = await this.plugin.auth.blobExists(this.vaultId, job.path, job.hash, job.size);
+    const size = bytes.byteLength;
+    const exists = await this.plugin.auth.blobExists(this.vaultId, job.path, job.hash, size);
     if (this.destroyed) return true;
     if (this.paused) return false;
     if (!exists) {
-      await this.plugin.auth.putBlob(this.vaultId, job.path, job.hash, job.bytes);
+      await this.plugin.auth.putBlob(this.vaultId, job.path, job.hash, bytes);
     }
     if (this.destroyed) return true;
     if (this.paused) return false;
@@ -755,7 +890,11 @@ export class BinarySync {
       return true;
     }
     // Publish only now that the bytes are on the server.
-    this.publishMeta(job.path, { hash: job.hash, size: job.size });
+    this.publishMeta(job.path, {
+      hash: job.hash,
+      size,
+      prev: job.expectedRemoteHash ?? null,
+    });
     this.urgentPaths.delete(job.path);
     dbg("binary uploaded+published", job.path, job.hash, job.size);
     return true;

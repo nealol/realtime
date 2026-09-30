@@ -7,6 +7,7 @@
 import { createElement, type ReactElement, type CSSProperties } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { Awareness } from "y-protocols/awareness";
+import { holdPresence } from "./presenceOwners";
 
 // ---------- types ----------
 
@@ -295,6 +296,8 @@ const viewingRefs = new WeakMap<Awareness, Map<string, number>>();
  * same note from clearing presence while another remains open.
  */
 export function markViewing(awareness: Awareness, kind: "markdown" | "canvas"): () => void {
+  // Presence is published only while some view of the document is open.
+  const releasePresence = holdPresence(awareness);
   let byKind = viewingRefs.get(awareness);
   if (!byKind) {
     byKind = new Map();
@@ -305,7 +308,10 @@ export function markViewing(awareness: Awareness, kind: "markdown" | "canvas"): 
   if (count === 0) {
     awareness.setLocalStateField("viewing", { kind });
   }
+  let released = false;
   return () => {
+    if (released) return;
+    released = true;
     const current = byKind.get(kind) ?? 0;
     if (current <= 1) {
       byKind.delete(kind);
@@ -317,6 +323,7 @@ export function markViewing(awareness: Awareness, kind: "markdown" | "canvas"): 
     } else {
       byKind.set(kind, current - 1);
     }
+    releasePresence();
   };
 }
 

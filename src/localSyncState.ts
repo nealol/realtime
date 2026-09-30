@@ -24,6 +24,12 @@ export interface LocalPathState {
    * not edited locally since, however far the document has moved on.
    */
   diskFingerprint?: string;
+  /**
+   * Blob identity (hash) that this device's last publish for the path
+   * replaced. A remote entry still at exactly that version, not built on the
+   * published one, means the publish never reached the shared index.
+   */
+  replacedIdentity?: string | null;
 }
 
 /** Keep `diskFingerprint` only while it describes the same identity. */
@@ -156,6 +162,27 @@ export class LocalSyncState {
       ...(candidate && current?.candidateFingerprint
         ? { candidateFingerprint: current.candidateFingerprint }
         : {}),
+      ...carriedDiskFingerprint(current, identity),
+    });
+  }
+
+  /**
+   * Record content this device just published as `identity` in place of
+   * `replacedIdentity` (null for a new path).
+   */
+  markPublished(
+    path: string,
+    kind: MaterializedKind,
+    identity: string,
+    replacedIdentity: string | null,
+  ): void {
+    const current = this.get(path);
+    this.paths.set(path, {
+      kind,
+      identity,
+      fingerprint: identity,
+      candidate: false,
+      replacedIdentity,
       ...carriedDiskFingerprint(current, identity),
     });
   }

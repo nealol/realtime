@@ -113,7 +113,7 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         git,
         plugindb,
         search,
-        sync_grants: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        sync_grants: Arc::new(tokio::sync::Mutex::new(crate::state::SyncGrants::default())),
         pending_document_creations: Arc::new(tokio::sync::Mutex::new(
             std::collections::HashMap::new(),
         )),

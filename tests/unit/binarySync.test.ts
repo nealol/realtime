@@ -595,6 +595,134 @@ describe("BinarySync", () => {
     }
   });
 
+  it("surfaces a conflict when last-writer-wins drops a concurrent publish", async () => {
+    const A = makeDevice("A");
+    const B = makeDevice("B");
+    // Concurrent Y.Map writes resolve to the higher client id: A's wins.
+    A.indexDoc.clientID = 900;
+    B.indexDoc.clientID = 100;
+    try {
+      await synced(A.provider);
+      await synced(B.provider);
+      B.bs.seedBaseline();
+      await B.bs.reconcileAll([]);
+      A.vault.binaries.set("shared.bin", bytes([1]));
+      A.bs.seedBaseline();
+      await A.bs.reconcileAll(["shared.bin"]);
+      await waitFor(() => asArray(B.vault.binaries.get("shared.bin"))?.[0] === 1, {
+        label: "B has the first version",
+      });
+
+      // A publishes a new version while B is offline...
+      B.provider.disconnect();
+      A.vault.binaries.set("shared.bin", bytes([2]));
+      A.bs.onLocalChanged("shared.bin");
+      const second = await sha256Hex(bytes([2]));
+      await waitFor(() => A.binaries.get("shared.bin")?.hash === second, { label: "A published" });
+      await waitFor(() => !A.provider.hasLocalChanges, { label: "A's publish acknowledged" });
+
+      // ...and B publishes its own edit, still built on the first version.
+      B.vault.binaries.set("shared.bin", bytes([3]));
+      B.bs.onLocalChanged("shared.bin");
+      const third = await sha256Hex(bytes([3]));
+      await waitFor(() => B.binaries.get("shared.bin")?.hash === third, {
+        label: "B published offline",
+      });
+
+      void B.provider.connect();
+      // A's version wins the map; B must not quietly replace its edit with it.
+      await waitFor(() => binaryModal.calls.some((call) => call.path === "shared.bin"), {
+        label: "B surfaced the conflict",
+      });
+      // Keeping local (the modal's choice here) preserves A's version beside
+      // B's and republishes B's on top of it, which A then adopts.
+      await waitFor(() => asArray(A.vault.binaries.get("shared.bin"))?.[0] === 3, {
+        label: "A adopted the resolution",
+      });
+      expect(asArray(B.vault.binaries.get("shared.bin"))).toEqual([3]);
+      const preserved = [...B.vault.binaries.entries()].find(([path]) =>
+        /conflicted copy/.test(path),
+      );
+      expect(asArray(preserved?.[1])).toEqual([2]);
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+      B.bs.destroy();
+      B.provider.destroy();
+      B.indexDoc.destroy();
+    }
+  });
+
+  it("republishes a local version whose publish never reached the shared index", async () => {
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const older = bytes([4, 4]);
+    const newer = bytes([5, 5, 5]);
+    const olderHash = await sha256Hex(older);
+    const newerHash = await sha256Hex(newer);
+    vault.binaries.set("lost.bin", newer);
+    // This device published `newer` over `older`, but the index it published
+    // into was discarded (e.g. an index epoch restart) before that reached
+    // the server, which still maps the path to `older`.
+    const localState = new LocalSyncState(`binary-lost-publish:${freshGuid()}`);
+    await localState.whenSynced;
+    localState.markPublished("lost.bin", "binary", newerHash, olderHash);
+    const indexDoc = new Y.Doc();
+    const binaries = indexDoc.getMap<BinaryMeta>("binaries");
+    binaries.set("lost.bin", { hash: olderHash, size: 2 });
+    const downloads: string[] = [];
+    plugin.auth.getBlob = async (_vault: string, path: string | null) => {
+      downloads.push(String(path));
+      return older;
+    };
+    plugin.auth.blobExists = async () => true;
+    const bs = new BinarySync(
+      plugin as any,
+      { isTextSyncBusy: () => false, recordTrash: () => {} } as any,
+      indexDoc,
+      localState,
+    );
+    try {
+      bs.seedBaseline();
+      await bs.reconcileAll(["lost.bin"]);
+      await waitFor(() => binaries.get("lost.bin")?.hash === newerHash, {
+        label: "republished the lost version",
+      });
+      expect(binaries.get("lost.bin")?.prev).toBe(olderHash);
+      expect(asArray(vault.binaries.get("lost.bin"))).toEqual([5, 5, 5]);
+      expect(downloads).toEqual([]);
+    } finally {
+      bs.destroy();
+      indexDoc.destroy();
+      localState.destroy();
+    }
+  });
+
+  it("does not hold small uploads behind a large one deferred for note sync", async () => {
+    const A = makeDevice("A");
+    try {
+      await synced(A.provider);
+      A.vaultSyncStub.busy = true;
+      const big = new Uint8Array(6 * 1024 * 1024);
+      big[0] = 7;
+      A.vault.binaries.set("big.bin", big.buffer);
+      A.bs.seedBaseline();
+      await A.bs.reconcileAll(["big.bin"]);
+      A.vault.binaries.set("small.png", bytes([1, 2]));
+      A.bs.onLocalChanged("small.png");
+
+      await waitFor(() => A.binaries.has("small.png"), { label: "small upload published" });
+      expect(A.binaries.has("big.bin")).toBe(false);
+    } finally {
+      A.bs.destroy();
+      A.provider.destroy();
+      A.indexDoc.destroy();
+    }
+  });
+
   it("keeps a peer attachment when remote delete races local edits (conflict)", async () => {
     binaryModal.delayMs = 1_000;
     const A = makeDevice("A");

@@ -229,6 +229,10 @@ struct CreateArgs {
 struct ContentArgs {
     path: String,
     content: String,
+    /// Lowercase hex SHA-256 of the note content this replacement is based on.
+    /// When set and the note changed since, the replace is refused as stale.
+    #[serde(default)]
+    expected_content_hash: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1439,6 +1443,7 @@ impl InstaMcp {
                 &args.path,
                 ReplaceNoteBody {
                     content: args.content,
+                    expected_content_hash: args.expected_content_hash,
                 },
             )
             .await,
@@ -1779,6 +1784,7 @@ impl InstaMcp {
                 &c.vault_id,
                 &args.path,
                 &bytes,
+                crate::ydoc::AttachmentPrecondition::None,
             )
             .await,
         )

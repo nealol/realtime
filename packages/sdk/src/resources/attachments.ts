@@ -4,6 +4,7 @@ import type {
   AttachmentSummary,
   CreateUploadLinkResponse,
   DeleteBlobResult,
+  UploadAttachmentOptions,
   UploadAttachmentResponse,
 } from "../types";
 import { NotFoundError } from "../errors";
@@ -39,10 +40,22 @@ export class AttachmentsResource {
     }
   }
 
-  async upload(path: string, bytes: Uint8Array | ArrayBuffer): Promise<UploadAttachmentResponse> {
+  /**
+   * Upload `bytes` to `path`. Pass `ifMatch` (the hash you last saw there) or
+   * `ifNoneMatch: "*"` to have the server refuse, instead of overwrite, an
+   * attachment someone else changed or created meanwhile.
+   */
+  async upload(
+    path: string,
+    bytes: Uint8Array | ArrayBuffer,
+    options: UploadAttachmentOptions = {},
+  ): Promise<UploadAttachmentResponse> {
+    const headers: Record<string, string> = { "Content-Type": "application/octet-stream" };
+    if (options.ifMatch) headers["If-Match"] = `"${options.ifMatch}"`;
+    if (options.ifNoneMatch) headers["If-None-Match"] = options.ifNoneMatch;
     const res = await this.http.raw("PUT", this.attachment(path), {
       body: bytes instanceof Uint8Array ? new Uint8Array(bytes) : bytes,
-      headers: { "Content-Type": "application/octet-stream" },
+      headers,
     });
     return (await res.json()) as UploadAttachmentResponse;
   }

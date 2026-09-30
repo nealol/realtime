@@ -711,7 +711,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 
   /** Sets this client's cursor identity on a single document's awareness. */
   applyAwarenessTo(doc: SyncedDoc): void {
-    doc.awareness.setLocalStateField("user", {
+    doc.setPresenceUser({
       name: this.settings.clientName,
       color: this.settings.clientColor,
       colorLight: this.settings.clientColorLight,

@@ -6,6 +6,7 @@ import type {
   CanvasEdgeBody,
   CanvasOperationBatch,
   CanvasNodeBody,
+  ReplaceStructuredOptions,
   StructuredResponse,
   StructuredSummary,
 } from "../types";
@@ -35,8 +36,16 @@ export class CanvasesResource {
     return this.http.request("GET", this.canvas(path));
   }
 
-  replace(path: string, value: unknown): Promise<StructuredResponse> {
-    return this.http.request("PUT", this.canvas(path), { body: { path, value } });
+  /** Replace the whole file; `ifMatch` (a read's `valueHash`) refuses a stale write. */
+  replace(
+    path: string,
+    value: unknown,
+    options: ReplaceStructuredOptions = {},
+  ): Promise<StructuredResponse> {
+    return this.http.request("PUT", this.canvas(path), {
+      body: { path, value },
+      ...(options.ifMatch ? { headers: { "If-Match": `"${options.ifMatch}"` } } : {}),
+    });
   }
 
   async delete(path: string): Promise<void> {
@@ -178,8 +187,16 @@ export class BasesResource {
     return this.http.request("GET", this.base(path));
   }
 
-  replace(path: string, value: unknown): Promise<StructuredResponse> {
-    return this.http.request("PUT", this.base(path), { body: { path, value } });
+  /** Replace the whole file; `ifMatch` (a read's `valueHash`) refuses a stale write. */
+  replace(
+    path: string,
+    value: unknown,
+    options: ReplaceStructuredOptions = {},
+  ): Promise<StructuredResponse> {
+    return this.http.request("PUT", this.base(path), {
+      body: { path, value },
+      ...(options.ifMatch ? { headers: { "If-Match": `"${options.ifMatch}"` } } : {}),
+    });
   }
 
   async delete(path: string): Promise<void> {

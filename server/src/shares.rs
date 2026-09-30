@@ -601,6 +601,102 @@ fn resolve_wikilink_target<'a>(
     })
 }
 
+/// True when `requested` is an embed/image target of `note_content`.
+fn note_references_attachment(note_content: &str, note_path: &str, requested: &str) -> bool {
+    let requested = requested.trim().trim_matches('/');
+    if requested.is_empty() {
+        return false;
+    }
+    let note_dir = note_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    for target in extract_attachment_targets(note_content) {
+        if attachment_target_matches(&target, requested, note_dir) {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_attachment_targets(content: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            if i + 2 < bytes.len() && bytes[i + 2] == b'[' {
+                if let Some(end) = content[i + 3..].find("]]") {
+                    let inner = content[i + 3..i + 3 + end].trim();
+                    let target = inner.split('|').next().unwrap_or(inner).trim();
+                    if !target.is_empty() {
+                        targets.push(target.to_string());
+                    }
+                    i += 3 + end + 2;
+                    continue;
+                }
+            } else if let Some(close) = content[i + 2..].find("](") {
+                let after = i + 2 + close + 2;
+                if let Some(end) = content[after..].find(')') {
+                    let target = content[after..after + end].trim();
+                    if !target.is_empty() {
+                        targets.push(target.to_string());
+                    }
+                    i = after + end + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    targets
+}
+
+fn attachment_target_matches(target: &str, requested: &str, note_dir: &str) -> bool {
+    let Some(requested) = normalize_attachment_path("", requested) else {
+        return false;
+    };
+    let Some(vault_target) = normalize_attachment_path("", target) else {
+        return false;
+    };
+    if vault_target.eq_ignore_ascii_case(&requested) {
+        return true;
+    }
+    let target_base = vault_target.rsplit('/').next().unwrap_or(&vault_target);
+    let requested_base = requested.rsplit('/').next().unwrap_or(&requested);
+    if target_base.eq_ignore_ascii_case(requested_base) && !vault_target.contains('/') {
+        return true;
+    }
+    if let Some(relative) = normalize_attachment_path(note_dir, target) {
+        if relative.eq_ignore_ascii_case(&requested) {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalize_attachment_path(base_dir: &str, path: &str) -> Option<String> {
+    let path = path.trim().split(['?', '#']).next().unwrap_or("");
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .ok()?;
+    let mut segments: Vec<&str> = if decoded.starts_with('/') {
+        Vec::new()
+    } else {
+        base_dir
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect()
+    };
+    for segment in decoded.split(['/', '\\']) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop();
+            }
+            segment => segments.push(segment),
+        }
+    }
+    (!segments.is_empty()).then(|| segments.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -728,100 +824,4 @@ mod tests {
             "Notes/images/chart one.png"
         ));
     }
-}
-
-/// True when `requested` is an embed/image target of `note_content`.
-fn note_references_attachment(note_content: &str, note_path: &str, requested: &str) -> bool {
-    let requested = requested.trim().trim_matches('/');
-    if requested.is_empty() {
-        return false;
-    }
-    let note_dir = note_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-    for target in extract_attachment_targets(note_content) {
-        if attachment_target_matches(&target, requested, note_dir) {
-            return true;
-        }
-    }
-    false
-}
-
-fn extract_attachment_targets(content: &str) -> Vec<String> {
-    let mut targets = Vec::new();
-    let bytes = content.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'!' && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            if i + 2 < bytes.len() && bytes[i + 2] == b'[' {
-                if let Some(end) = content[i + 3..].find("]]") {
-                    let inner = content[i + 3..i + 3 + end].trim();
-                    let target = inner.split('|').next().unwrap_or(inner).trim();
-                    if !target.is_empty() {
-                        targets.push(target.to_string());
-                    }
-                    i += 3 + end + 2;
-                    continue;
-                }
-            } else if let Some(close) = content[i + 2..].find("](") {
-                let after = i + 2 + close + 2;
-                if let Some(end) = content[after..].find(')') {
-                    let target = content[after..after + end].trim();
-                    if !target.is_empty() {
-                        targets.push(target.to_string());
-                    }
-                    i = after + end + 1;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    targets
-}
-
-fn attachment_target_matches(target: &str, requested: &str, note_dir: &str) -> bool {
-    let Some(requested) = normalize_attachment_path("", requested) else {
-        return false;
-    };
-    let Some(vault_target) = normalize_attachment_path("", target) else {
-        return false;
-    };
-    if vault_target.eq_ignore_ascii_case(&requested) {
-        return true;
-    }
-    let target_base = vault_target.rsplit('/').next().unwrap_or(&vault_target);
-    let requested_base = requested.rsplit('/').next().unwrap_or(&requested);
-    if target_base.eq_ignore_ascii_case(requested_base) && !vault_target.contains('/') {
-        return true;
-    }
-    if let Some(relative) = normalize_attachment_path(note_dir, target) {
-        if relative.eq_ignore_ascii_case(&requested) {
-            return true;
-        }
-    }
-    false
-}
-
-fn normalize_attachment_path(base_dir: &str, path: &str) -> Option<String> {
-    let path = path.trim().split(['?', '#']).next().unwrap_or("");
-    let decoded = percent_encoding::percent_decode_str(path)
-        .decode_utf8()
-        .ok()?;
-    let mut segments: Vec<&str> = if decoded.starts_with('/') {
-        Vec::new()
-    } else {
-        base_dir
-            .split('/')
-            .filter(|segment| !segment.is_empty())
-            .collect()
-    };
-    for segment in decoded.split(['/', '\\']) {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                segments.pop();
-            }
-            segment => segments.push(segment),
-        }
-    }
-    (!segments.is_empty()).then(|| segments.join("/"))
 }

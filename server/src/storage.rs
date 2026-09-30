@@ -16,15 +16,22 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::crdt::Level;
 use crate::error::{AppError, AppResult};
-use crate::routes::{require_admin, require_member};
+use crate::routes::{authorize_uniform_vault, require_admin, require_member};
 use crate::session::AuthUser;
 use crate::state::AppState;
 use crate::ydoc;
+
+/// Orphaned blobs newer than this are kept. A client uploads a blob before it
+/// publishes the index entry that references it, and a re-upload of existing
+/// content only refreshes the file's mtime, so a young "orphan" is usually a
+/// publish still in flight.
+const BLOB_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -42,6 +49,10 @@ pub struct StorageUsage {
 pub struct GcBlobsBody {
     /// Only delete orphaned blobs at least this large (bytes). Defaults to 0.
     pub min_bytes: Option<u64>,
+    /// Only delete orphaned blobs written at least this long ago (seconds).
+    /// Defaults to an hour, so uploads whose index entry is still on its way
+    /// are not reclaimed.
+    pub min_age_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -140,6 +151,42 @@ pub async fn get_storage(
     }))
 }
 
+/// Blob hashes still referenced by `trash` entries (recoverable deletions),
+/// keyed by entry id.
+async fn trashed_blob_hashes(state: &AppState, vault_id: &str) -> AppResult<Vec<(String, String)>> {
+    use yrs::{Any, Map, Out, ReadTxn, Transact};
+    state
+        .documents
+        .read_with(vault_id, |doc| {
+            let txn = doc.transact();
+            let Some(trash) = txn.get_map("trash") else {
+                return Vec::new();
+            };
+            trash
+                .iter(&txn)
+                .filter_map(|(id, value)| {
+                    let Out::Any(Any::Map(entry)) = value else {
+                        return None;
+                    };
+                    match entry.get("hash") {
+                        Some(Any::String(hash)) => Some((id.to_string(), hash.to_string())),
+                        _ => None,
+                    }
+                })
+                .collect()
+        })
+        .await
+        .map_err(AppError::from)
+}
+
+/// True when a blob file was written (or re-uploaded) within `grace`.
+fn written_within(meta: &std::fs::Metadata, grace: std::time::Duration) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < grace)
+}
+
 /// `POST /api/vaults/{id}/storage/gc-blobs` — delete orphaned ("previous") blobs.
 pub async fn gc_blobs(
     State(state): State<AppState>,
@@ -151,6 +198,9 @@ pub async fn gc_blobs(
 
     let live = live_blob_hashes(&state, &vault_id).await?;
     let min_bytes = body.min_bytes.unwrap_or(0);
+    let grace = body
+        .min_age_seconds
+        .map_or(BLOB_GC_GRACE, std::time::Duration::from_secs);
 
     let mut removed = 0u64;
     let mut freed_bytes = 0u64;
@@ -166,7 +216,7 @@ pub async fn gc_blobs(
             let Ok(meta) = entry.metadata().await else {
                 continue;
             };
-            if !meta.is_file() || meta.len() < min_bytes {
+            if !meta.is_file() || meta.len() < min_bytes || written_within(&meta, grace) {
                 continue;
             }
             let len = meta.len();
@@ -189,16 +239,29 @@ pub struct DeleteBlobResult {
     pub deleted: bool,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteBlobQuery {
+    /// The trash entry being permanently deleted; its own reference to the
+    /// blob does not keep it alive.
+    pub trash_entry: Option<String>,
+}
+
 /// `DELETE /api/vaults/{id}/blobs/{hash}` — reclaim a single orphaned blob (used
 /// when permanently deleting a trashed attachment). Refuses to delete a blob that
-/// is still referenced by the live `binaries` map, so a shared/in-use blob is
-/// never removed. Idempotent: a missing blob reports `deleted: true`.
+/// is still referenced by the live `binaries` map or by another trash entry, or
+/// that was written recently (an upload whose index entry is still in flight).
+/// Idempotent: a missing blob reports `deleted: true`.
 pub async fn delete_blob(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Path((vault_id, hash)): Path<(String, String)>,
+    Query(query): Query<DeleteBlobQuery>,
 ) -> AppResult<Json<DeleteBlobResult>> {
     require_member(&state, &user.id, &vault_id).await?;
+    if authorize_uniform_vault(&state, &user, &vault_id).await? != Level::Full {
+        return Err(AppError::Forbidden);
+    }
     if !is_blob_name(&hash) {
         return Err(AppError::BadRequest("invalid blob hash".into()));
     }
@@ -206,8 +269,21 @@ pub async fn delete_blob(
     if live.contains(&hash) {
         return Ok(Json(DeleteBlobResult { deleted: false }));
     }
+    let still_trashed = trashed_blob_hashes(&state, &vault_id)
+        .await?
+        .into_iter()
+        .any(|(id, trashed)| trashed == hash && query.trash_entry.as_deref() != Some(id.as_str()));
+    if still_trashed {
+        return Ok(Json(DeleteBlobResult { deleted: false }));
+    }
     let mut path = vault_blob_dir(&state, &vault_id);
     path.push(&hash);
+    if tokio::fs::metadata(&path)
+        .await
+        .is_ok_and(|meta| written_within(&meta, BLOB_GC_GRACE))
+    {
+        return Ok(Json(DeleteBlobResult { deleted: false }));
+    }
     match tokio::fs::remove_file(&path).await {
         Ok(_) => Ok(Json(DeleteBlobResult { deleted: true })),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

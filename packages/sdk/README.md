@@ -28,6 +28,34 @@ await vault.search.search("world");
 await vault.attachments.upload("img/pic.png", bytes);
 ```
 
+## Whole-file replaces
+
+A plain `replace` or attachment `upload` overwrites whatever the server holds,
+including changes made after you read the file. Pass what you read to have the
+server refuse a stale write with `ConflictError` instead:
+
+```ts
+import { noteContentHash } from "@realtime-md/sdk";
+
+const note = await vault.notes.read("Hello.md");
+await vault.notes.replace("Hello.md", rewrite(note.content), {
+  expectedContentHash: await noteContentHash(note.content),
+});
+
+const canvas = await vault.canvases.read("Planning.canvas");
+await vault.canvases.replace("Planning.canvas", edit(canvas.value), {
+  ifMatch: canvas.valueHash,
+});
+
+// Attachments: the hash from `list` (or an earlier upload) you replace…
+await vault.attachments.upload("img/pic.png", bytes, { ifMatch: listed.hash });
+// …or require that nothing is at the path yet.
+await vault.attachments.upload("img/new.png", bytes, { ifNoneMatch: "*" });
+```
+
+`notes.append` does this itself and re-reads when another edit lands first.
+Moves refuse to overwrite an existing target with `ConflictError`.
+
 ## Atomic Canvas edits
 
 `canvases.applyOperations()` sends one field-level batch. Patches name the fields to set and remove, so an unchanged stale field never becomes an edit. Deletes create tombstones; use `node-restore` or `edge-restore` when restoring an ID on purpose.
@@ -81,7 +109,8 @@ optional `caps` map carries named capability versions per surface
 `documentInvalidation`). The
 SDK also mirrors `epoch` on document-token responses. Consumers must create a
 fresh local Y.Doc when that value changes; the SDK does not do this or enforce
-caps itself. Only the Obsidian plugin performs that lifecycle automatically. See
+caps itself. Newer servers also return `expiresAt` (ms since the Unix epoch);
+mint a fresh token instead of reconnecting with one past it. Only the Obsidian plugin performs that lifecycle automatically. See
 **[../../docs/versioning.md](../../docs/versioning.md)** for the cap names,
 bump rules, and gating behavior.
 

@@ -18,6 +18,7 @@ import { CanvasDocument } from "../../src/CanvasDocument";
 import { parseCanvas, reconcileCanvas, serializeCanvas } from "../../src/structured/canvas";
 import { toValue } from "../../src/structured/reconcile";
 import { Peer } from "../support/peer";
+import { BootstrapEventLog } from "../../src/bootstrapEvents";
 
 const bootstrapModal = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -1236,6 +1237,77 @@ describe("VaultSync index", () => {
     }
   });
 
+  it("publishes deletes and renames made before the initial sync instead of undoing them", async () => {
+    const vault = await harness.createVault(aliceToken, "startup-path-changes");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    localVault.files.set("delete.md", "delete me");
+    localVault.files.set("rename.md", "rename me");
+    const peer = makeIndexPeer(plugin, vault.id);
+    let sync: VaultSync | null = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    try {
+      await waitFor(() => peer.files.has("delete.md") && peer.files.has("rename.md"), {
+        timeout: 20_000,
+        label: "initial paths indexed",
+      });
+      await waitFor(
+        () => {
+          const state = (sync as any).localSyncState;
+          return (
+            state.acknowledgedFingerprint("delete.md", peer.files.get("delete.md")) !== null &&
+            state.acknowledgedFingerprint("rename.md", peer.files.get("rename.md")) !== null
+          );
+        },
+        { timeout: 20_000, label: "baselines acknowledged" },
+      );
+      const renamedGuid = peer.files.get("rename.md");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      sync.destroy();
+
+      // Restart while offline: the index stays disconnected until released.
+      let goOnline!: () => void;
+      const online = new Promise<void>((resolve) => {
+        goOnline = resolve;
+      });
+      const serverInfoChecked = plugin.auth.serverInfoChecked.bind(plugin.auth);
+      plugin.auth.serverInfoChecked = async (...args: Parameters<typeof serverInfoChecked>) => {
+        await online;
+        return serverInfoChecked(...args);
+      };
+      sync = new VaultSync(plugin as any);
+      (plugin as any).vaultSync = sync;
+      await waitFor(() => (sync as any).binaryBaselineSeeded, { label: "local state loaded" });
+
+      await localVault.delete(localVault.getAbstractFileByPath("delete.md")!);
+      await localVault.rename("rename.md", "renamed.md");
+      await localVault.modify(
+        localVault.getAbstractFileByPath("renamed.md") as TFile,
+        "rename me, then edit",
+      );
+      expect((sync as any).initialSynced).toBe(false);
+      goOnline();
+
+      await waitFor(
+        () =>
+          !peer.files.has("delete.md") &&
+          !peer.files.has("rename.md") &&
+          peer.files.get("renamed.md") === renamedGuid,
+        { timeout: 20_000, label: "startup changes published" },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(localVault.files.has("delete.md")).toBe(false);
+      expect(localVault.files.has("rename.md")).toBe(false);
+      expect(localVault.files.get("renamed.md")).toBe("rename me, then edit");
+    } finally {
+      sync?.destroy();
+      peer.provider.destroy();
+      peer.doc.destroy();
+    }
+  });
+
   it("cleans up old cross-type index entries when a pending rename aborts", async () => {
     const vault = await harness.createVault(aliceToken, "cross-type-rename-abort");
     const vaultId = vault.id;
@@ -1337,26 +1409,28 @@ describe("VaultSync index", () => {
 
   it("preserves a bootstrap create when a newer modify exists for the same file", async () => {
     const sync = Object.create(VaultSync.prototype) as any;
-    const file = { path: "created-and-modified.md" };
+    const file = new TFile("created-and-modified.md");
     const order: string[] = [];
+    const log = new BootstrapEventLog();
+    log.create(file.path, file);
+    log.modify(file.path, file);
     Object.assign(sync, {
       destroyed: false,
       initialSynced: false,
-      bootstrapVaultEvents: [
-        { type: "create", file, version: 1 },
-        { type: "modify", file, version: 2 },
-      ],
-      pathVersions: new Map([["created-and-modified.md", 2]]),
+      bootstrapLog: log,
+      files: new Y.Doc().getMap("files"),
+      structured: new Y.Doc().getMap("structured"),
       handleLocalCreate: vi.fn(async () => order.push("create")),
       onLocalModify: vi.fn(() => order.push("modify")),
       handleLocalRename: vi.fn(),
-      onLocalDelete: vi.fn(),
+      applyLocalDeletion: vi.fn(),
     });
 
     await sync.replayBootstrapVaultEvents();
 
-    expect(order).toEqual(["create", "modify"]);
-    expect(sync.bootstrapVaultEvents).toHaveLength(0);
+    // The new file is published from its current content; the edit is part of it.
+    expect(order).toEqual(["create"]);
+    expect(sync.bootstrapLog.isEmpty).toBe(true);
   });
 
   it("retries when the final bootstrap rescan fails", async () => {
@@ -1657,6 +1731,42 @@ describe("VaultSync index", () => {
       expect(sync.getDocumentForPath("steady.md")).toBe(steadyBefore);
       expect(steadyBefore.isDestroyed()).toBe(false);
       expect(steadyBefore.provider.status).toBe("connected");
+      // The retired epoch's local store is deleted, not left behind.
+      await waitFor(
+        async () => !(await indexedDB.databases()).some((db) => db.name === documentId),
+        { label: "retired store deleted" },
+      );
+      expect((await indexedDB.databases()).some((db) => db.name === `${documentId}:epoch:1`)).toBe(
+        true,
+      );
+    } finally {
+      sync.destroy();
+    }
+  });
+
+  it("deletes the local store of a note deleted after its changes were acknowledged", async () => {
+    const vault = await harness.createVault(aliceToken, "deleted-store");
+    const note = await createNote(vault.id, "gone.md", "short-lived");
+    const { plugin, vault: localVault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    const sync = new VaultSync(plugin as any);
+    (plugin as any).vaultSync = sync;
+    const storeName = `${vault.id}__${note.guid}`;
+    try {
+      await waitFor(() => localVault.files.get("gone.md") === "short-lived", {
+        label: "note synced",
+      });
+      await waitFor(() => (sync as any).initialSynced, { label: "initial sync done" });
+      await waitFor(async () => (await indexedDB.databases()).some((db) => db.name === storeName), {
+        label: "store exists",
+      });
+      await localVault.delete(localVault.getAbstractFileByPath("gone.md")!);
+      await waitFor(
+        async () => !(await indexedDB.databases()).some((db) => db.name === storeName),
+        { label: "store deleted" },
+      );
     } finally {
       sync.destroy();
     }
@@ -2165,29 +2275,41 @@ describe("VaultSync index", () => {
     });
   });
 
-  it("replays the latest vault event captured during both bootstrap passes", async () => {
+  it("replays startup deletes and a rename followed by an edit", async () => {
     const sync = Object.create(VaultSync.prototype) as any;
-    const created = { path: "created.md" };
-    const renamed = { path: "renamed.md" };
-    const order: string[] = [];
+    const index = new Y.Doc();
+    const files = index.getMap<string>("files");
+    files.set("gone.md", "guid-gone");
+    files.set("old.md", "guid-old");
+    const renamed = new TFile("new.md");
+    const log = new BootstrapEventLog();
+    log.delete("gone.md");
+    log.rename("old.md", "new.md", renamed);
+    log.modify("new.md", renamed);
+    const calls: string[] = [];
     Object.assign(sync, {
       destroyed: false,
       initialSynced: false,
-      bootstrapVaultEvents: [{ type: "delete", file: renamed, version: 1 }],
-      pathVersions: new Map([
-        ["created.md", 1],
-        ["renamed.md", 1],
-      ]),
-      handleLocalCreate: vi.fn(async () => order.push("create")),
-      onLocalModify: vi.fn(() => order.push("modify")),
-      handleLocalRename: vi.fn(async () => order.push("rename")),
-      onLocalDelete: vi.fn(() => order.push("delete")),
+      bootstrapLog: log,
+      files,
+      structured: index.getMap("structured"),
+      handleLocalCreate: vi.fn(async () => calls.push("create")),
+      onLocalModify: vi.fn(() => calls.push("modify")),
+      handleLocalRename: vi.fn(async (file: TFile, from: string) =>
+        calls.push(`rename ${from} -> ${file.path}`),
+      ),
+      applyLocalDeletion: vi.fn((path: string) => calls.push(`delete ${path}`)),
     });
+
+    // The pass must not restore either removed path meanwhile.
+    expect(sync.isPendingLocalRemoval("gone.md")).toBe(true);
+    expect(sync.isPendingLocalRemoval("old.md")).toBe(true);
+    expect(sync.isPendingLocalRemoval("new.md")).toBe(false);
 
     await sync.replayBootstrapVaultEvents();
 
-    expect(order).toEqual(["delete"]);
-    expect(sync.bootstrapVaultEvents).toHaveLength(0);
+    expect(calls).toEqual(["delete gone.md", "rename old.md -> new.md"]);
+    expect(sync.isPendingLocalRemoval("gone.md")).toBe(false);
   });
 
   it("reruns a coalesced remote delete after the active reconciliation", async () => {
@@ -2231,7 +2353,9 @@ describe("VaultSync index", () => {
       plugin: local.plugin,
       files: index.getMap("files"),
       structured: index.getMap("structured"),
-      documents: new Map([[path, { content: "unsaved resident edit" }]]),
+      documents: new Map([
+        [path, { content: "unsaved resident edit", provider: { hasLocalChanges: true } }],
+      ]),
       structuredDocuments: new Map(),
       remoteDeletePreserved: new Set(),
       remoteDeletesApplying: new Set(),
@@ -2247,6 +2371,8 @@ describe("VaultSync index", () => {
 
     expect([...local.vault.files.values()]).toContain("unsaved resident edit");
     expect(local.vault.files.has(path)).toBe(false);
+    // Unsent local changes keep the document's local store.
+    expect(sync.removeDocument).toHaveBeenCalledWith(path, { clearLocalStore: false });
     index.destroy();
   });
 
@@ -2266,7 +2392,9 @@ describe("VaultSync index", () => {
       files: index.getMap("files"),
       structured: index.getMap("structured"),
       documents: new Map(),
-      structuredDocuments: new Map([[path, { canvasText: () => residentCanvas }]]),
+      structuredDocuments: new Map([
+        [path, { canvasText: () => residentCanvas, provider: { hasLocalChanges: true } }],
+      ]),
       remoteDeletePreserved: new Set(),
       remoteDeletesApplying: new Set(),
       localSyncState: {

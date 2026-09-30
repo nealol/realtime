@@ -1,7 +1,7 @@
 {
   "id": "realtime",
   "name": "Realtime",
-  "version": "0.4.4-alpha.3",
+  "version": "0.4.4-alpha.4",
   "minAppVersion": "1.11.4",
   "description": "Google-docs-like collaborative editing. Sync your whole vault in real time with live cursors via a native Realtime server.",
   "author": "Realtime",

@@ -1447,7 +1447,11 @@ pub async fn doc_token(
     state
         .ensure_vault_document(&body.vault_id, &body.doc_id)
         .await?;
-    let token = mint_client_token(&state, &body.doc_id, level).await?;
+    let mut token = mint_client_token(&state, &body.doc_id, level).await?;
+    let expires_at_ms = now_millis() + SYNC_GRANT_TTL_MS;
+    // Clients refresh before this instead of discovering an expired token
+    // through failed channel opens after a reconnect.
+    token["expiresAt"] = Value::from(expires_at_ms);
 
     // Bind this opaque token to exactly one document, authorization level, and
     // principal before returning it to the client.
@@ -1468,7 +1472,7 @@ pub async fn doc_token(
                     email: user.email.clone(),
                     git_email: user.git_email.clone(),
                     actor: PrincipalActor::User,
-                    expires_at_ms: now_millis() + SYNC_GRANT_TTL_MS,
+                    expires_at_ms,
                 },
             )
             .await;

@@ -124,6 +124,34 @@ describe("ConfigSync reconcile decisions", () => {
     indexDoc.destroy();
   });
 
+  it("re-reads a config file only when its size or mtime changes", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const indexDoc = new Y.Doc();
+    let stat = { mtime: 1, ctime: 1, size: 1, type: "file" };
+    const readBinary = vi.fn(async () => new Uint8Array([1]).buffer);
+    (plugin.app.vault as any).adapter = {
+      readBinary,
+      exists: vi.fn(async () => true),
+      stat: vi.fn(async () => stat),
+    };
+    const sync = new ConfigSync(plugin as any, indexDoc);
+    const info = (path: string) => (sync as any).localInfo(path);
+    try {
+      const first = await info(".obsidian/app.json");
+      expect(await info(".obsidian/app.json")).toEqual(first);
+      expect(readBinary).toHaveBeenCalledTimes(1);
+      stat = { ...stat, mtime: 2 };
+      await info(".obsidian/app.json");
+      expect(readBinary).toHaveBeenCalledTimes(2);
+    } finally {
+      sync.destroy();
+      indexDoc.destroy();
+    }
+  });
+
   it("does not publish an upload that was paused in flight", async () => {
     const { plugin } = makeFakePlugin("https://sync.example.com", {
       sessionToken: "token",
@@ -259,6 +287,25 @@ describe("ConfigSync reconcile decisions", () => {
 
   it("merges true conflicts on JSON settings files", () => {
     expect(decideConfigReconcile(local, remote, "older", { canMerge: true })).toBe("merge");
+  });
+
+  it("tells a remote built on our publish from one last-writer-wins kept over it", () => {
+    // Built on the version this device published: a clean update.
+    expect(decideConfigReconcile(local, { ...remote, prev: local.hash }, local.hash)).toBe(
+      "download",
+    );
+    // Published concurrently from an older version: both sides changed.
+    expect(
+      decideConfigReconcile(local, { ...remote, prev: "older" }, local.hash, { canMerge: true }),
+    ).toBe("merge");
+    // Still exactly the version our publish replaced: that publish was lost.
+    expect(
+      decideConfigReconcile(local, { ...remote, prev: "oldest" }, local.hash, {
+        replacedHash: remote.hash,
+      }),
+    ).toBe("upload");
+    // Older publishers record no parent: keep the previous behavior.
+    expect(decideConfigReconcile(local, remote, local.hash)).toBe("download");
   });
 
   it("falls back to newest-wins on non-mergeable conflicts", () => {

@@ -212,7 +212,10 @@ pub async fn undo(
                 undoer,
                 vault_id,
                 &entry.path,
-                notes::ReplaceNoteBody { content: before },
+                notes::ReplaceNoteBody {
+                    content: before,
+                    expected_content_hash: None,
+                },
             )
             .await?;
         }
@@ -258,8 +261,18 @@ pub async fn undo(
             if current.value != after && !force {
                 return Err(AppError::Conflict("changed_since".into()));
             }
-            structured::write_structured_json(state, undoer, vault_id, &entry.path, &kind, before)
-                .await?;
+            // Refuse the undo if the file changes between that check and the write.
+            let expected = if force { None } else { current.value_hash };
+            structured::write_structured_json(
+                state,
+                undoer,
+                vault_id,
+                &entry.path,
+                &kind,
+                before,
+                expected.as_deref(),
+            )
+            .await?;
         }
         "structured_create" => {
             let kind = structured_kind(&entry)?;

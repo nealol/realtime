@@ -56,6 +56,29 @@ pub struct SyncGrant {
     pub principal: Principal,
 }
 
+/// How often expired sync grants are swept. Lookups check expiry themselves,
+/// so a sweep only bounds memory; doing it on every call made each token mint
+/// and channel open O(live grants) under one lock.
+const GRANT_PRUNE_INTERVAL_MS: i64 = 60_000;
+
+/// Opaque, document-scoped sync tokens cached by this process.
+#[derive(Default)]
+pub struct SyncGrants {
+    grants: HashMap<String, SyncGrant>,
+    next_prune_at_ms: i64,
+}
+
+impl SyncGrants {
+    fn prune_if_due(&mut self, now: i64) {
+        if now < self.next_prune_at_ms {
+            return;
+        }
+        self.grants
+            .retain(|_, grant| grant.principal.expires_at_ms > now);
+        self.next_prune_at_ms = now + GRANT_PRUNE_INTERVAL_MS;
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PendingDocumentCreation {
     pub user_id: String,
@@ -126,7 +149,7 @@ pub struct AppState {
     /// Persistent search reconciliation scheduler.
     pub search: SearchService,
     /// Opaque, document-scoped sync tokens cached by this process.
-    pub sync_grants: Arc<Mutex<HashMap<String, SyncGrant>>>,
+    pub sync_grants: Arc<Mutex<SyncGrants>>,
     /// Short-lived creation reservations for client-created file documents.
     /// A reservation is keyed by document id and bound to its creator/path.
     pub pending_document_creations: Arc<Mutex<HashMap<String, PendingDocumentCreation>>>,
@@ -167,7 +190,7 @@ impl AppState {
     }
 
     /// Remember the document, access level, and principal for a freshly minted
-    /// connection token. Lazily evicts expired entries.
+    /// connection token. Expired entries are swept periodically.
     pub async fn record_sync_grant(
         &self,
         token: String,
@@ -176,10 +199,9 @@ impl AppState {
         epoch: u64,
         principal: Principal,
     ) {
-        let mut map = self.sync_grants.lock().await;
-        let now = now_millis();
-        map.retain(|_, grant| grant.principal.expires_at_ms > now);
-        map.insert(
+        let mut grants = self.sync_grants.lock().await;
+        grants.prune_if_due(now_millis());
+        grants.grants.insert(
             token,
             SyncGrant {
                 document_id,
@@ -192,11 +214,13 @@ impl AppState {
 
     /// Resolve an unexpired token only for the document it was minted for.
     pub async fn sync_grant(&self, token: &str, document_id: &str) -> Option<SyncGrant> {
-        let mut map = self.sync_grants.lock().await;
+        let mut grants = self.sync_grants.lock().await;
         let now = now_millis();
-        map.retain(|_, grant| grant.principal.expires_at_ms > now);
-        map.get(token)
-            .filter(|grant| grant.document_id == document_id)
+        grants.prune_if_due(now);
+        grants
+            .grants
+            .get(token)
+            .filter(|grant| grant.document_id == document_id && grant.principal.expires_at_ms > now)
             .cloned()
     }
 

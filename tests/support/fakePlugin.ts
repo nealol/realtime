@@ -34,9 +34,24 @@ export class FakeVault {
   }
 
   getAbstractFileByPath(path: string): TAbstractFile | null {
-    if (this.files.has(path) || this.binaries.has(path)) return new TFile(path);
+    if (this.files.has(path) || this.binaries.has(path)) return this.fileAt(path);
     if (this.folders.has(path)) return new TAbstractFile(path);
     return null;
+  }
+  /** A TFile carrying `stat` like Obsidian's, sized from the stored content. */
+  private fileAt(path: string): TFile {
+    const file = new TFile(path);
+    const text = this.files.get(path);
+    const size =
+      text !== undefined
+        ? new TextEncoder().encode(text).byteLength
+        : (this.binaries.get(path)?.byteLength ?? 0);
+    (file as TFile & { stat: { size: number; mtime: number; ctime: number } }).stat = {
+      size,
+      mtime: Date.now(),
+      ctime: Date.now(),
+    };
+    return file;
   }
   async read(file: TFile): Promise<string> {
     const text = this.files.get(file.path);

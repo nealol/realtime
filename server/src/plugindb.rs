@@ -16,7 +16,7 @@
 //! (`config.crsqlite_ext_path`). When it is unset or missing, those degrade
 //! gracefully — client-to-client sync over the Y log is unaffected.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,7 +70,6 @@ pub struct ChangeRow {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Batch {
-    #[allow(dead_code)]
     pub id: String,
     #[serde(rename = "siteId")]
     pub site_id: String,
@@ -601,13 +600,16 @@ impl PluginDbService {
             }
         }
 
-        // Determine which batches are fully covered and can be dropped.
-        let drop_count = view
+        // Determine which batches are fully covered and can be dropped. They
+        // are trimmed by id below: the log may have changed since `view` was
+        // read, and anything not verified here must survive the trim.
+        let drop_ids: HashSet<String> = view
             .batches
             .iter()
             .take_while(|b| safe.get(&b.site_id).copied().unwrap_or(0) >= b.to_db_version)
-            .count();
-        if drop_count == 0 {
+            .map(|b| b.id.clone())
+            .collect();
+        if drop_ids.is_empty() {
             return Ok(());
         }
 
@@ -618,7 +620,7 @@ impl PluginDbService {
             .read_update_with_epoch(&doc_id)
             .await
             .map_err(|e| anyhow!(e.to_string()))?;
-        if let Ok(trim) = build_compaction_update(&update, drop_count) {
+        if let Ok(trim) = build_compaction_update(&update, &drop_ids) {
             if !trim.is_empty() {
                 let _ = self
                     .0
@@ -1277,18 +1279,30 @@ fn build_purge_update(current: &[u8]) -> Result<Vec<u8>> {
     Ok(update)
 }
 
-/// Build an update that drops the first `drop_count` batches and records the
-/// new `compactedThrough` high-water marks. Marks are computed from the
-/// batches actually dropped and max-merged into any existing marks, so a site
-/// whose batches have all been trimmed keeps its record — clients rely on the
-/// mark to detect that a range they still need can no longer arrive via the
-/// log and must be rebuilt from the server.
-fn build_compaction_update(current: &[u8], drop_count: usize) -> Result<Vec<u8>> {
+/// Build an update that drops the batches in `drop_ids` and records the new
+/// `compactedThrough` high-water marks. Batches are matched by id, never by
+/// position: Yjs orders concurrent appends by client id, so a batch another
+/// device appended concurrently (or while offline) can be integrated in front
+/// of batches that were verified as applied, and a positional trim would drop
+/// it before anyone applied it. Marks are computed from the batches actually
+/// dropped and max-merged into any existing marks, so a site whose batches
+/// have all been trimmed keeps its record — clients rely on the mark to detect
+/// that a range they still need can no longer arrive via the log and must be
+/// rebuilt from the server. Returns an empty update when nothing matches.
+fn build_compaction_update(current: &[u8], drop_ids: &HashSet<String>) -> Result<Vec<u8>> {
     let view = decode_doc(current)?;
     let mut marks = view.compacted_through.clone();
-    for b in view.batches.iter().take(drop_count) {
+    let mut drop_indices = Vec::new();
+    for (index, b) in view.batches.iter().enumerate() {
+        if !drop_ids.contains(&b.id) {
+            continue;
+        }
+        drop_indices.push(index as u32);
         let entry = marks.entry(b.site_id.clone()).or_insert(0);
         *entry = (*entry).max(b.to_db_version);
+    }
+    if drop_indices.is_empty() {
+        return Ok(Vec::new());
     }
     let doc = doc_from_update(current)?;
     let before = doc.transact().state_vector();
@@ -1296,10 +1310,10 @@ fn build_compaction_update(current: &[u8], drop_count: usize) -> Result<Vec<u8>>
     let meta = doc.get_or_insert_map("meta");
     {
         let mut txn = doc.transact_mut();
-        let len = batches.len(&txn) as usize;
-        let n = drop_count.min(len) as u32;
-        if n > 0 {
-            batches.remove_range(&mut txn, 0, n);
+        // `view` decoded the same bytes, so its indices address this array.
+        // Remove from the back so earlier indices stay valid.
+        for index in drop_indices.into_iter().rev() {
+            batches.remove(&mut txn, index);
         }
         let map: HashMap<String, Any> = marks
             .iter()
@@ -2865,7 +2879,10 @@ mod tests {
         );
         // Drop the first two batches: marks are recorded for the dropped
         // sites, and siteC's mark survives even though siteC has no batches.
-        let trimmed = apply_delta(&update, &build_compaction_update(&update, 2).unwrap());
+        let trimmed = apply_delta(
+            &update,
+            &build_compaction_update(&update, &ids(&["b1", "b2"])).unwrap(),
+        );
         let view = decode_doc(&trimmed).unwrap();
         assert_eq!(view.batches.len(), 1);
         assert_eq!(view.compacted_through.get("siteA"), Some(&5));
@@ -2873,12 +2890,93 @@ mod tests {
         assert_eq!(view.compacted_through.get("siteC"), Some(&9));
 
         // Drop the rest: siteA's mark advances; untouched sites keep theirs.
-        let trimmed = apply_delta(&trimmed, &build_compaction_update(&trimmed, 1).unwrap());
+        let trimmed = apply_delta(
+            &trimmed,
+            &build_compaction_update(&trimmed, &ids(&["b3"])).unwrap(),
+        );
         let view = decode_doc(&trimmed).unwrap();
         assert!(view.batches.is_empty());
         assert_eq!(view.compacted_through.get("siteA"), Some(&8));
         assert_eq!(view.compacted_through.get("siteB"), Some(&3));
         assert_eq!(view.compacted_through.get("siteC"), Some(&9));
+    }
+
+    fn ids(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn compaction_keeps_a_concurrent_batch_integrated_inside_the_verified_prefix() {
+        // The server log as compaction reads it: two batches from siteA.
+        let server = Doc::with_client_id(100);
+        let log = server.get_or_insert_array("batches");
+        log.push_back(
+            &mut server.transact_mut(),
+            crate::ydoc::json_to_any(&sample_batch("a1", "siteA", 1)),
+        );
+        // A device with a lower client id synced here, then appended offline.
+        let device = Doc::with_client_id(5);
+        let synced = server
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        device
+            .transact_mut()
+            .apply_update(crate::safe_yrs::decode_v1::<Update>(&synced).unwrap());
+        device.get_or_insert_array("batches").push_back(
+            &mut device.transact_mut(),
+            crate::ydoc::json_to_any(&sample_batch("d1", "siteD", 1)),
+        );
+        log.push_back(
+            &mut server.transact_mut(),
+            crate::ydoc::json_to_any(&sample_batch("a2", "siteA", 2)),
+        );
+        let verified = server
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let verified_ids: HashSet<String> = decode_doc(&verified)
+            .unwrap()
+            .batches
+            .into_iter()
+            .map(|batch| batch.id)
+            .collect();
+        assert_eq!(verified_ids, ids(&["a1", "a2"]));
+
+        // The offline batch lands before the trim is built from a fresh read,
+        // and Yjs places it between the verified batches.
+        let offline = device
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        server
+            .transact_mut()
+            .apply_update(crate::safe_yrs::decode_v1::<Update>(&offline).unwrap());
+        let fresh = server
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        let order: Vec<String> = decode_doc(&fresh)
+            .unwrap()
+            .batches
+            .into_iter()
+            .map(|batch| batch.id)
+            .collect();
+        assert_eq!(order, ["a1", "d1", "a2"]);
+
+        let trimmed = apply_delta(
+            &fresh,
+            &build_compaction_update(&fresh, &verified_ids).unwrap(),
+        );
+        let view = decode_doc(&trimmed).unwrap();
+        let remaining: Vec<&str> = view.batches.iter().map(|batch| batch.id.as_str()).collect();
+        assert_eq!(remaining, ["d1"]);
+        assert_eq!(view.compacted_through.get("siteA"), Some(&2));
+        assert_eq!(view.compacted_through.get("siteD"), None);
+    }
+
+    #[test]
+    fn compaction_without_matching_batches_is_empty() {
+        let update = doc_update_with(&[sample_batch("b1", "siteA", 5)], &[]);
+        assert!(build_compaction_update(&update, &ids(&["gone"]))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

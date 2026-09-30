@@ -12,7 +12,7 @@ import {
   SYNC_STATUS_CONNECTED,
   type SyncStatus,
 } from "../sync/RealtimeProvider";
-import { IndexeddbPersistence } from "y-indexeddb";
+import { IndexeddbPersistence, clearDocument } from "y-indexeddb";
 import type RealtimePlugin from "../main";
 import { getClientToken } from "../sync/clientToken";
 import { createMuxSocket } from "../sync/mux";
@@ -119,11 +119,18 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
     () => getClientToken(plugin, docId, undefined, epoch),
     { connect: false, socketFactory: createMuxSocket },
   );
+  // A database has no viewers to show presence to.
+  provider.awareness.setLocalState(null);
   const serverScope = plugin.settings.authServerId || plugin.settings.authServerUrl;
+  const storeBase = `realtime:plugindb:${serverScope}:${docId}`;
   const persistence = new IndexeddbPersistence(
-    epochPersistenceName(plugin, docId, `realtime:plugindb:${serverScope}:${docId}`, epoch),
+    epochPersistenceName(plugin, docId, storeBase, epoch),
     doc,
   );
+  if (epoch > 0) {
+    // A retired epoch's store is never connected again.
+    void clearDocument(epochPersistenceName(plugin, docId, storeBase, epoch - 1)).catch(() => {});
+  }
 
   let connected = false;
   let destroyed = false;

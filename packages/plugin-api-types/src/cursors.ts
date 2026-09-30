@@ -48,9 +48,10 @@ export interface CursorNotesApi {
     edit: { old: string; new: string; replaceAll?: boolean },
   ): Promise<CursorNote>;
   /**
-   * Convenience read-then-replace appending `text` on a fresh line. Not
-   * atomic: a concurrent edit between the read and the write can be lost —
-   * prefer `patch` with a unique anchor when contention is possible.
+   * Convenience read-then-replace appending `text` on a fresh line. If the
+   * note changes between the read and the write, the write is refused and
+   * `append` re-reads rather than reverting that change; it gives up with the
+   * server's `stale` error after a few attempts on a note under heavy edits.
    */
   append(path: string, text: string): Promise<CursorNote>;
   move(path: string, toPath: string): Promise<CursorNote>;

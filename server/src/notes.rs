@@ -39,8 +39,20 @@ pub struct CreateNoteBody {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ReplaceNoteBody {
     pub content: String,
+    /// Lowercase hex SHA-256 of the UTF-8 note content this replacement was
+    /// based on. When present and the note has changed since, the replace is
+    /// refused (409 `stale`) instead of reverting the other edits.
+    #[serde(default)]
+    pub expected_content_hash: Option<String>,
+}
+
+/// Lowercase hex SHA-256 of a note's UTF-8 content.
+pub(crate) fn content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(content.as_bytes()))
 }
 
 #[derive(Deserialize)]
@@ -315,18 +327,16 @@ pub(crate) async fn replace_note_inner(
 ) -> AppResult<NoteResponse> {
     let file = require_note_access(state, principal, vault_id, path, true).await?;
     let doc_id = doc_id(vault_id, &file.guid);
-    // The before-image is only needed for the cursor audit trail; spare human
-    // callers the extra document read.
-    let before = if audit::is_cursor(principal) {
-        let update = ydoc::read_update(state, &doc_id).await?;
-        Some(
-            ydoc::decode_text(&update, "contents")
-                .map_err(|e| AppError::Internal(e.to_string()))?,
-        )
-    } else {
-        None
-    };
-    ydoc::set_text(state, &doc_id, &body.content).await?;
+    let expected = body.expected_content_hash.as_deref();
+    let (before, _) = ydoc::update_text(state, &doc_id, |current| {
+        if expected.is_some_and(|expected| !expected.eq_ignore_ascii_case(&content_hash(current))) {
+            return Err(AppError::Conflict("stale".into()));
+        }
+        Ok(body.content.clone())
+    })
+    .await?;
+    // The before-image is only needed for the cursor audit trail.
+    let before = audit::is_cursor(principal).then_some(before);
     best_effort_index(state, vault_id, &file.guid, &file.path, &body.content).await;
     state
         .git
@@ -442,6 +452,9 @@ pub(crate) async fn move_note_inner(
     }
     let file = require_note_access(state, principal, vault_id, path, true).await?;
     require_path_write(state, principal, vault_id, &body.to_path).await?;
+    // Reconcile the registry mirror first (see create_note); index_rename
+    // re-checks the target against the index read it writes from.
+    reconcile_vault_files(state, vault_id).await?;
     if file_by_path(state, vault_id, &body.to_path)
         .await?
         .is_some()

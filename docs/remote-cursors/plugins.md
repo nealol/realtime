@@ -47,12 +47,14 @@ local vault) through the normal realtime channel.
 
 Notes:
 
-- `append` is a convenience read-then-replace; it is **not atomic** under
-  concurrent edits of the same note — prefer `patch` with a unique anchor when
-  contention is possible.
+- `append` is a convenience read-then-replace. The write carries the hash of
+  the content it read, so an edit that lands in between is never reverted:
+  the server refuses the write (`stale`) and `append` re-reads and retries,
+  surfacing `stale` only if the note keeps changing. Prefer `patch` with a
+  unique anchor under heavy contention.
 - Errors surface the server's reason, e.g. `anchor_not_found` (patch anchor
   missing), `ambiguous` (multiple matches without `replaceAll`), `exists`
-  (create/move target taken).
+  (create/move target taken), `stale` (the note changed since it was read).
 - For realtime token streaming with a live caret, use the WebSocket API at
   `cursor.streamUrl` with `cursor.token` ([streaming.md](./streaming.md)).
 - Any vault member's client may acquire a plugin cursor; admins can delete it

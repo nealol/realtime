@@ -32,7 +32,12 @@ export {
   type AuthorizeUrlOptions,
   type ExchangeCodeOptions,
 } from "./auth/oauth";
-export { NotesResource, FrontmatterResource, PeriodicNotesResource } from "./resources/notes";
+export {
+  NotesResource,
+  FrontmatterResource,
+  PeriodicNotesResource,
+  noteContentHash,
+} from "./resources/notes";
 export {
   VaultsResource,
   InvitesResource,

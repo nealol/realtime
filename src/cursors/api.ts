@@ -24,6 +24,7 @@ import type {
 } from "@realtime-md/plugin-api-types";
 import type RealtimePlugin from "../main";
 import { normalizeServerUrl } from "../auth";
+import { sha256Text } from "../hash";
 import { isValidId } from "../pluginDb/types";
 
 // Public interfaces live in the published types package; re-export for
@@ -38,6 +39,9 @@ export type {
 
 /** Re-acquire when the cached token has less than a day left. */
 const EXPIRY_MARGIN_MS = 24 * 60 * 60 * 1000;
+
+/** Reads `append` makes before giving up on a note that keeps changing. */
+const APPEND_ATTEMPTS = 3;
 
 export class RealtimeCursorsAPI implements RealtimeCursors {
   private plugin: RealtimePlugin;
@@ -102,11 +106,21 @@ export class RealtimeCursorsAPI implements RealtimeCursors {
           replaceAll: edit.replaceAll ?? false,
         }),
       append: async (path, text) => {
-        const current = await this.request<CursorNote>(pluginId, "GET", note(path));
-        const glue = current.content.length === 0 || current.content.endsWith("\n") ? "" : "\n";
-        return this.request<CursorNote>(pluginId, "PUT", note(path), {
-          content: `${current.content}${glue}${text}`,
-        });
+        // The server refuses a replacement built on content that changed
+        // since the read ("stale"); re-read and append to the new content.
+        for (let attempt = 1; ; attempt++) {
+          const current = await this.request<CursorNote>(pluginId, "GET", note(path));
+          const glue = current.content.length === 0 || current.content.endsWith("\n") ? "" : "\n";
+          try {
+            return await this.request<CursorNote>(pluginId, "PUT", note(path), {
+              content: `${current.content}${glue}${text}`,
+              expectedContentHash: await sha256Text(current.content),
+            });
+          } catch (error) {
+            const stale = error instanceof Error && error.message === "stale";
+            if (!stale || attempt >= APPEND_ATTEMPTS) throw error;
+          }
+        }
       },
       move: (path, toPath) =>
         this.request<CursorNote>(

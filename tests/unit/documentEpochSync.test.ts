@@ -54,10 +54,10 @@ class EpochClient {
 beforeAll(async () => {
   harness = await startAuthHarness({
     env: {
-      // Two initial SyncStep2 responses plus these clients' two edits.
-      // Keep enough headroom that reconnecting both fresh documents does not
-      // immediately trigger a second rollover.
-      CRDT_EPOCH_MAX_UPDATES: "4",
+      // These clients' two edits. Connect handshakes that carry nothing new
+      // are not writes, so the replacement epoch sees only the one later
+      // edit and does not immediately roll over again.
+      CRDT_EPOCH_MAX_UPDATES: "2",
       CRDT_EPOCH_MAX_STATE_BYTES: "536870912",
       CRDT_EPOCH_MAX_DELETE_SET_BYTES: "536870912",
       // Peers that never acknowledge hold a proposal open for this long.

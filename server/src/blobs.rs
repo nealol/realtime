@@ -208,6 +208,15 @@ pub async fn put_blob(
         .and_then(|value| value.parse::<u64>().ok());
     if let Ok(metadata) = tokio::fs::metadata(&path).await {
         if expected_len.is_none_or(|len| len == metadata.len()) {
+            // The uploader is about to publish an index entry for this blob:
+            // refresh its age so an orphan sweep cannot reclaim it meanwhile.
+            if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(&path).await {
+                let file = file.into_std().await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    file.set_modified(std::time::SystemTime::now())
+                })
+                .await;
+            }
             return Ok(StatusCode::OK);
         }
     }

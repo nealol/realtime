@@ -8,6 +8,7 @@ import type { Document } from "../Document";
 import { ensureDocumentForEditor, requestSaveForEditor } from "./context";
 import { ySyncAnnotation } from "./annotations";
 import { applyTextToYText } from "../diff";
+import { mergeText } from "../textMerge";
 import { dbg, snip } from "../debug";
 
 /**
@@ -89,30 +90,47 @@ export class LiveEditPluginValue implements PluginValue {
 
   /**
    * Align the editor and the shared text when an editor attaches:
-   *  - if the shared text has content, it is authoritative -> update editor;
+   *  - text typed before the document was ready is merged into the shared text;
+   *  - otherwise, if the shared text has content, it is authoritative -> update editor;
    *  - else if the editor has content, seed the shared text from it;
    *  - if both are empty, do nothing.
    * We never overwrite editor content with an empty shared document.
    */
   private reconcileOnAttach(): void {
     if (!this.ytext || this.destroyed) return;
-    const shared = this.ytext.toString();
+    const ytext = this.ytext;
+    const shared = ytext.toString();
     const current = this.editor.state.doc.toString();
     if (shared === current) return;
 
-    // If the user typed while the document was still loading its local
-    // persistence / first server sync, preserve that active editor state as the
-    // newest local edit instead of applying the now-ready shared text over it.
-    if (this.editorTextAtBind !== null && current !== this.editorTextAtBind) {
+    // The user typed while the document was still loading its local
+    // persistence / first server sync (possibly a whole offline session).
+    // Those keystrokes are edits to the text the editor showed when it bound;
+    // the shared text may have gained other peers' changes meanwhile, so merge
+    // the two instead of letting either side overwrite the other.
+    const base = this.editorTextAtBind;
+    if (base !== null && current !== base) {
       // ...unless a server sync that could deliver this content is still pending
       // (see {@link shouldPushEditorToShared}); seeding it now would duplicate.
       if (!this.mayPushToShared()) {
         dbg("reconcile push DEFERRED (pre-sync empty shared)", this.doc?.path, snip(current));
         return;
       }
-      this.ytext.doc?.transact(() => {
-        applyTextToYText(this.ytext!, current);
+      const merge = mergeText(base, current, shared);
+      if (merge.kind === "merged") {
+        ytext.doc?.transact(() => {
+          applyTextToYText(ytext, merge.content);
+        }, this);
+        this.applyTextToEditor(merge.content);
+        return;
+      }
+      // Both sides changed the same lines. Keep what the user is typing and
+      // preserve the shared version beside the note rather than dropping it.
+      const doc = this.doc;
+      ytext.doc?.transact(() => {
+        applyTextToYText(ytext, current);
       }, this);
+      void doc?.preserveSharedConflict(shared);
       return;
     }
 

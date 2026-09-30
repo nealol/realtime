@@ -1,7 +1,7 @@
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
 import { handleEpochProposal } from "../documentEpoch";
-import type { SyncSocket } from "./RealtimeProvider";
+import { SOCKET_ERROR_TOKEN_REJECTED, type SyncSocket } from "./RealtimeProvider";
 
 /**
  * Bounded WebSocket multiplexing for Realtime document sync.
@@ -23,11 +23,17 @@ import type { SyncSocket } from "./RealtimeProvider";
  * Wire frames (binary; ints are lib0 var-uints):
  *   OPEN     = [1][channelId][varString pathAndQuery]   client -> server
  *   OPEN_OK  = [2][channelId]                            server -> client
- *   OPEN_ERR = [3][channelId]                            server -> client
+ *   OPEN_ERR = [3][channelId][reason?]                   server -> client
  *   DATA     = [4][channelId][raw yjs bytes …]           both directions
  *   CLOSE    = [5][channelId]                            both directions
  *   PING     = [6][0]                                    client -> server
  *   PONG     = [7][0]                                    server -> client
+ *
+ * OPEN_ERR's optional reason says whether the rejection is admission
+ * pressure (back off every open on the shard), a token the server will not
+ * accept (fetch a new one; nothing else is wrong), or a document that cannot
+ * open right now. Servers that predate it send none, which is treated as
+ * admission pressure.
  *
  * `pathAndQuery` is the per-document URL the provider would otherwise use
  * (`/d/{docId}/ws/{docId}?token=…`); the server validates the same per-document
@@ -50,6 +56,11 @@ const FRAME_PING = 6;
 const FRAME_PONG = 7;
 const EPOCH_PROPOSAL_MESSAGE = 103;
 const EPOCH_ACK_MESSAGE = 104;
+
+/** OPEN_ERR reasons (see server/src/dmux.rs); 0 means the server sent none. */
+const OPEN_ERR_UNSPECIFIED = 0;
+const OPEN_ERR_REJECTED = 1;
+const OPEN_ERR_TOKEN = 2;
 
 /** Channel id reserved for control frames that are not tied to a channel. */
 const CONTROL_CHANNEL = 0;
@@ -135,7 +146,7 @@ export function encodePong(): Uint8Array {
 export type DecodedFrame =
   | { type: "open"; channelId: number; pathAndQuery: string }
   | { type: "open_ok"; channelId: number }
-  | { type: "open_err"; channelId: number }
+  | { type: "open_err"; channelId: number; reason: number }
   | { type: "data"; channelId: number; payload: Uint8Array }
   | { type: "close"; channelId: number }
   | { type: "ping" }
@@ -153,7 +164,11 @@ export function decodeFrame(buf: Uint8Array): DecodedFrame {
       case FRAME_OPEN_OK:
         return { type: "open_ok", channelId };
       case FRAME_OPEN_ERR:
-        return { type: "open_err", channelId };
+        return {
+          type: "open_err",
+          channelId,
+          reason: decoding.hasContent(dec) ? decoding.readVarUint(dec) : OPEN_ERR_UNSPECIFIED,
+        };
       case FRAME_DATA:
         return { type: "data", channelId, payload: decoding.readTailAsUint8Array(dec) };
       case FRAME_CLOSE:
@@ -180,6 +195,21 @@ export function setMuxWebSocketCtor(ctor: WebSocketCtor): void {
 }
 
 const connectionPools = new Map<string, MuxConnection[]>();
+
+/**
+ * Detach a real socket and close it. Closing one that is still connecting
+ * reports an error event afterwards, and Node's `ws` throws that error when
+ * nothing listens, so a no-op handler stays attached.
+ */
+function discardSocket(ws: WebSocket): void {
+  ws.onopen = ws.onmessage = ws.onclose = null;
+  ws.onerror = () => {};
+  try {
+    ws.close();
+  } catch {
+    /* ignore */
+  }
+}
 
 /** Test-only: tear down all shared connections and registries. */
 export function resetMuxForTests(): void {
@@ -369,10 +399,18 @@ class MuxConnection {
         this.channels.get(frame.channelId)?.deliverOpen();
         break;
       case "open_err": {
-        this.backOffOpens();
+        // Only admission pressure should slow every other open on this shard.
+        // A refused token says nothing about the server's load: after a long
+        // sleep or a server restart every channel's token is refused at once,
+        // and backing off on each would stall the whole vault for minutes.
+        if (frame.reason === OPEN_ERR_REJECTED || frame.reason === OPEN_ERR_UNSPECIFIED) {
+          this.backOffOpens();
+        }
         const channel = this.channels.get(frame.channelId);
         this.channels.delete(frame.channelId);
-        channel?.deliverError();
+        channel?.deliverError(
+          frame.reason === OPEN_ERR_TOKEN ? SOCKET_ERROR_TOKEN_REJECTED : undefined,
+        );
         channel?.deliverClose(CLOSE_CODE_TRANSPORT);
         this.teardownIfIdle();
         break;
@@ -439,14 +477,7 @@ class MuxConnection {
     this.pendingOpens.clear();
     const ws = this.ws;
     this.ws = null;
-    if (ws) {
-      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
-      try {
-        ws.close();
-      } catch {
-        /* ignore */
-      }
-    }
+    if (ws) discardSocket(ws);
     for (const channel of channels) {
       channel.deliverError();
       channel.deliverClose(CLOSE_CODE_TRANSPORT);
@@ -461,14 +492,7 @@ class MuxConnection {
     this.clearOpenPaceTimer();
     const ws = this.ws;
     this.ws = null;
-    if (ws) {
-      ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
-      try {
-        ws.close();
-      } catch {
-        /* ignore */
-      }
-    }
+    if (ws) discardSocket(ws);
     this.release();
   }
 
@@ -567,8 +591,8 @@ export class MuxWebSocket implements SyncSocket {
     this.onmessage?.({ data: payload });
   }
 
-  deliverError(): void {
-    this.onerror?.({});
+  deliverError(reason?: string): void {
+    this.onerror?.(reason === undefined ? {} : { reason });
   }
 
   deliverClose(code: number = CLOSE_CODE_TRANSPORT): void {

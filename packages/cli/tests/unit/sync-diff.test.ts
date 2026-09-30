@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { VaultHandle } from "@realtime-md/sdk";
+import { ConflictError, type UploadAttachmentOptions, type VaultHandle } from "@realtime-md/sdk";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   classifyStatus,
@@ -106,7 +106,7 @@ function tempWorkspace(config: RtmdConfig): Workspace {
 function fakeVault(options: {
   attachmentList?: () => Promise<{ path: string; hash: string; size: number }[]>;
   read?: (path: string) => Promise<Uint8Array>;
-  upload?: (path: string, bytes: Uint8Array) => Promise<unknown>;
+  upload?: (path: string, bytes: Uint8Array, options?: UploadAttachmentOptions) => Promise<unknown>;
 }): VaultHandle {
   return {
     notes: { list: async () => [] },
@@ -208,5 +208,128 @@ describe("attachment filtering during push", () => {
     expect(report).toEqual({ applied: [], conflicts: [] });
     expect(fs.existsSync(path.join(ws.dir, "LICENSE"))).toBe(false);
     expect(ws.config.sync?.files).toEqual({});
+  });
+});
+
+describe("attachment preconditions during push", () => {
+  const png = (tail: string) => Buffer.from(`\x89PNG\r\n\x1a\n${tail}`, "latin1");
+
+  /** A workspace whose last sync saw `synced` at img/pic.png, now edited to `local`. */
+  function editedWorkspace(synced: Buffer | null, local: Buffer): Workspace {
+    const ws = tempWorkspace({
+      version: 1,
+      baseUrl: "https://example.com",
+      vaultId: "v1",
+      attachmentSync: { enabled: true, includeGlobs: ["img/**"] },
+      sync: {
+        lastSyncedAt: new Date(0).toISOString(),
+        files: synced
+          ? {
+              "img/pic.png": {
+                kind: "attachment",
+                hash: hashBytes(synced),
+                size: synced.byteLength,
+                mtimeMs: 1,
+              },
+            }
+          : {},
+      },
+    });
+    fs.mkdirSync(path.join(ws.dir, "img"));
+    fs.writeFileSync(path.join(ws.dir, "img/pic.png"), local);
+    return ws;
+  }
+
+  function remoteHolding(bytes: Buffer | null) {
+    return async () =>
+      bytes ? [{ path: "img/pic.png", hash: hashBytes(bytes), size: bytes.byteLength }] : [];
+  }
+
+  it("replaces only the remote version it compared against", async () => {
+    const synced = png("synced");
+    const local = png("local edit");
+    const ws = editedWorkspace(synced, local);
+    const sent: (UploadAttachmentOptions | undefined)[] = [];
+    const vault = fakeVault({
+      attachmentList: remoteHolding(synced),
+      upload: async (attachmentPath, bytes, options) => {
+        sent.push(options);
+        return { path: attachmentPath, hash: hashBytes(bytes), size: bytes.byteLength };
+      },
+    });
+
+    const report = await push(ws, vault);
+
+    expect(sent).toEqual([{ ifMatch: hashBytes(synced), ifNoneMatch: undefined }]);
+    expect(report).toEqual({ applied: [{ action: "update", path: "img/pic.png" }], conflicts: [] });
+    expect(ws.config.sync?.files["img/pic.png"]?.hash).toBe(hashBytes(local));
+  });
+
+  it("reports a conflict instead of overwriting an attachment replaced during push", async () => {
+    const synced = png("synced");
+    const ws = editedWorkspace(synced, png("local edit"));
+    const vault = fakeVault({
+      attachmentList: remoteHolding(synced),
+      upload: async () => {
+        throw new ConflictError("stale");
+      },
+    });
+
+    const report = await push(ws, vault);
+
+    expect(report).toEqual({
+      applied: [],
+      conflicts: [
+        {
+          path: "img/pic.png",
+          reason: "modified remotely during push (use --force to overwrite)",
+        },
+      ],
+    });
+    expect(ws.config.sync?.files["img/pic.png"]?.hash).toBe(hashBytes(synced));
+  });
+
+  it("creates a new attachment only while the path is still empty", async () => {
+    const ws = editedWorkspace(null, png("new"));
+    const sent: (UploadAttachmentOptions | undefined)[] = [];
+    const vault = fakeVault({
+      attachmentList: remoteHolding(null),
+      upload: async (_path, _bytes, options) => {
+        sent.push(options);
+        throw new ConflictError("exists");
+      },
+    });
+
+    const report = await push(ws, vault);
+
+    expect(sent).toEqual([{ ifMatch: undefined, ifNoneMatch: "*" }]);
+    expect(report).toEqual({
+      applied: [],
+      conflicts: [
+        {
+          path: "img/pic.png",
+          reason: "created remotely during push (use --force to overwrite)",
+        },
+      ],
+    });
+    expect(ws.config.sync?.files["img/pic.png"]).toBeUndefined();
+  });
+
+  it("overwrites without preconditions under --force", async () => {
+    const synced = png("synced");
+    const ws = editedWorkspace(synced, png("local edit"));
+    const sent: (UploadAttachmentOptions | undefined)[] = [];
+    const vault = fakeVault({
+      attachmentList: remoteHolding(png("changed remotely")),
+      upload: async (attachmentPath, bytes, options) => {
+        sent.push(options);
+        return { path: attachmentPath, hash: hashBytes(bytes), size: bytes.byteLength };
+      },
+    });
+
+    const report = await push(ws, vault, { force: true });
+
+    expect(sent).toEqual([{ ifMatch: undefined, ifNoneMatch: undefined }]);
+    expect(report.applied).toEqual([{ action: "update", path: "img/pic.png" }]);
   });
 });

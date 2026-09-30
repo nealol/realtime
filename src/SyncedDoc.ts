@@ -1,6 +1,6 @@
 import * as Y from "yjs";
 import type { Awareness } from "y-protocols/awareness";
-import { IndexeddbPersistence, storeState } from "y-indexeddb";
+import { IndexeddbPersistence, clearDocument, storeState } from "y-indexeddb";
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./sync/clientToken";
 import {
@@ -13,6 +13,7 @@ import { createMuxSocket } from "./sync/mux";
 import { epochPersistenceName, getDocumentEpoch } from "./documentEpoch";
 import { preserveTextConflict } from "./conflictRecovery";
 import { sha256Text } from "./hash";
+import { registerPresenceOwner, type PresenceOwner } from "./presenceOwners";
 import type { MaterializedKind } from "./localSyncState";
 
 /**
@@ -34,9 +35,16 @@ export interface DocumentBootstrapOptions {
    * unsynced edits, so it is replaced by this document instead of conflicting.
    */
   staleLocalFingerprint?: string | null;
+  /**
+   * Content of the document this one replaces after an epoch rollover, when
+   * the server had acknowledged all of it (see {@link SyncedDoc.retiredBaseline}).
+   * The new epoch starts from an empty local store, so this is the only
+   * baseline that tells local edits apart from remote ones.
+   */
+  retiredBaseline?: string | null;
 }
 
-export abstract class SyncedDoc {
+export abstract class SyncedDoc implements PresenceOwner {
   readonly path: string;
   readonly guid: string;
   readonly serverDocId: string;
@@ -59,7 +67,7 @@ export abstract class SyncedDoc {
   private readonly autoConnect: boolean;
   private persistenceReady = false;
   /** Whether IndexedDB held any state for this document when it loaded. */
-  private loadedStoredState = false;
+  protected loadedStoredState = false;
   private connectRequested = false;
   /** True once the provider has reported a successful server sync at least once. */
   private syncedOnce = false;
@@ -68,6 +76,10 @@ export abstract class SyncedDoc {
   private readOnlyRecoveryRequested = false;
   private readOnlyRecoveryBaseline: string | null = null;
   private destroyListeners = new Set<() => void>();
+  /** This client's presence fields (name, colors, avatar). */
+  private presenceUser: Record<string, unknown> | null = null;
+  /** Open views of this document; presence is published only while one exists. */
+  private presenceHolds = 0;
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -103,10 +115,22 @@ export abstract class SyncedDoc {
       },
     );
     this.awareness = this.provider.awareness;
+    // y-protocols starts every Awareness with an (empty) local state, which it
+    // renews and every peer re-broadcasts every 15s. Most documents are never
+    // on screen, so publish presence only while a view holds it.
+    this.awareness.setLocalState(null);
+    registerPresenceOwner(this.awareness, this);
     this.persistence = new IndexeddbPersistence(
       epochPersistenceName(plugin, serverDocId, serverDocId, this.epoch),
       this.ydoc,
     );
+    // The previous epoch's store can never be connected again; drop it even
+    // when the document was not resident (or the app was closed) at rollover.
+    if (this.epoch > 0) {
+      void clearDocument(
+        epochPersistenceName(plugin, serverDocId, serverDocId, this.epoch - 1),
+      ).catch(() => {});
+    }
     const storeUpdate = this.persistence._storeUpdate;
     this.ydoc.off("update", storeUpdate);
     const filteredStoreUpdate = (update: Uint8Array, origin: unknown) => {
@@ -236,16 +260,51 @@ export abstract class SyncedDoc {
   }
 
   /**
-   * Whether disk `text` is content this document's local store already
-   * contains (see {@link recordStoredDiskContent}): the file then merely lags
-   * the document, and is not a local edit.
+   * Whether disk `text` holds no local edits: it is content this document's
+   * local store already contains (see {@link recordStoredDiskContent}), so the
+   * file merely lags the document — or, when the store loaded nothing (a new
+   * epoch, or a lost database), it is exactly the content the server last
+   * acknowledged for this identity.
    */
   protected async storeContainsDiskContent(text: string): Promise<boolean> {
-    // A store that loaded nothing (a new epoch, or a lost database) cannot
-    // contain what an earlier store did.
-    if (!this.loadedStoredState) return false;
-    const known = await this.plugin.vaultSync?.diskFingerprint(this.path, this.guid);
+    const vaultSync = this.plugin.vaultSync;
+    if (!this.loadedStoredState) {
+      const acknowledged = vaultSync?.acknowledgedFingerprint?.(this.path, this.guid);
+      return acknowledged != null && acknowledged === (await sha256Text(text));
+    }
+    const known = await vaultSync?.diskFingerprint(this.path, this.guid);
     return known != null && known === (await storedContentFingerprint(this.epoch, text));
+  }
+
+  /**
+   * This document's content as a merge baseline for the one replacing it in
+   * a new epoch, or null while the server has not acknowledged all of it:
+   * changes it never persisted may be missing from the new epoch, and using
+   * them as the baseline would read their absence as a remote deletion.
+   */
+  retiredBaseline(): string | null {
+    if (this.destroyed || !this.ready || this.provider.hasLocalChanges) return null;
+    return this.serializeRecoveryContent();
+  }
+
+  /** Set this client's presence fields; published while a view holds presence. */
+  setPresenceUser(user: Record<string, unknown>): void {
+    this.presenceUser = user;
+    if (this.presenceHolds > 0 && !this.destroyed) this.awareness.setLocalStateField("user", user);
+  }
+
+  holdPresence(): () => void {
+    this.presenceHolds += 1;
+    if (this.presenceHolds === 1 && !this.destroyed) {
+      this.awareness.setLocalState(this.presenceUser ? { user: this.presenceUser } : {});
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.presenceHolds -= 1;
+      if (this.presenceHolds === 0 && !this.destroyed) this.awareness.setLocalState(null);
+    };
   }
 
   /** Run `listener` once this instance is destroyed; returns an unsubscribe. */
@@ -324,14 +383,20 @@ export abstract class SyncedDoc {
     }
   }
 
-  destroy(): void {
+  /**
+   * Release this document. `clearLocalStore` also deletes its IndexedDB store
+   * (a retired epoch, or a deleted file whose changes all reached the server)
+   * so stores do not accumulate on the device.
+   */
+  destroy(options: { clearLocalStore?: boolean } = {}): void {
     if (this.destroyed) return;
     this.destroyed = true;
     this.destroySubclass();
     this.provider.off("synced", this.syncedListener);
     this.provider.off(SYNC_EVENT_LOCAL_CHANGES, this.localChangesListener);
     this.provider.destroy();
-    void this.persistence.destroy();
+    if (options.clearLocalStore) void this.persistence.clearData();
+    else void this.persistence.destroy();
     this.ydoc.destroy();
     this.resolveNextServerSyncWaiters();
     this.resolveWhenReady();

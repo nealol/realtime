@@ -23,7 +23,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use url::Url;
 use yrs::sync::{Awareness, Message, SyncMessage};
 use yrs::updates::encoder::Encode;
-use yrs::{Doc, ReadTxn, StateVector, Transact};
+use yrs::{DeleteSet, Doc, ReadTxn, StateVector, Transact};
 
 use crate::crdt_epoch::{self, DocumentEpochMetrics, EpochPolicy};
 use crate::crdt_storage::{self, DocumentPersistence, StorageError};
@@ -332,6 +332,49 @@ impl DocumentStore {
             );
         }
         Ok(())
+    }
+
+    /// Read, decide, and write under the document's write gate, so no other
+    /// write (server-side or from a client connection) lands between the state
+    /// `build` sees and the update it returns. `build` gets the encoded state
+    /// and returns the update to apply (empty: none) plus a value for the
+    /// caller; an error from `build` writes nothing and is passed through.
+    pub(crate) async fn modify<T, E>(
+        &self,
+        document_id: &str,
+        build: impl FnOnce(&[u8]) -> Result<(Vec<u8>, T), E>,
+    ) -> Result<Result<T, E>, CrdtError> {
+        let write_gate = self.write_gate(document_id).await?;
+        let write_guard = write_gate.lock().await;
+        let (epoch, document) = self.get_or_load(document_id).await?;
+        let current = document.read_update().await?;
+        let (update, value) = match build(&current) {
+            Ok(built) => built,
+            Err(error) => return Ok(Err(error)),
+        };
+        if update.is_empty() {
+            return Ok(Ok(value));
+        }
+        self.reject_server_write_during_transition(document_id)
+            .await?;
+        #[cfg(test)]
+        let write_pause = self.0.write_pauses.lock().await.remove(document_id);
+        #[cfg(test)]
+        if let Some(pause) = write_pause {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
+        document.apply_update(&update).await?;
+        drop(write_guard);
+        if let Err(error) = self.after_write(document_id, epoch, &document).await {
+            tracing::error!(
+                %error,
+                %document_id,
+                epoch,
+                "post-write CRDT maintenance failed"
+            );
+        }
+        Ok(Ok(value))
     }
 
     /// Force a compacted generation for offline maintenance and benchmarks.
@@ -1241,6 +1284,45 @@ fn epoch_error(error: crdt_epoch::EpochError) -> CrdtError {
     CrdtError::Storage(error.to_string())
 }
 
+/// True when every range in `deletions` is already deleted in a document whose
+/// delete set is `applied` and whose clocks are `known`. Deleting a block the
+/// document has not integrated yet is new information.
+fn deletions_applied(deletions: &DeleteSet, applied: &DeleteSet, known: &StateVector) -> bool {
+    let mut applied_ranges: HashMap<u64, Vec<std::ops::Range<u32>>> = HashMap::new();
+    for (client, ranges) in applied.iter() {
+        let mut sorted: Vec<_> = ranges.iter().cloned().collect();
+        sorted.sort_by_key(|range| range.start);
+        applied_ranges.insert(*client, sorted);
+    }
+    deletions.iter().all(|(client, ranges)| {
+        ranges.iter().all(|range| {
+            range.start >= range.end
+                || (range.end <= known.get(client)
+                    && applied_ranges
+                        .get(client)
+                        .is_some_and(|covered| range_covered(range, covered)))
+        })
+    })
+}
+
+/// Whether the start-sorted `covered` ranges contain all of `range`.
+fn range_covered(range: &std::ops::Range<u32>, covered: &[std::ops::Range<u32>]) -> bool {
+    let mut next = range.start;
+    for candidate in covered {
+        if candidate.end <= next {
+            continue;
+        }
+        if candidate.start > next {
+            return false;
+        }
+        next = candidate.end;
+        if next >= range.end {
+            return true;
+        }
+    }
+    next >= range.end
+}
+
 fn validate_document_id(document_id: &str) -> Result<(), CrdtError> {
     if !document_id.is_empty()
         && document_id.len() <= 255
@@ -1319,6 +1401,27 @@ impl PersistentDocument {
     async fn read_update(&self) -> Result<Vec<u8>, CrdtError> {
         let _mutation = self.mutation.lock().await;
         self.snapshot()
+    }
+
+    /// True when every block and deletion `update` carries is already part of
+    /// this document, so applying it would change nothing. Conservative: any
+    /// decoding doubt answers `false` and the update takes the normal path.
+    fn contains_update(&self, update: &[u8]) -> bool {
+        let Ok((update_clocks, deletions)) = crate::safe_yrs::update_contents(update) else {
+            return false;
+        };
+        let Ok(awareness) = self.awareness.read() else {
+            return false;
+        };
+        let txn = awareness.doc().transact();
+        let known = txn.state_vector();
+        if update_clocks
+            .iter()
+            .any(|(client, clock)| *clock > known.get(client))
+        {
+            return false;
+        }
+        deletions.is_empty() || deletions_applied(&deletions, &txn.snapshot().delete_set, &known)
     }
 
     /// Encoded state size, delete-set size, and update count for the epoch
@@ -1644,6 +1747,7 @@ async fn run_connection(
                     }
                     let message = crate::safe_yrs::decode_message(&bytes)
                         .map_err(|error| CrdtError::Protocol(error.to_string()))?;
+                    let handshake = matches!(message, Message::Sync(SyncMessage::SyncStep2(_)));
                     match message {
                         Message::Sync(SyncMessage::SyncStep1(state_vector)) => {
                             send_outgoing(
@@ -1663,6 +1767,14 @@ async fn run_connection(
                                 tracing::debug!(
                                     "ignored client update on read-only CRDT connection"
                                 );
+                                continue;
+                            }
+                            // A reconnecting peer answers SyncStep1 with its
+                            // whole delete set even when it holds nothing new.
+                            // Persisting and broadcasting that would count every
+                            // reconnect as a content write (fsync, peer fan-out,
+                            // index invalidations, audit and search work).
+                            if handshake && document.contains_update(&update) {
                                 continue;
                             }
                             store
@@ -2409,6 +2521,145 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
+    async fn drain_initial(connection: &mut CrdtConnection) {
+        connection.recv().await.unwrap();
+        connection.recv().await.unwrap();
+    }
+
+    async fn await_sync_status(connection: &mut CrdtConnection, version: u8) {
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let bytes = connection.recv().await.unwrap();
+                if matches!(
+                    crate::safe_yrs::decode_v1::<Message>(&bytes).unwrap(),
+                    Message::Custom(SYNC_STATUS_MESSAGE, payload) if payload == vec![version]
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_handshake_without_new_content_is_not_a_write() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        // A client note with ordinary editing history, already on the server.
+        let client = Doc::new();
+        let text = client.get_or_insert_text("contents");
+        text.insert(&mut client.transact_mut(), 0, "hello brave new world");
+        text.remove_range(&mut client.transact_mut(), 6, 6);
+        let full = client
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        store.apply_update("vault__document", &full).await.unwrap();
+        let writes_before = store
+            .epoch_metrics("vault__document")
+            .await
+            .unwrap()
+            .update_count;
+
+        let mut index = store.connect_internal("vault", Level::Full).await.unwrap();
+        drain_initial(&mut index).await;
+        let mut peer = store
+            .connect_internal("vault__document", Level::Full)
+            .await
+            .unwrap();
+        drain_initial(&mut peer).await;
+        let mut reconnecting = store
+            .connect_internal("vault__document", Level::Full)
+            .await
+            .unwrap();
+        drain_initial(&mut reconnecting).await;
+
+        // The reconnect answer: nothing new, but the whole delete set.
+        let server_clocks = store
+            .read_with("vault__document", |doc| doc.transact().state_vector())
+            .await
+            .unwrap();
+        let step2 = client.transact().encode_state_as_update_v1(&server_clocks);
+        assert!(
+            step2.len() > 2,
+            "the handshake must still carry the delete set"
+        );
+        reconnecting
+            .send(Message::Sync(SyncMessage::SyncStep2(step2)).encode_v1())
+            .await
+            .unwrap();
+        reconnecting
+            .send(Message::Custom(SYNC_STATUS_MESSAGE, vec![9]).encode_v1())
+            .await
+            .unwrap();
+        await_sync_status(&mut reconnecting, 9).await;
+
+        assert_eq!(
+            store
+                .epoch_metrics("vault__document")
+                .await
+                .unwrap()
+                .update_count,
+            writes_before
+        );
+        assert!(timeout(Duration::from_millis(200), peer.recv())
+            .await
+            .is_err());
+        assert!(timeout(Duration::from_millis(200), index.recv())
+            .await
+            .is_err());
+
+        // A handshake that carries a deletion the server lacks is still applied.
+        text.remove_range(&mut client.transact_mut(), 0, 6);
+        let step2 = client.transact().encode_state_as_update_v1(&server_clocks);
+        reconnecting
+            .send(Message::Sync(SyncMessage::SyncStep2(step2)).encode_v1())
+            .await
+            .unwrap();
+        reconnecting
+            .send(Message::Custom(SYNC_STATUS_MESSAGE, vec![10]).encode_v1())
+            .await
+            .unwrap();
+        await_sync_status(&mut reconnecting, 10).await;
+        assert_eq!(
+            store
+                .epoch_metrics("vault__document")
+                .await
+                .unwrap()
+                .update_count,
+            writes_before + 1
+        );
+        let persisted = store.read_update("vault__document").await.unwrap();
+        let doc = decode_document(&persisted).unwrap();
+        assert_eq!(
+            doc.get_or_insert_text("contents")
+                .get_string(&doc.transact()),
+            "new world"
+        );
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[test]
+    fn deletion_coverage_needs_every_clock_already_deleted() {
+        let mut known = StateVector::default();
+        known.set_max(1, 10);
+        let mut applied = DeleteSet::new();
+        applied.insert(yrs::ID::new(1, 2), 3); // 2..5
+        applied.insert(yrs::ID::new(1, 6), 2); // 6..8
+        let mut inside = DeleteSet::new();
+        inside.insert(yrs::ID::new(1, 3), 2);
+        assert!(deletions_applied(&inside, &applied, &known));
+        let mut spanning_gap = DeleteSet::new();
+        spanning_gap.insert(yrs::ID::new(1, 4), 3);
+        assert!(!deletions_applied(&spanning_gap, &applied, &known));
+        let mut unknown_blocks = DeleteSet::new();
+        unknown_blocks.insert(yrs::ID::new(1, 9), 3);
+        assert!(!deletions_applied(&unknown_blocks, &applied, &known));
+        let mut other_client = DeleteSet::new();
+        other_client.insert(yrs::ID::new(2, 0), 1);
+        assert!(!deletions_applied(&other_client, &applied, &known));
+    }
+
     #[tokio::test]
     async fn durable_child_write_invalidates_the_live_vault_index() {
         let directory = temp_store();
@@ -2732,6 +2983,86 @@ mod tests {
                 Err(CrdtError::InvalidDocumentId)
             ));
         }
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    fn values_entry(update: &[u8], key: &str) -> Option<String> {
+        let doc = decode_document(update).unwrap();
+        let value = doc
+            .get_or_insert_map("values")
+            .get(&doc.transact(), key)
+            .and_then(|value| value.cast::<String>().ok());
+        value
+    }
+
+    #[tokio::test]
+    async fn modify_holds_the_write_gate_from_its_read_to_its_write() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        let (write_reached, resume_write) = store.pause_next_write("vault__document").await;
+
+        // Write "checked" only while no "raced" entry exists.
+        let checked = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .modify("vault__document", |current| {
+                        if values_entry(current, "raced").is_some() {
+                            return Err("stale");
+                        }
+                        Ok((map_update("checked", "written"), ()))
+                    })
+                    .await
+            })
+        };
+        write_reached.await.unwrap();
+
+        let racing = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                store
+                    .apply_update("vault__document", &map_update("raced", "later"))
+                    .await
+            })
+        };
+        // Long enough for an unblocked write to finish.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !racing.is_finished(),
+            "a write must not land between modify's check and its write"
+        );
+
+        resume_write.send(()).unwrap();
+        assert_eq!(checked.await.unwrap().unwrap(), Ok(()));
+        racing.await.unwrap().unwrap();
+        let update = store.read_update("vault__document").await.unwrap();
+        assert_eq!(values_entry(&update, "checked").as_deref(), Some("written"));
+        assert_eq!(values_entry(&update, "raced").as_deref(), Some("later"));
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn modify_refuses_against_a_write_that_landed_first() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        store
+            .apply_update("vault__document", &map_update("raced", "first"))
+            .await
+            .unwrap();
+
+        let outcome = store
+            .modify("vault__document", |current| {
+                if values_entry(current, "raced").is_some() {
+                    return Err("stale");
+                }
+                Ok((map_update("checked", "written"), ()))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, Err("stale"));
+        let update = store.read_update("vault__document").await.unwrap();
+        assert_eq!(values_entry(&update, "checked"), None);
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 

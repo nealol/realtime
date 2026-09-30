@@ -37,12 +37,15 @@ export abstract class StructuredDocument extends SyncedDoc {
   private startupReconciling = false;
   private forceBootstrapConflict: boolean;
   private readonly staleLocalFingerprint: string | null;
+  private readonly retiredBaselineText: string | null;
   private baselineAtStartup: JsonValue = {};
   private baselineTextAtStartup = "";
   private diskAtStartup: JsonValue | null = null;
   private localChangedAtStartup = false;
   /** True when the on-disk file exists but could not be parsed. */
   private diskParseFailed = false;
+  /** Serialized remote version already preserved by the startup reconcile. */
+  private preservedStartupRemote: string | null = null;
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -55,6 +58,7 @@ export abstract class StructuredDocument extends SyncedDoc {
     super(plugin, path, guid, serverDocId, isCreator, opts);
     this.forceBootstrapConflict = opts.forceBootstrapConflict ?? false;
     this.staleLocalFingerprint = opts.staleLocalFingerprint ?? null;
+    this.retiredBaselineText = opts.retiredBaseline ?? null;
     this.root = this.ydoc.getMap("root");
     this.rootObserver = (_events, txn) => this.onRootChanged(txn?.origin);
     this.root.observeDeep(this.rootObserver);
@@ -91,7 +95,12 @@ export abstract class StructuredDocument extends SyncedDoc {
   }
 
   protected async afterPersistenceSynced(): Promise<void> {
-    this.baselineAtStartup = this.value;
+    // A new epoch starts from an empty store; the content it replaced is
+    // then the baseline local and remote changes are measured from.
+    this.baselineAtStartup =
+      !this.loadedStoredState && this.retiredBaselineText !== null
+        ? this.parse(this.retiredBaselineText)
+        : this.value;
     this.baselineTextAtStartup = this.serialize(this.baselineAtStartup);
     const disk = await this.readParsedFromDisk();
     let stale = false;
@@ -120,38 +129,36 @@ export abstract class StructuredDocument extends SyncedDoc {
     try {
       if (!this.startupReconciled) {
         const remote = this.value;
-        if (
-          this.diskAtStartup !== null &&
-          (this.localChangedAtStartup || this.forceBootstrapConflict)
-        ) {
-          const merge =
-            this.mergeWithoutSharedBaseline(this.diskAtStartup, remote) ??
-            (this.forceBootstrapConflict
-              ? {
-                  value: this.diskAtStartup,
-                  conflicted: this.serialize(this.diskAtStartup) !== this.serialize(remote),
-                }
-              : mergeStructuredStartupResult(this.baselineAtStartup, this.diskAtStartup, remote));
+        const disk = this.diskAtStartup;
+        if (disk !== null && (this.localChangedAtStartup || this.forceBootstrapConflict)) {
+          let merge = this.startupMerge(disk, remote);
           if (merge.conflicted) {
-            const preservedPath = await preserveTextConflict(
-              this.plugin,
-              this.path,
-              this.serialize(remote),
-              "remote",
-            );
-            new Notice(
-              `Realtime: merged "${this.path}" and preserved the conflicting remote version as "${preservedPath}".`,
-            );
+            // One recovery copy per remote version: a remote that keeps
+            // changing while this retries must not leave a trail of copies.
+            const remoteText = this.serialize(remote);
+            if (remoteText !== this.preservedStartupRemote) {
+              const preservedPath = await preserveTextConflict(
+                this.plugin,
+                this.path,
+                remoteText,
+                "remote",
+              );
+              this.preservedStartupRemote = remoteText;
+              new Notice(
+                `Realtime: merged "${this.path}" and preserved the conflicting remote version as "${preservedPath}".`,
+              );
+            }
             const latestDisk = await this.readParsedFromDisk();
             if (this.destroyed) return;
-            if (
-              latestDisk === null ||
-              this.serialize(latestDisk) !== this.serialize(this.diskAtStartup) ||
-              this.serialize(this.value) !== this.serialize(remote)
-            ) {
+            if (latestDisk === null || this.serialize(latestDisk) !== this.serialize(disk)) {
               this.diskAtStartup = latestDisk;
               return;
             }
+            // The remote may have moved on while the copy was written. Merge
+            // against it now, with no await before applying, rather than
+            // applying a merge that would revert those changes.
+            const current = this.value;
+            if (this.serialize(current) !== remoteText) merge = this.startupMerge(disk, current);
           }
           if (this.destroyed) return;
           this.applyValue(merge.value, DISK_ORIGIN);
@@ -184,6 +191,19 @@ export abstract class StructuredDocument extends SyncedDoc {
         window.setTimeout(() => void this.finishStartupReconcile(), 2_000);
       }
     }
+  }
+
+  /** The startup merge of local `disk` with `remote`, and whether they conflict. */
+  private startupMerge(
+    disk: JsonValue,
+    remote: JsonValue,
+  ): { value: JsonValue; conflicted: boolean } {
+    return (
+      this.mergeWithoutSharedBaseline(disk, remote) ??
+      (this.forceBootstrapConflict
+        ? { value: disk, conflicted: this.serialize(disk) !== this.serialize(remote) }
+        : mergeStructuredStartupResult(this.baselineAtStartup, disk, remote))
+    );
   }
 
   /**
@@ -436,13 +456,26 @@ export abstract class StructuredDocument extends SyncedDoc {
             return false;
           }
         }
-        await this.plugin.app.vault.modify(file, text);
+        const releaseWrite = this.plugin.vaultSync?.beginOwnWrite(file.path);
+        try {
+          await this.plugin.app.vault.modify(file, text);
+        } finally {
+          releaseWrite?.();
+        }
       } else {
         const path = normalizePath(this.path);
+        // Removed by the user before the initial sync finished: publish
+        // that rather than bring the file back.
+        if (this.plugin.vaultSync?.isPendingLocalRemoval(path)) return false;
         await ensureParentFolder(this.plugin.app, path);
         if (this.destroyed) return false;
         if (this.serialize(this.value) !== text) return false;
-        await this.plugin.app.vault.create(path, text);
+        const releaseWrite = this.plugin.vaultSync?.beginOwnWrite(path);
+        try {
+          await this.plugin.app.vault.create(path, text);
+        } finally {
+          releaseWrite?.();
+        }
       }
       if (this.destroyed) return false;
       this.noteDiskContent(text);

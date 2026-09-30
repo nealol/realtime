@@ -16,6 +16,7 @@ import {
   initials,
   type PresenceEntry,
 } from "../../src/presence";
+import { registerPresenceOwner } from "../../src/presenceOwners";
 
 function makeAwareness(): Awareness {
   const doc = new Y.Doc();
@@ -125,6 +126,32 @@ describe("markViewing", () => {
     expect(aw.getLocalState()?.viewing?.kind).toBe("canvas");
     releaseCanvas();
     expect(aw.getLocalState()?.viewing ?? null).toBeNull();
+  });
+});
+
+describe("presence holds", () => {
+  it("publishes an owned awareness only while some view holds it", () => {
+    const aw = makeAwareness();
+    const user = { name: "A" };
+    let holds = 0;
+    aw.setLocalState(null);
+    registerPresenceOwner(aw, {
+      holdPresence: () => {
+        if (holds++ === 0) aw.setLocalState({ user });
+        return () => {
+          if (--holds === 0) aw.setLocalState(null);
+        };
+      },
+    });
+
+    const first = markViewing(aw, "markdown");
+    expect(aw.getLocalState()).toEqual({ user, viewing: { kind: "markdown" } });
+    const second = markViewing(aw, "markdown");
+    first();
+    first();
+    expect(aw.getLocalState()?.viewing).toEqual({ kind: "markdown" });
+    second();
+    expect(aw.getLocalState()).toBeNull();
   });
 });
 

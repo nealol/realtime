@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use yrs::encoding::read::{Error, Read};
 use yrs::updates::decoder::{Decode, Decoder};
-use yrs::{Any, Doc, Transact, Update, ID};
+use yrs::updates::encoder::Encode;
+use yrs::{Any, DeleteSet, Doc, StateVector, Transact, Update, ID};
 
 struct SafeCursor<'a> {
     bytes: &'a [u8],
@@ -264,6 +265,22 @@ pub(crate) fn validate_update(bytes: &[u8]) -> Result<Update, Error> {
         Err(_) => Err(Error::Custom(
             "update panics when applied to an empty document".to_string(),
         )),
+    }
+}
+
+/// What a validated update carries, without integrating it anywhere: the
+/// upper bound of its block clocks and its delete set.
+pub(crate) fn update_contents(bytes: &[u8]) -> Result<(StateVector, DeleteSet), Error> {
+    let state_vector = validate_update(bytes)?.state_vector();
+    // A diff against the update's own clocks keeps none of its blocks, only
+    // the delete set. The bytes have just decoded safely, so yrs' own decoder
+    // sees valid strings; the panic guard covers anything else.
+    let own_clocks = state_vector.encode_v1();
+    let diff = std::panic::catch_unwind(|| yrs::diff_updates_v1(bytes, &own_clocks))
+        .unwrap_or(Err(Error::UnexpectedValue))?;
+    match diff.split_first() {
+        Some((0, delete_set)) => Ok((state_vector, decode_v1::<DeleteSet>(delete_set)?)),
+        _ => Err(Error::Custom("update diff retained blocks".to_string())),
     }
 }
 

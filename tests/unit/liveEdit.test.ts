@@ -65,6 +65,93 @@ describe("LiveEdit", () => {
     ydoc.destroy();
   });
 
+  it("merges text typed before the first sync with remote changes the sync delivered", async () => {
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("contents");
+    ytext.insert(0, "line one\nline two\n");
+    let resolveReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    let isReady = false;
+    bind.doc = {
+      path: "note.md",
+      ytext,
+      isCreator: false,
+      hasSyncedOnce: false,
+      isProviderOnline: true,
+      bindEditor: vi.fn(),
+      unbindEditor: vi.fn(),
+      whenReady: () => ready,
+      isReady: () => isReady,
+      isDestroyed: () => false,
+      onDestroy: () => () => {},
+      preserveSharedConflict: vi.fn(),
+    };
+
+    const editor = makeEditor("line one\nline two\n") as any;
+    const live = new LiveEditPluginValue(editor);
+    editor.setText("line one\nline two\nmy local line\n");
+    live.update({ docChanged: true, state: editor.state } as any);
+
+    // The first sync delivers a collaborator's paragraph meanwhile.
+    ytext.insert(0, "REMOTE PARAGRAPH\n");
+    bind.doc.hasSyncedOnce = true;
+    isReady = true;
+    resolveReady();
+    await Promise.resolve();
+
+    const merged = "REMOTE PARAGRAPH\nline one\nline two\nmy local line\n";
+    expect(ytext.toString()).toBe(merged);
+    expect(editor.state.doc.toString()).toBe(merged);
+    expect(bind.doc.preserveSharedConflict).not.toHaveBeenCalled();
+    live.destroy();
+    ydoc.destroy();
+  });
+
+  it("keeps overlapping pre-sync typing and preserves the shared version", async () => {
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("contents");
+    ytext.insert(0, "title\n");
+    let resolveReady!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    let isReady = false;
+    bind.doc = {
+      path: "note.md",
+      ytext,
+      isCreator: false,
+      hasSyncedOnce: true,
+      isProviderOnline: true,
+      bindEditor: vi.fn(),
+      unbindEditor: vi.fn(),
+      whenReady: () => ready,
+      isReady: () => isReady,
+      isDestroyed: () => false,
+      onDestroy: () => () => {},
+      preserveSharedConflict: vi.fn(async () => {}),
+    };
+
+    const editor = makeEditor("title\n") as any;
+    const live = new LiveEditPluginValue(editor);
+    editor.setText("title edited here\n");
+    live.update({ docChanged: true, state: editor.state } as any);
+    ydoc.transact(() => {
+      ytext.delete(0, ytext.length);
+      ytext.insert(0, "title edited remotely\n");
+    });
+    isReady = true;
+    resolveReady();
+    await Promise.resolve();
+
+    expect(ytext.toString()).toBe("title edited here\n");
+    expect(editor.state.doc.toString()).toBe("title edited here\n");
+    expect(bind.doc.preserveSharedConflict).toHaveBeenCalledWith("title edited remotely\n");
+    live.destroy();
+    ydoc.destroy();
+  });
+
   it("detaches from a destroyed document and rebinds before pushing edits", async () => {
     const oldYdoc = new Y.Doc();
     const oldYtext = oldYdoc.getText("contents");

@@ -12,9 +12,12 @@
 //! Wire frames mirror `src/sync/mux.ts` (ints are lib0 var-uints):
 //!   OPEN     = [1][channel][varString pathAndQuery]   client -> server
 //!   OPEN_OK  = [2][channel]                            server -> client
-//!   OPEN_ERR = [3][channel]                            server -> client
+//!   OPEN_ERR = [3][channel][reason]                    server -> client
 //!   DATA     = [4][channel][raw yjs bytes …]           both directions
 //!   CLOSE    = [5][channel]                            both directions
+//!
+//! OPEN_ERR's trailing reason is optional on the wire: clients that predate
+//! it stop reading after the channel id and treat every rejection alike.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -32,7 +35,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use url::Url;
 
-use crate::crdt::{read_varint, Attribution, CrdtConnection};
+use crate::crdt::{read_varint, Attribution, CrdtConnection, CrdtError};
 use crate::state::AppState;
 
 const FRAME_OPEN: u64 = 1;
@@ -45,6 +48,16 @@ const FRAME_PONG: u64 = 7;
 
 /// Channel id reserved for connection-level control frames (PING/PONG).
 const CONTROL_CHANNEL: u64 = 0;
+
+/// OPEN_ERR reasons. Admission pressure is the only one that should slow a
+/// client's other opens on this connection.
+const OPEN_ERR_REJECTED: u64 = 1;
+/// The token cannot open this document: unknown, expired (this process's
+/// grants are in memory), minted for another document, or naming an epoch the
+/// document is no longer at. A freshly minted token can succeed.
+const OPEN_ERR_TOKEN: u64 = 2;
+/// The document could not be opened right now; the same token may succeed later.
+const OPEN_ERR_UNAVAILABLE: u64 = 3;
 
 /// Outbound queue depth per direction; bounds memory if one side stalls.
 const CHANNEL_CAPACITY: usize = 16;
@@ -160,7 +173,7 @@ async fn handle(client: WebSocket, state: AppState) {
                             // Queued even when the outbound queue is full: a
                             // dropped OPEN_ERR leaves the client's channel
                             // waiting to open forever.
-                            let rejected = encode_simple(FRAME_OPEN_ERR, channel);
+                            let rejected = encode_open_err(channel, OPEN_ERR_REJECTED);
                             if !send_control(&out_tx, rejected, CONTROL_SEND_TIMEOUT).await {
                                 break;
                             }
@@ -287,11 +300,11 @@ async fn open_and_pump(
     out_tx: mpsc::Sender<Vec<u8>>,
 ) {
     let Some((document_id, token)) = parse_sync_target(&path_and_query) else {
-        let _ = out_tx.send(encode_simple(FRAME_OPEN_ERR, channel)).await;
+        let _ = out_tx.send(encode_open_err(channel, OPEN_ERR_TOKEN)).await;
         return;
     };
     let Some(grant) = state.sync_grant(&token, &document_id).await else {
-        let _ = out_tx.send(encode_simple(FRAME_OPEN_ERR, channel)).await;
+        let _ = out_tx.send(encode_open_err(channel, OPEN_ERR_TOKEN)).await;
         return;
     };
     let attribution = Arc::new(Attribution::new(
@@ -312,7 +325,13 @@ async fn open_and_pump(
         Ok(connection) => connection,
         Err(error) => {
             tracing::debug!("dmux: native document open failed: {error}");
-            let _ = out_tx.send(encode_simple(FRAME_OPEN_ERR, channel)).await;
+            let reason = match error {
+                CrdtError::EpochTransition { .. } | CrdtError::RetiredEpoch { .. } => {
+                    OPEN_ERR_TOKEN
+                }
+                _ => OPEN_ERR_UNAVAILABLE,
+            };
+            let _ = out_tx.send(encode_open_err(channel, reason)).await;
             return;
         }
     };
@@ -478,6 +497,13 @@ fn encode_simple(frame_type: u64, channel: u64) -> Vec<u8> {
     buf
 }
 
+/// OPEN_ERR with its reason code.
+fn encode_open_err(channel: u64, reason: u64) -> Vec<u8> {
+    let mut buf = encode_simple(FRAME_OPEN_ERR, channel);
+    write_varint(&mut buf, reason);
+    buf
+}
+
 fn encode_data(channel: u64, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(payload.len() + 4);
     write_varint(&mut buf, FRAME_DATA);
@@ -559,6 +585,19 @@ mod tests {
             parse_frame(&close),
             Some(Frame::Close { channel: 4 })
         ));
+    }
+
+    #[test]
+    fn open_err_carries_a_trailing_reason() {
+        let frame = encode_open_err(12, OPEN_ERR_TOKEN);
+        let (frame_type, rest) = read_varint(&frame).unwrap();
+        let (channel, rest) = read_varint(rest).unwrap();
+        let (reason, rest) = read_varint(rest).unwrap();
+        assert_eq!(
+            (frame_type, channel, reason),
+            (FRAME_OPEN_ERR, 12, OPEN_ERR_TOKEN)
+        );
+        assert!(rest.is_empty());
     }
 
     #[test]

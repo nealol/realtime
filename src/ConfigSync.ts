@@ -16,6 +16,11 @@ export interface ConfigMeta {
   hash: string;
   size: number;
   mtime: number;
+  /**
+   * The hash this version replaced (null for a new file); absent on entries
+   * from older clients. See `BinaryMeta.prev`.
+   */
+  prev?: string | null;
 }
 
 export type ConfigReconcileAction =
@@ -42,7 +47,12 @@ export function decideConfigReconcile(
   local: ConfigMeta | null,
   remote: ConfigMeta | null,
   base: string | null,
-  opts: { initialPull?: boolean; canMerge?: boolean } = {},
+  opts: {
+    initialPull?: boolean;
+    canMerge?: boolean;
+    /** The hash this device's last publish of the path replaced. */
+    replacedHash?: string | null;
+  } = {},
 ): ConfigReconcileAction {
   const localHash = local?.hash ?? null;
   const remoteHash = remote?.hash ?? null;
@@ -65,7 +75,15 @@ export function decideConfigReconcile(
     // newly joining device never clobbers the profile with its local defaults.
     if (base === null) return "download";
     if (base === remote.hash) return "upload";
-    if (base === local.hash) return "download";
+    if (base === local.hash) {
+      // A clean remote update only if the remote was built on our baseline:
+      // last-writer-wins may instead have kept a concurrent publish over ours.
+      const remotePrev = "prev" in remote ? (remote.prev ?? null) : undefined;
+      if (remotePrev === base) return "download";
+      // Still the version our last publish replaced: that publish was lost.
+      if (opts.replacedHash !== undefined && remote.hash === opts.replacedHash) return "upload";
+      if (remotePrev === undefined) return "download";
+    }
     if (opts.canMerge) return "merge";
     return local.mtime >= remote.mtime ? "upload" : "download";
   }
@@ -129,6 +147,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 const POLL_MS = 15_000;
 const RETRY_MS = 2_000;
 const RELOAD_NOTICE_DEBOUNCE_MS = 2_000;
+/**
+ * Reuse a file's hash while its size and mtime are unchanged, but re-read it
+ * this often anyway: some filesystems keep coarse mtimes, and a same-size
+ * rewrite within one tick would otherwise go unnoticed.
+ */
+const HASH_REVALIDATE_MS = 5 * 60_000;
+
+interface HashCacheEntry {
+  size: number;
+  mtime: number;
+  hash: string;
+  checkedAt: number;
+}
 
 export class ConfigSync {
   private plugin: RealtimePlugin;
@@ -137,6 +168,8 @@ export class ConfigSync {
   private localSyncState?: LocalSyncState;
   private enabledCategories = new Set<ConfigCategoryId>();
   private lastSyncedHash = new Map<string, string>();
+  /** Hashes of local config files by size+mtime, so each poll need not re-read them all. */
+  private hashCache = new Map<string, HashCacheEntry>();
   private chains = new Map<string, Promise<boolean>>();
   private writing = new Set<string>();
   private pollTimer: number | null = null;
@@ -341,6 +374,7 @@ export class ConfigSync {
     const action = decideConfigReconcile(local, remote, base, {
       initialPull: this.initialPull,
       canMerge: path.endsWith(".json"),
+      replacedHash: localState?.kind === "config" ? localState.replacedIdentity : undefined,
     });
     if (action === "none") {
       if (remote?.hash) {
@@ -355,8 +389,18 @@ export class ConfigSync {
       await this.download(path, remote, local?.hash ?? null, generation);
     } else if (action === "deleteLocal") await this.deleteLocal(path, generation);
     else if (action === "deleteRemote") this.publishDelete(path, generation);
-    else if (action === "merge" && local && remote)
-      await this.mergeConflict(path, local, remote, generation);
+    else if (action === "merge" && local && remote) {
+      // After a concurrent publish, `base` is this device's own (optimistic)
+      // publish; both versions were built on the one the remote replaced.
+      const concurrent = base === local.hash && remote.prev !== undefined && remote.prev !== base;
+      await this.mergeConflict(
+        path,
+        local,
+        remote,
+        generation,
+        concurrent ? remote.prev : undefined,
+      );
+    }
     return this.canApply(generation);
   }
 
@@ -383,14 +427,33 @@ export class ConfigSync {
 
   private async localInfo(path: string): Promise<ConfigMeta | null | undefined> {
     try {
-      if (!(await this.plugin.app.vault.adapter.exists(path))) return null;
-      const bytes = await this.plugin.app.vault.adapter.readBinary(path);
-      const stat = await this.plugin.app.vault.adapter.stat(path);
-      return {
-        hash: await sha256Hex(bytes),
-        size: bytes.byteLength,
-        mtime: stat?.mtime ?? Date.now(),
-      };
+      const adapter = this.plugin.app.vault.adapter;
+      if (!(await adapter.exists(path))) {
+        this.hashCache.delete(path);
+        return null;
+      }
+      const stat = await adapter.stat(path);
+      const now = Date.now();
+      const cached = this.hashCache.get(path);
+      if (
+        stat &&
+        cached &&
+        cached.size === stat.size &&
+        cached.mtime === stat.mtime &&
+        now - cached.checkedAt < HASH_REVALIDATE_MS
+      ) {
+        return { hash: cached.hash, size: cached.size, mtime: cached.mtime };
+      }
+      const bytes = await adapter.readBinary(path);
+      const hash = await sha256Hex(bytes);
+      const mtime = stat?.mtime ?? now;
+      if (stat && stat.size === bytes.byteLength) {
+        this.hashCache.set(path, { size: stat.size, mtime, hash, checkedAt: now });
+      } else {
+        // Changed while being read; do not cache a mismatched pair.
+        this.hashCache.delete(path);
+      }
+      return { hash, size: bytes.byteLength, mtime };
     } catch (e) {
       console.error(`[Realtime] failed to read config ${path}`, e);
       return undefined;
@@ -423,8 +486,10 @@ export class ConfigSync {
       if (!this.destroyed) void this.reconcile(path);
       return;
     }
-    const finalMeta =
-      meta && hash === meta.hash ? meta : { hash, size: bytes.byteLength, mtime: Date.now() };
+    const finalMeta: ConfigMeta = {
+      ...(meta && hash === meta.hash ? meta : { hash, size: bytes.byteLength, mtime: Date.now() }),
+      prev: expectedRemoteHash,
+    };
     if (!(await this.plugin.auth.blobExists(this.vaultId, path, finalMeta.hash))) {
       if (!this.canApply(generation)) {
         if (!this.destroyed) void this.reconcile(path);
@@ -448,7 +513,7 @@ export class ConfigSync {
     }
     this.indexDoc.transact(() => this.configFiles.set(path, finalMeta));
     this.lastSyncedHash.set(path, finalMeta.hash);
-    this.localSyncState?.markSynced(path, "config", finalMeta.hash, finalMeta.hash, true);
+    this.localSyncState?.markPublished(path, "config", finalMeta.hash, expectedRemoteHash);
     dbg("config uploaded+published", path, finalMeta.hash, finalMeta.size);
   }
 
@@ -498,6 +563,7 @@ export class ConfigSync {
         return;
       }
       await this.plugin.app.vault.adapter.writeBinary(path, bytes);
+      this.hashCache.delete(path);
       this.lastSyncedHash.set(path, meta.hash);
       this.localSyncState?.markSynced(path, "config", meta.hash, meta.hash, true);
       this.noteDownloaded(path);
@@ -520,6 +586,8 @@ export class ConfigSync {
     local: ConfigMeta,
     remote: ConfigMeta,
     generation = this.pauseGeneration,
+    /** Common ancestor when known to differ from the baseline; null: none (both created it). */
+    ancestorHash?: string | null,
   ): Promise<void> {
     let remoteBytes: ArrayBuffer;
     try {
@@ -541,7 +609,7 @@ export class ConfigSync {
     }
 
     const decoder = new TextDecoder();
-    const baseHash = this.lastSyncedHash.get(path);
+    const baseHash = ancestorHash === undefined ? this.lastSyncedHash.get(path) : ancestorHash;
     if (baseHash) {
       // Fetch the baseline by hash alone: a path-scoped request only serves
       // the hash the path currently maps to, which is the remote version.
@@ -622,6 +690,7 @@ export class ConfigSync {
         return;
       }
       await this.plugin.app.vault.adapter.writeBinary(path, buffer);
+      this.hashCache.delete(path);
     } finally {
       window.setTimeout(() => this.writing.delete(path), 0);
     }
@@ -653,6 +722,7 @@ export class ConfigSync {
           return;
         }
         await this.plugin.app.vault.adapter.remove(path);
+        this.hashCache.delete(path);
       }
       this.lastSyncedHash.delete(path);
       this.localSyncState?.remove(path);

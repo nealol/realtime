@@ -93,6 +93,35 @@ describe("YTextEditorBinding", () => {
     binding.destroy();
   });
 
+  it("merges text typed before readiness with remote changes instead of overwriting them", async () => {
+    const doc = new Y.Doc();
+    const ytext = doc.getText("text");
+    ytext.insert(0, "first\nsecond\n");
+    let resolveReady!: () => void;
+    const whenReady = new Promise<void>((resolve) => {
+      resolveReady = resolve;
+    });
+    let isReady = false;
+    const onConflict = vi.fn();
+    const adapter = editor("first\nsecond\n");
+    const binding = new YTextEditorBinding(adapter, ytext, {
+      whenReady: () => whenReady,
+      isReady: () => isReady,
+      mayPushToShared: () => true,
+      onConflict,
+    });
+    adapter.type("first\nsecond\nlocal\n");
+    ytext.insert(0, "remote\n");
+    isReady = true;
+    resolveReady();
+    await Promise.resolve();
+
+    expect(ytext.toString()).toBe("remote\nfirst\nsecond\nlocal\n");
+    expect(adapter.getText()).toBe("remote\nfirst\nsecond\nlocal\n");
+    expect(onConflict).not.toHaveBeenCalled();
+    binding.destroy();
+  });
+
   it("pulls remote text and removes listeners on destroy", async () => {
     const doc = new Y.Doc();
     const ytext = doc.getText("text");

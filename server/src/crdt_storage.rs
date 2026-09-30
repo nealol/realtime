@@ -116,10 +116,16 @@ impl DocumentPersistence {
 
     pub(crate) async fn append_update(&mut self, update: &[u8]) -> Result<(), StorageError> {
         if self.append_failed {
-            return corrupt(
-                &self.document_id,
-                "a prior append failed; reload the document before accepting more writes",
-            );
+            // A prior append may have left part of a record behind. Cut the
+            // segment back to its last durable length before appending again;
+            // the document stays loaded (and writable) once that succeeds.
+            if self.discard_partial_record().await.is_err() {
+                return corrupt(
+                    &self.document_id,
+                    "a prior append failed and its partial record could not be removed",
+                );
+            }
+            self.append_failed = false;
         }
         let record_len = self.record_len(update.len())?;
         if self
@@ -149,13 +155,29 @@ impl DocumentPersistence {
         }
         .await;
         if let Err(error) = result {
-            self.append_failed = true;
+            // Remove whatever part of this unacknowledged record reached the
+            // file so the next append cannot land behind a torn record. Only
+            // if that fails does the segment refuse writes until it succeeds.
+            if self.discard_partial_record().await.is_err() {
+                self.append_failed = true;
+            }
             return Err(StorageError::Io(error));
         }
         self.log_bytes = self.log_bytes.saturating_add(record.len() as u64);
         self.records = self.records.saturating_add(1);
         self.total_records = self.total_records.saturating_add(1);
         Ok(())
+    }
+
+    /// Truncate the update segment back to its last durable record boundary.
+    async fn discard_partial_record(&self) -> Result<(), std::io::Error> {
+        let path = self.directory.join(log_name(self.generation));
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .await?;
+        file.set_len(self.log_bytes).await?;
+        file.sync_all().await
     }
 
     pub(crate) fn requires_compaction(&self, update_bytes: usize) -> Result<bool, StorageError> {
@@ -509,13 +531,21 @@ async fn replay_log(
         offset += 8;
         let expected: [u8; 32] = bytes[offset..offset + 32].try_into().unwrap();
         offset += 32;
-        let Ok(length) = usize::try_from(length) else {
-            return corrupt(
-                document_id,
-                "update-record length does not fit this platform",
-            );
+        // A record that claims to run past the end of the segment (however
+        // large its garbled length) is an append the crash interrupted.
+        let end = usize::try_from(length)
+            .ok()
+            .and_then(|length| offset.checked_add(length))
+            .filter(|end| *end <= bytes.len());
+        let Some(end) = end else {
+            if mode == RecoveryMode::Inspect {
+                return corrupt(document_id, "truncated update-record payload");
+            }
+            truncate_log(&path, record_start as u64).await?;
+            repaired = true;
+            break;
         };
-        if length > MAX_UPDATE_BYTES {
+        if end - offset > MAX_UPDATE_BYTES {
             if mode == RecoveryMode::Repair {
                 truncate_log(&path, record_start as u64).await?;
                 repaired = true;
@@ -526,20 +556,15 @@ async fn replay_log(
                 format!("update record exceeds {MAX_UPDATE_BYTES} bytes"),
             );
         }
-        let Some(end) = offset.checked_add(length) else {
-            return corrupt(document_id, "update-record length overflow");
-        };
-        if end > bytes.len() {
-            if mode == RecoveryMode::Inspect {
-                return corrupt(document_id, "truncated update-record payload");
-            }
-            truncate_log(&path, record_start as u64).await?;
-            repaired = true;
-            break;
-        }
         let update = &bytes[offset..end];
         if checksum(update) != expected {
-            if mode == RecoveryMode::Repair {
+            // A tail that is all zeros is space a crash allocated before the
+            // append's data landed; no acknowledged record looks like that.
+            // Any other mismatch may be damage to acknowledged data.
+            let zero_tail = bytes[record_start..].iter().all(|byte| *byte == 0);
+            if mode == RecoveryMode::Repair
+                || (mode == RecoveryMode::RecoverInterruptedAppend && zero_tail)
+            {
                 truncate_log(&path, record_start as u64).await?;
                 repaired = true;
                 break;
@@ -1256,6 +1281,75 @@ mod tests {
         assert!(reloaded.persistence.recovered_tail);
         assert_eq!(tokio::fs::metadata(&log).await.unwrap().len(), valid_len);
         let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn failed_append_discards_its_partial_record_before_the_next_write() {
+        let root = temp_store();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut loaded = load_or_create(&root, "doc").await.unwrap();
+        apply(&mut loaded, &map_update("first", "kept")).await;
+
+        // An append failed after part of its record reached the segment, and
+        // truncating it at the time failed too, so the segment is latched.
+        let log = root.join("doc.crdt/updates-0.log");
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&log)
+            .await
+            .unwrap();
+        file.write_all(&[42; 23]).await.unwrap();
+        file.sync_all().await.unwrap();
+        drop(file);
+        loaded.persistence.append_failed = true;
+
+        // The next write repairs the segment instead of refusing forever.
+        loaded
+            .persistence
+            .append_update(&map_update("second", "kept"))
+            .await
+            .unwrap();
+        drop(loaded);
+
+        let reloaded = load_or_create(&root, "doc").await.unwrap();
+        assert!(!reloaded.persistence.recovered_tail);
+        assert_eq!(map_value(&reloaded.doc, "first").as_deref(), Some("kept"));
+        assert_eq!(map_value(&reloaded.doc, "second").as_deref(), Some("kept"));
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn zero_filled_and_overlong_tails_are_interrupted_appends() {
+        for tail in [vec![0u8; 96], {
+            // A garbled header whose length runs far past the end of the file.
+            let mut header = u64::MAX.to_le_bytes().to_vec();
+            header.extend_from_slice(&[7; 32]);
+            header.extend_from_slice(b"partial");
+            header
+        }] {
+            let root = temp_store();
+            tokio::fs::create_dir_all(&root).await.unwrap();
+            let mut loaded = load_or_create(&root, "doc").await.unwrap();
+            apply(&mut loaded, &map_update("kept", "yes")).await;
+            drop(loaded);
+
+            let log = root.join("doc.crdt/updates-0.log");
+            let valid_len = tokio::fs::metadata(&log).await.unwrap().len();
+            let mut file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&log)
+                .await
+                .unwrap();
+            file.write_all(&tail).await.unwrap();
+            file.sync_all().await.unwrap();
+            drop(file);
+
+            let reloaded = load_or_create(&root, "doc").await.unwrap();
+            assert_eq!(map_value(&reloaded.doc, "kept").as_deref(), Some("yes"));
+            assert!(reloaded.persistence.recovered_tail);
+            assert_eq!(tokio::fs::metadata(&log).await.unwrap().len(), valid_len);
+            let _ = tokio::fs::remove_dir_all(root).await;
+        }
     }
 
     #[tokio::test]

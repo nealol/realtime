@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { RealtimeClient, type VaultHandle } from "../../src/index";
+import { ConflictError, RealtimeClient, type VaultHandle } from "../../src/index";
 import { startAuthHarness, type AuthHarness } from "../support/harness";
 
 let harness: AuthHarness;
@@ -45,6 +45,26 @@ describe("attachments", () => {
     expect(await vault.attachments.exists("archive/pic.png")).toBe(false);
   });
 
+  it("refuses uploads whose precondition no longer holds", async () => {
+    const version = (tail: number) => new Uint8Array([...PNG_BYTES, tail]);
+    const first = await vault.attachments.upload("img/guarded.png", version(1), {
+      ifNoneMatch: "*",
+    });
+    await expect(
+      vault.attachments.upload("img/guarded.png", version(2), { ifNoneMatch: "*" }),
+    ).rejects.toThrow(ConflictError);
+
+    const second = await vault.attachments.upload("img/guarded.png", version(2), {
+      ifMatch: first.hash,
+    });
+    await expect(
+      vault.attachments.upload("img/guarded.png", version(3), { ifMatch: first.hash }),
+    ).rejects.toThrow(ConflictError);
+
+    const listed = (await vault.attachments.list()).find((a) => a.path === "img/guarded.png");
+    expect(listed?.hash).toBe(second.hash);
+  });
+
   it("mints public upload links", async () => {
     const link = await vault.attachments.createUploadLink({ landingDir: "inbox" });
     expect(link.uploadUrl).toContain("/upload");
@@ -79,7 +99,11 @@ describe("storage", () => {
     const usage = await vault.storage.usage();
     expect(usage.blobsCurrentBytes + usage.blobsPreviousBytes).toBeGreaterThan(0);
 
-    const gc = await vault.storage.gcBlobs();
+    // A fresh upload may be a publish still in flight: the default grace keeps it.
+    await vault.storage.gcBlobs();
+    expect(await vault.blobs.exists(hash)).toBe(true);
+
+    const gc = await vault.storage.gcBlobs({ minAgeSeconds: 0 });
     expect(gc.removed).toBeGreaterThanOrEqual(1);
     expect(await vault.blobs.exists(hash)).toBe(false);
   });

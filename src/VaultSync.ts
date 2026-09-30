@@ -8,7 +8,7 @@ import {
   SYNC_STATUS_ERROR,
   type SyncStatus,
 } from "./sync/RealtimeProvider";
-import { IndexeddbPersistence } from "y-indexeddb";
+import { IndexeddbPersistence, clearDocument } from "y-indexeddb";
 import { TFile, TAbstractFile, Notice, Platform, type EventRef } from "obsidian";
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./sync/clientToken";
@@ -29,6 +29,7 @@ export { isConflictCopy } from "./conflictRecovery";
 import { sha256Text } from "./hash";
 import { ensureParentFolder } from "./vaultHelpers";
 import { embeddedLinkpaths, resolveAttachmentLink } from "./noteAttachments";
+import { BootstrapEventLog } from "./bootstrapEvents";
 
 type FileKind = "text" | "structured" | "binary" | "ignore";
 type StructuredKind = "canvas" | "base";
@@ -38,6 +39,8 @@ interface QueueItem {
   guid: string;
   kind: QueueKind;
   reconnect?: boolean;
+  /** Content of the document this one replaces after an epoch change. */
+  retiredBaseline?: string | null;
 }
 interface StructuredMeta {
   guid: string;
@@ -169,17 +172,10 @@ export class VaultSync {
   private prioritizedGuids = new Set<string>();
   /** Monotonic per-path version used to abort stale async create/rename work. */
   private pathVersions = new Map<string, number>();
-  private bootstrapVaultEvents: Array<
-    | { type: "create" | "modify"; file: TAbstractFile; version: number }
-    | { type: "delete"; file: TAbstractFile; version: number }
-    | {
-        type: "rename";
-        file: TAbstractFile;
-        oldPath: string;
-        oldVersion: number;
-        newVersion: number;
-      }
-  > = [];
+  /** Net effect of the vault events captured before the initial sync. */
+  private bootstrapLog = new BootstrapEventLog();
+  /** Paths this plugin is writing; their vault events are not user edits. */
+  private ownWrites = new Map<string, number>();
   private remoteDeleteInFlight = new Set<string>();
   private remoteDeletePending = new Map<
     string,
@@ -241,10 +237,18 @@ export class VaultSync {
       () => getClientToken(plugin, vaultId, undefined, indexEpoch),
       { connect: false, socketFactory: createMuxSocket },
     );
+    // Nobody views the index: publishing presence on it is pure overhead.
+    this.indexProvider.awareness.setLocalState(null);
     this.indexPersistence = new IndexeddbPersistence(
       epochPersistenceName(plugin, vaultId, `realtime:index:${localScope}`, indexEpoch),
       this.indexDoc,
     );
+    if (indexEpoch > 0) {
+      // A retired epoch's index store is never read again.
+      void clearDocument(
+        epochPersistenceName(plugin, vaultId, `realtime:index:${localScope}`, indexEpoch - 1),
+      ).catch(() => {});
+    }
 
     this.filesObserver = this.onFilesChanged.bind(this);
     this.files.observe(this.filesObserver);
@@ -359,6 +363,43 @@ export class VaultSync {
     }
   }
 
+  /**
+   * Mark a vault write the plugin itself is about to make at `path`, so the
+   * resulting vault event is not taken for a user edit. Call the returned
+   * function once the write settles.
+   */
+  beginOwnWrite(path: string): () => void {
+    this.ownWrites.set(path, (this.ownWrites.get(path) ?? 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      // Release on the next tick so the write's own vault event is still ours.
+      window.setTimeout(() => {
+        const count = (this.ownWrites.get(path) ?? 1) - 1;
+        if (count > 0) this.ownWrites.set(path, count);
+        else this.ownWrites.delete(path);
+      }, 0);
+    };
+  }
+
+  private isOwnWrite(path: string): boolean {
+    return (
+      this.ownWrites.has(path) ||
+      this.remoteDeletesApplying.has(path) ||
+      this.binarySync.isWriting(path)
+    );
+  }
+
+  /**
+   * The user deleted or moved away the file at `path` before the initial
+   * sync finished: restoring it from the index must wait for that change to
+   * be published instead of undoing it.
+   */
+  isPendingLocalRemoval(path: string): boolean {
+    return this.bootstrapLog.removed(path);
+  }
+
   noteMaterialized(path: string, kind: MaterializedKind, identity?: string): void {
     if (identity) this.localSyncState.commit(path, kind, identity);
     else this.localSyncState.mark(path, kind);
@@ -383,6 +424,12 @@ export class VaultSync {
   ): void {
     if (this.destroyed) return;
     this.localSyncState.markDisk(path, kind, identity, fingerprint);
+  }
+
+  /** Fingerprint of the content the server last acknowledged for `identity` at `path`. */
+  acknowledgedFingerprint(path: string, identity: string): string | null {
+    if (this.destroyed) return null;
+    return this.localSyncState.acknowledgedFingerprint(path, identity);
   }
 
   /** Fingerprint of disk content the document for `identity` last contained. */
@@ -487,14 +534,16 @@ export class VaultSync {
     const guid = documentId.slice(prefix.length);
     for (const [path, doc] of [...this.documents]) {
       if (doc.guid !== guid) continue;
-      this.removeDocument(path);
-      this.enqueueDoc({ path, guid, kind: "text" }, true);
+      const retiredBaseline = doc.retiredBaseline();
+      this.removeDocument(path, { clearLocalStore: true });
+      this.enqueueDoc({ path, guid, kind: "text", retiredBaseline }, true);
     }
     for (const [path, doc] of [...this.structuredDocuments]) {
       if (doc.guid !== guid) continue;
       const kind: StructuredKind = doc instanceof CanvasDocument ? "canvas" : "base";
-      this.removeStructuredDocument(path);
-      this.enqueueDoc({ path, guid, kind }, true);
+      const retiredBaseline = doc.retiredBaseline();
+      this.removeStructuredDocument(path, { clearLocalStore: true });
+      this.enqueueDoc({ path, guid, kind, retiredBaseline }, true);
     }
     this.pumpDocQueue();
   }
@@ -806,7 +855,10 @@ export class VaultSync {
     const priorityPaths = this.startupPriorityPaths();
 
     // Register entries that already exist in the shared index, but connect lazily.
+    // A path the user removed during startup is left alone: materializing it
+    // would undo the delete or rename the replay is about to publish.
     for (const [path, guid] of this.files.entries()) {
+      if (this.bootstrapLog.removed(path)) continue;
       this.registerFile(path, guid);
       this.enqueueDoc(
         { path, guid, kind: "text" },
@@ -818,6 +870,7 @@ export class VaultSync {
         console.warn(`[Realtime] ignoring malformed structured index entry for ${path}`);
         continue;
       }
+      if (this.bootstrapLog.removed(path)) continue;
       this.registerFile(path, meta.guid);
       this.enqueueDoc(
         { path, guid: meta.guid, kind: meta.kind },
@@ -831,6 +884,15 @@ export class VaultSync {
       if (!this.localFileExists(path)) continue;
       const pathVersion = this.currentPathVersion(path);
       if (isConflictCopy(path)) continue;
+      // Renamed here from a tracked path during startup: the replay moves
+      // that identity over; publishing it as new now would orphan it.
+      const renamedFrom = this.bootstrapLog.renamedFrom(path);
+      if (
+        renamedFrom !== null &&
+        (this.files.has(renamedFrom) || this.structured.has(renamedFrom))
+      ) {
+        continue;
+      }
       const kind = this.classify(file);
       if (kind === "text") {
         if (!this.localSyncState.has(path)) {
@@ -849,14 +911,10 @@ export class VaultSync {
           const guid = this.localSyncState.candidateIdentity(path, structuredKind) ?? newGuid();
           this.localSyncState.beginCandidate(path, structuredKind, guid);
           const doc = this.ensureStructuredDocument(path, guid, structuredKind, true);
-          await doc.whenReady();
+          await this.publishWhenReady(doc, () =>
+            this.publishLocalStructured(path, pathVersion, doc, guid, structuredKind),
+          );
           if (this.destroyed) return;
-          if (!this.canPublishLocalPath(path, pathVersion, doc)) continue;
-          this.indexDoc.transact(() => {
-            this.structured.set(path, { guid, kind: structuredKind });
-          });
-          this.localSyncState.commit(path, structuredKind, guid);
-          this.registerFile(path, guid);
         } else {
           const meta = this.structured.get(path);
           if (!isStructuredMeta(meta)) continue;
@@ -869,14 +927,8 @@ export class VaultSync {
         const guid = this.localSyncState.candidateIdentity(path, "text") ?? newGuid();
         this.localSyncState.beginCandidate(path, "text", guid);
         const doc = this.ensureDocument(path, guid, true);
-        await doc.whenReady();
+        await this.publishWhenReady(doc, () => this.publishLocalText(path, pathVersion, doc, guid));
         if (this.destroyed) return;
-        if (!this.canPublishLocalPath(path, pathVersion, doc)) continue;
-        this.indexDoc.transact(() => {
-          this.files.set(path, guid);
-        });
-        this.localSyncState.commit(path, "text", guid);
-        this.registerFile(path, guid);
       } else {
         this.registerFile(path, this.files.get(path)!);
         this.enqueueDoc(
@@ -1104,8 +1156,15 @@ export class VaultSync {
       this.docQueue.delete(path);
       const doc =
         item.kind === "text"
-          ? this.ensureDocument(item.path, item.guid, false, false)
-          : this.ensureStructuredDocument(item.path, item.guid, item.kind, false, false);
+          ? this.ensureDocument(item.path, item.guid, false, false, item.retiredBaseline)
+          : this.ensureStructuredDocument(
+              item.path,
+              item.guid,
+              item.kind,
+              false,
+              false,
+              item.retiredBaseline,
+            );
       this.activeDocConnections++;
       const generation = this.docConnectionGeneration;
       const completion =
@@ -1235,7 +1294,7 @@ export class VaultSync {
     event.changes.keys.forEach((change, path) => {
       if (change.action === "add" || change.action === "update") {
         const guid = this.files.get(path);
-        if (guid) {
+        if (guid && !this.bootstrapLog.removed(path)) {
           this.remoteDeletePreserved.delete(path);
           this.registerFile(path, guid);
           this.enqueueDoc(
@@ -1261,7 +1320,7 @@ export class VaultSync {
     event.changes.keys.forEach((change, path) => {
       if (change.action === "add" || change.action === "update") {
         const meta = this.structured.get(path);
-        if (isStructuredMeta(meta)) {
+        if (isStructuredMeta(meta) && !this.bootstrapLog.removed(path)) {
           this.remoteDeletePreserved.delete(path);
           this.registerFile(path, meta.guid);
           this.enqueueDoc(
@@ -1365,8 +1424,9 @@ export class VaultSync {
       }
 
       if (this.destroyed || wasReintroduced()) return;
-      this.removeDocument(path);
-      this.removeStructuredDocument(path);
+      const clearLocalStore = this.deletedStoreDisposable(path);
+      this.removeDocument(path, { clearLocalStore });
+      this.removeStructuredDocument(path, { clearLocalStore });
       const current = this.plugin.app.vault.getAbstractFileByPath(path);
       if (current instanceof TFile) {
         if (this.destroyed || wasReintroduced()) return;
@@ -1477,20 +1537,17 @@ export class VaultSync {
     guid: string,
     isCreator: boolean,
     autoConnect = true,
+    retiredBaseline: string | null = null,
   ): Document {
     const existing = this.documents.get(path);
     if (existing && existing.guid === guid) return existing;
     if (existing) this.removeDocument(path);
 
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
-    const doc = new Document(
-      this.plugin,
-      path,
-      guid,
-      serverDocId,
-      isCreator,
-      this.bootstrapOptions(path, guid, autoConnect),
-    );
+    const doc = new Document(this.plugin, path, guid, serverDocId, isCreator, {
+      ...this.bootstrapOptions(path, guid, autoConnect),
+      retiredBaseline,
+    });
     this.documents.set(path, doc);
     this.plugin.applyAwarenessTo(doc);
     this.scheduleMobileWorkingSetTrim(1_000);
@@ -1518,18 +1575,53 @@ export class VaultSync {
     };
   }
 
+  /**
+   * Publish a new local file's index entry once its creator document is
+   * ready. Waits at most QUEUE_SLOT_TIMEOUT_MS: a document that cannot
+   * connect (it keeps retrying on its own, e.g. at the server's document
+   * quota) must not hold up the bootstrap or every file after it. It then
+   * publishes whenever it does become ready. `publish` must re-check that
+   * publishing is still wanted; it may run long after the caller moved on.
+   */
+  private async publishWhenReady(doc: SyncedDoc, publish: () => void): Promise<void> {
+    let timer = 0;
+    const timedOut = new Promise<false>((resolve) => {
+      timer = window.setTimeout(() => resolve(false), QUEUE_SLOT_TIMEOUT_MS);
+    });
+    const ready = doc.whenReady().then(() => true as const);
+    const inTime = await Promise.race([ready, timedOut]);
+    window.clearTimeout(timer);
+    if (inTime) publish();
+    else void ready.then(() => publish());
+  }
+
   /** Best-effort: keep the server's guid → path registry current (for ACLs). */
   private registerFile(path: string, guid: string): void {
     void this.plugin.auth.registerFile(this.plugin.settings.activeVaultId, guid, path);
   }
 
-  private removeDocument(path: string): void {
+  private removeDocument(path: string, options: { clearLocalStore?: boolean } = {}): void {
     const doc = this.documents.get(path);
     if (doc) {
-      doc.destroy();
       this.documents.delete(path);
+      doc.destroy({ clearLocalStore: options.clearLocalStore && !this.hasResidentGuid(doc.guid) });
     }
     this.mobileLastUsedAt?.delete(path);
+  }
+
+  /** Whether another resident document (e.g. at a second path) uses `guid`'s store. */
+  private hasResidentGuid(guid: string): boolean {
+    return this.allDocuments().some((doc) => doc.guid === guid);
+  }
+
+  /**
+   * The local store of a document whose file is being deleted is only worth
+   * keeping while it holds changes the server never acknowledged (restoring
+   * the file from the trash on this device would then upload them).
+   */
+  private deletedStoreDisposable(path: string): boolean {
+    const doc = this.documents.get(path) ?? this.structuredDocuments.get(path);
+    return doc !== undefined && !doc.provider.hasLocalChanges;
   }
 
   private ensureStructuredDocument(
@@ -1538,13 +1630,14 @@ export class VaultSync {
     kind: StructuredKind,
     isCreator: boolean,
     autoConnect = true,
+    retiredBaseline: string | null = null,
   ): StructuredDocument {
     const existing = this.structuredDocuments.get(path);
     if (existing && existing.guid === guid) return existing;
     if (existing) this.removeStructuredDocument(path);
 
     const serverDocId = `${this.plugin.settings.activeVaultId}__${guid}`;
-    const options = this.bootstrapOptions(path, guid, autoConnect);
+    const options = { ...this.bootstrapOptions(path, guid, autoConnect), retiredBaseline };
     const doc =
       kind === "canvas"
         ? new CanvasDocument(this.plugin, path, guid, serverDocId, isCreator, options)
@@ -1555,11 +1648,14 @@ export class VaultSync {
     return doc;
   }
 
-  private removeStructuredDocument(path: string): void {
+  private removeStructuredDocument(
+    path: string,
+    options: { clearLocalStore?: boolean } = {},
+  ): void {
     const doc = this.structuredDocuments.get(path);
     if (doc) {
-      doc.destroy();
       this.structuredDocuments.delete(path);
+      doc.destroy({ clearLocalStore: options.clearLocalStore && !this.hasResidentGuid(doc.guid) });
     }
     this.mobileLastUsedAt?.delete(path);
   }
@@ -1713,10 +1809,10 @@ export class VaultSync {
   }
 
   private onLocalCreate(file: TAbstractFile): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.isOwnWrite(file.path)) return;
     if (!this.initialSynced) {
-      const version = this.bumpPathVersion(file.path);
-      this.bootstrapVaultEvents.push({ type: "create", file, version });
+      this.bumpPathVersion(file.path);
+      this.bootstrapLog.create(file.path, file);
       return;
     }
     void this.handleLocalCreate(file);
@@ -1726,6 +1822,9 @@ export class VaultSync {
     if (this.destroyed || !this.initialSynced) return;
     const path = file.path;
     const pathVersion = this.bumpPathVersion(path);
+    // Created and then removed again before this ran (e.g. within one
+    // offline session): there is nothing left to publish.
+    if (file instanceof TFile && !this.localFileExists(path)) return;
     const kind = this.classify(file);
     if (kind === "text" && file instanceof TFile) {
       if (!this.localSyncState.has(path)) {
@@ -1770,14 +1869,9 @@ export class VaultSync {
       const guid = this.localSyncState.candidateIdentity(path, structuredKind) ?? newGuid();
       this.localSyncState.beginCandidate(path, structuredKind, guid);
       const doc = this.ensureStructuredDocument(path, guid, structuredKind, true);
-      await doc.whenReady();
-      if (this.destroyed) return;
-      if (!this.canPublishLocalPath(path, pathVersion, doc)) return;
-      this.indexDoc.transact(() => {
-        this.structured.set(path, { guid, kind: structuredKind });
-      });
-      this.localSyncState.commit(path, structuredKind, guid);
-      this.registerFile(path, guid);
+      await this.publishWhenReady(doc, () =>
+        this.publishLocalStructured(path, pathVersion, doc, guid, structuredKind),
+      );
       return;
     }
     if (kind !== "text") return;
@@ -1790,11 +1884,14 @@ export class VaultSync {
     const guid = this.localSyncState.candidateIdentity(path, "text") ?? newGuid();
     this.localSyncState.beginCandidate(path, "text", guid);
     const doc = this.ensureDocument(path, guid, true);
-    await doc.whenReady();
-    if (this.destroyed) return;
-    if (!this.canPublishLocalPath(path, pathVersion, doc)) return;
     // Publish the index entry only after the creator's file doc has seeded and
     // synced, so peers do not materialize an empty remote-created note.
+    await this.publishWhenReady(doc, () => this.publishLocalText(path, pathVersion, doc, guid));
+  }
+
+  /** Publish a new local note's index entry, unless something changed the path meanwhile. */
+  private publishLocalText(path: string, pathVersion: number, doc: Document, guid: string): void {
+    if (this.destroyed || !this.canPublishLocalPath(path, pathVersion, doc)) return;
     this.indexDoc.transact(() => {
       this.files.set(path, guid);
     });
@@ -1802,19 +1899,39 @@ export class VaultSync {
     this.registerFile(path, guid);
   }
 
+  /** Publish a new local Canvas/Base's index entry (see {@link publishLocalText}). */
+  private publishLocalStructured(
+    path: string,
+    pathVersion: number,
+    doc: StructuredDocument,
+    guid: string,
+    kind: StructuredKind,
+  ): void {
+    if (this.destroyed || !this.canPublishLocalPath(path, pathVersion, doc)) return;
+    this.indexDoc.transact(() => {
+      this.structured.set(path, { guid, kind });
+    });
+    this.localSyncState.commit(path, kind, guid);
+    this.registerFile(path, guid);
+  }
+
   private onLocalDelete(file: TAbstractFile): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.isOwnWrite(file.path)) return;
     if (!this.initialSynced) {
-      const version = this.bumpPathVersion(file.path);
-      this.bootstrapVaultEvents.push({ type: "delete", file, version });
+      this.bumpPathVersion(file.path);
+      this.bootstrapLog.delete(file.path);
       return;
     }
-    const path = file.path;
-    if (this.remoteDeletesApplying.has(path)) return;
+    this.applyLocalDeletion(file.path);
+  }
+
+  /** Publish the user's deletion of the file at `path`. */
+  private applyLocalDeletion(path: string): void {
     this.localSyncState.remove(path);
     this.bumpPathVersion(path);
+    const clearLocalStore = this.deletedStoreDisposable(path);
     if (this.documents.has(path) || this.files.has(path)) {
-      this.removeDocument(path);
+      this.removeDocument(path, { clearLocalStore });
       if (this.files.has(path)) {
         const guid = this.files.get(path)!;
         this.indexDoc.transact(() => {
@@ -1825,7 +1942,7 @@ export class VaultSync {
       return;
     }
     if (this.structuredDocuments.has(path) || this.structured.has(path)) {
-      this.removeStructuredDocument(path);
+      this.removeStructuredDocument(path, { clearLocalStore });
       if (this.structured.has(path)) {
         const meta = this.structured.get(path);
         if (!isStructuredMeta(meta)) return;
@@ -1847,9 +1964,9 @@ export class VaultSync {
       return;
     }
     if (!this.initialSynced) {
-      const oldVersion = this.bumpPathVersion(oldPath);
-      const newVersion = this.bumpPathVersion(file.path);
-      this.bootstrapVaultEvents.push({ type: "rename", file, oldPath, oldVersion, newVersion });
+      this.bumpPathVersion(oldPath);
+      this.bumpPathVersion(file.path);
+      this.bootstrapLog.rename(oldPath, file.path, file);
       return;
     }
     void this.handleLocalRename(file, oldPath);
@@ -1893,20 +2010,24 @@ export class VaultSync {
     if (kind === "text") {
       const finalGuid = guid ?? newGuid();
       const doc = this.ensureDocument(newPath, finalGuid, !wasTracked);
+      const publish = () => {
+        this.indexDoc.transact(() => {
+          if (wasTracked) this.files.delete(oldPath);
+          if (wasStructuredTracked) this.structured.delete(oldPath);
+          this.files.set(newPath, finalGuid);
+        });
+        this.registerFile(newPath, finalGuid);
+      };
       if (!wasTracked) {
         if (wasStructuredTracked) {
           this.indexDoc.transact(() => this.structured.delete(oldPath));
         }
-        await doc.whenReady();
-        if (this.destroyed) return;
-        if (!this.canPublishLocalPath(newPath, newPathVersion, doc)) return;
+        await this.publishWhenReady(doc, () => {
+          if (!this.destroyed && this.canPublishLocalPath(newPath, newPathVersion, doc)) publish();
+        });
+        return;
       }
-      this.indexDoc.transact(() => {
-        if (wasTracked) this.files.delete(oldPath);
-        if (wasStructuredTracked) this.structured.delete(oldPath);
-        this.files.set(newPath, finalGuid);
-      });
-      this.registerFile(newPath, finalGuid);
+      publish();
     } else if (kind === "structured") {
       const structuredKind = this.structuredKindForExtension(file.extension);
       if (!structuredKind) {
@@ -1925,6 +2046,14 @@ export class VaultSync {
         structuredKind,
         !wasStructuredTracked,
       );
+      const publish = () => {
+        this.indexDoc.transact(() => {
+          if (wasTracked) this.files.delete(oldPath);
+          if (wasStructuredTracked) this.structured.delete(oldPath);
+          this.structured.set(newPath, { guid: finalGuid, kind: structuredKind });
+        });
+        this.registerFile(newPath, finalGuid);
+      };
       if (!wasStructuredTracked) {
         if (wasTracked) {
           this.indexDoc.transact(() => {
@@ -1932,16 +2061,12 @@ export class VaultSync {
             this.files.delete(oldPath);
           });
         }
-        await doc.whenReady();
-        if (this.destroyed) return;
-        if (!this.canPublishLocalPath(newPath, newPathVersion, doc)) return;
+        await this.publishWhenReady(doc, () => {
+          if (!this.destroyed && this.canPublishLocalPath(newPath, newPathVersion, doc)) publish();
+        });
+        return;
       }
-      this.indexDoc.transact(() => {
-        if (wasTracked) this.files.delete(oldPath);
-        if (wasStructuredTracked) this.structured.delete(oldPath);
-        this.structured.set(newPath, { guid: finalGuid, kind: structuredKind });
-      });
-      this.registerFile(newPath, finalGuid);
+      publish();
     } else if (kind === "binary") {
       if (wasTracked || wasStructuredTracked) {
         this.indexDoc.transact(() => {
@@ -1975,8 +2100,10 @@ export class VaultSync {
       this.prioritizeOpenNoteAttachments();
     }
     if (!this.initialSynced) {
-      const version = this.bumpPathVersion(file.path);
-      this.bootstrapVaultEvents.push({ type: "modify", file, version });
+      // An edit does not change which files exist, so it neither bumps the
+      // path version nor supersedes the create or rename that brought the
+      // file here; the replay folds it in after those.
+      if (!this.isOwnWrite(file.path)) this.bootstrapLog.modify(file.path, file);
       return;
     }
     const kind = this.classify(file);
@@ -2014,41 +2141,44 @@ export class VaultSync {
     }
   }
 
+  /**
+   * Publish what the user did to the vault before the initial sync finished,
+   * as its net effect (see {@link BootstrapEventLog}). A step that fails is
+   * logged and skipped rather than dropping every step after it.
+   */
   private async replayBootstrapVaultEvents(): Promise<void> {
     this.initialSynced = true;
-    while (!this.destroyed && this.bootstrapVaultEvents.length > 0) {
-      const events = this.bootstrapVaultEvents.splice(0);
-      for (const event of events) {
+    const log = this.bootstrapLog;
+    try {
+      for (const step of log.plan()) {
         if (this.destroyed) return;
-        if (
-          event.type !== "rename" &&
-          this.currentPathVersion(event.file.path) !== event.version &&
-          event.type !== "create"
-        ) {
-          continue;
-        }
-        if (
-          event.type === "rename" &&
-          (this.currentPathVersion(event.oldPath) !== event.oldVersion ||
-            this.currentPathVersion(event.file.path) !== event.newVersion)
-        ) {
-          continue;
-        }
-        switch (event.type) {
-          case "create":
-            await this.handleLocalCreate(event.file);
-            break;
-          case "delete":
-            this.onLocalDelete(event.file);
-            break;
-          case "rename":
-            await this.handleLocalRename(event.file, event.oldPath);
-            break;
-          case "modify":
-            this.onLocalModify(event.file);
-            break;
+        try {
+          switch (step.type) {
+            case "delete":
+              this.applyLocalDeletion(step.path);
+              break;
+            case "rename":
+              // A rename from a path the index never tracked is just a new file.
+              if (this.files.has(step.from) || this.structured.has(step.from)) {
+                await this.handleLocalRename(step.file, step.from);
+              } else {
+                await this.handleLocalCreate(step.file);
+              }
+              break;
+            case "create":
+              await this.handleLocalCreate(step.file);
+              break;
+            case "modify":
+              this.onLocalModify(step.file);
+              break;
+          }
+        } catch (error) {
+          console.error(`[Realtime] failed to publish a startup ${step.type}`, error);
         }
       }
+    } finally {
+      // Events arriving from here on are handled live; nothing is withheld.
+      if (this.bootstrapLog === log) this.bootstrapLog = new BootstrapEventLog();
     }
   }
 
@@ -2144,7 +2274,14 @@ export class VaultSync {
 
     if (value.kind === "binary") {
       if (!value.hash) throw new Error("Trash entry is missing its attachment data.");
-      this.binarySync.restoreEntry(path, value.hash, value.size ?? 0);
+      if (!(await this.binarySync.restoreEntry(path, value.hash, value.size ?? 0))) {
+        // Storage cleanup reclaimed the bytes: restoring would publish an
+        // attachment every device then fails to download forever.
+        this.indexDoc.transact(() => this.trash.delete(id));
+        throw new Error(
+          `The contents of "${value.path}" were removed by storage cleanup and cannot be restored.`,
+        );
+      }
     } else if (value.kind === "text") {
       if (!value.guid) throw new Error("Trash entry is missing its document id.");
       const guid = value.guid;
@@ -2174,7 +2311,7 @@ export class VaultSync {
     if (!value) return;
     if (value.kind === "binary" && value.hash && !this.binarySync.hasHash(value.hash)) {
       try {
-        await this.plugin.auth.deleteBlob(this.plugin.settings.activeVaultId, value.hash);
+        await this.plugin.auth.deleteBlob(this.plugin.settings.activeVaultId, value.hash, id);
       } catch (e) {
         console.error(`[Realtime] failed to delete blob for trashed ${value.path}`, e);
       }

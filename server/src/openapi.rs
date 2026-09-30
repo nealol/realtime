@@ -174,13 +174,13 @@ async fn oauth_authorization_server() {}
 #[utoipa::path(get, path = "/api/vaults/{id}/canvases", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Canvas list")))]
 async fn list_canvases() {}
 
-#[utoipa::path(get, put, delete, path = "/api/vaults/{id}/canvas/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Canvas document")))]
+#[utoipa::path(get, put, delete, path = "/api/vaults/{id}/canvas/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Canvas document, with `valueHash` for `If-Match` on a later replace")))]
 async fn read_canvas() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/canvases", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Created Canvas")))]
 async fn create_canvas() {}
 
-#[utoipa::path(put, path = "/api/vaults/{id}/canvas/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Replaced Canvas")))]
+#[utoipa::path(put, path = "/api/vaults/{id}/canvas/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path), ("If-Match" = Option<String>, Header, description = "valueHash from an earlier read; the write is refused if the Canvas changed since")), responses((status = 200, description = "Replaced Canvas"), (status = 409, description = "Stale If-Match")))]
 async fn replace_canvas() {}
 
 #[utoipa::path(delete, path = "/api/vaults/{id}/canvas/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Deleted Canvas")))]
@@ -195,19 +195,19 @@ async fn canvas_edges() {}
 #[utoipa::path(post, path = "/api/vaults/{id}/canvas-operations/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = crate::structured::CanvasOperationBatchBody, responses((status = 200, description = "Atomically applied Canvas operation batch"), (status = 400, description = "Invalid Canvas operation"), (status = 409, description = "Canvas operation conflict")))]
 async fn canvas_operations() {}
 
-#[utoipa::path(post, path = "/api/vaults/{id}/canvas-moves/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Moved Canvas")))]
+#[utoipa::path(post, path = "/api/vaults/{id}/canvas-moves/{path}", tag = "canvas", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Moved Canvas"), (status = 409, description = "Target path exists")))]
 async fn move_canvas() {}
 
 #[utoipa::path(get, path = "/api/vaults/{id}/bases", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Base list")))]
 async fn list_bases() {}
 
-#[utoipa::path(get, put, delete, path = "/api/vaults/{id}/base/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base document")))]
+#[utoipa::path(get, put, delete, path = "/api/vaults/{id}/base/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base document, with `valueHash` for `If-Match` on a later replace")))]
 async fn read_base() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/bases", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path)), responses((status = 200, description = "Created Base")))]
 async fn create_base() {}
 
-#[utoipa::path(put, path = "/api/vaults/{id}/base/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Replaced Base")))]
+#[utoipa::path(put, path = "/api/vaults/{id}/base/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path), ("If-Match" = Option<String>, Header, description = "valueHash from an earlier read; the write is refused if the Base changed since")), responses((status = 200, description = "Replaced Base"), (status = 409, description = "Stale If-Match")))]
 async fn replace_base() {}
 
 #[utoipa::path(delete, path = "/api/vaults/{id}/base/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Deleted Base")))]
@@ -228,7 +228,7 @@ async fn base_formulas() {}
 #[utoipa::path(put, delete, path = "/api/vaults/{id}/base-properties/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Base properties")))]
 async fn base_properties() {}
 
-#[utoipa::path(post, path = "/api/vaults/{id}/base-moves/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Moved Base")))]
+#[utoipa::path(post, path = "/api/vaults/{id}/base-moves/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Moved Base"), (status = 409, description = "Target path exists")))]
 async fn move_base() {}
 
 #[utoipa::path(post, path = "/oauth/register", tag = "oauth", request_body = Object, responses((status = 200, description = "Dynamic client registration response"), (status = 400, description = "Invalid registration")))]
@@ -315,7 +315,7 @@ async fn clear_fts_and_reindex() {}
 #[utoipa::path(get, path = "/api/vaults/{id}/notes/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path, description = "Wildcard note path")), responses((status = 200, description = "Note content"), (status = 404, description = "Not found")))]
 async fn read_note() {}
 
-#[utoipa::path(put, path = "/api/vaults/{id}/notes/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = Object, responses((status = 200, description = "Replaced note")))]
+#[utoipa::path(put, path = "/api/vaults/{id}/notes/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body(content = Object, description = "`{ content, expectedContentHash? }`; `expectedContentHash` is the lowercase hex SHA-256 of the content the replacement was based on"), responses((status = 200, description = "Replaced note"), (status = 409, description = "The note changed since `expectedContentHash`")))]
 async fn replace_note() {}
 
 #[utoipa::path(patch, path = "/api/vaults/{id}/notes/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = Object, responses((status = 200, description = "Patched note"), (status = 409, description = "Ambiguous or no-op patch")))]
@@ -324,7 +324,7 @@ async fn patch_note() {}
 #[utoipa::path(delete, path = "/api/vaults/{id}/notes/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Deleted note")))]
 async fn delete_note() {}
 
-#[utoipa::path(post, path = "/api/vaults/{id}/note-moves/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = Object, responses((status = 200, description = "Moved note")))]
+#[utoipa::path(post, path = "/api/vaults/{id}/note-moves/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = Object, responses((status = 200, description = "Moved note"), (status = 409, description = "Target path exists")))]
 async fn move_note() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/note-permalinks/{path}", tag = "notes", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Generated permalink")))]
@@ -357,13 +357,13 @@ async fn read_attachment() {}
 #[utoipa::path(head, path = "/api/vaults/{id}/attachments/{path}", tag = "attachments", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Attachment exists"), (status = 404, description = "Not found")))]
 async fn head_attachment() {}
 
-#[utoipa::path(put, path = "/api/vaults/{id}/attachments/{path}", tag = "attachments", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body(content = Vec<u8>, content_type = "application/octet-stream"), responses((status = 200, description = "Uploaded attachment"), (status = 413, description = "Too large")))]
+#[utoipa::path(put, path = "/api/vaults/{id}/attachments/{path}", tag = "attachments", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path), ("If-Match" = Option<String>, Header, description = "Content hash the path must still hold; the upload is refused if the attachment changed since"), ("If-None-Match" = Option<String>, Header, description = "`*`: refuse the upload if the path already holds an attachment")), request_body(content = Vec<u8>, content_type = "application/octet-stream"), responses((status = 200, description = "Uploaded attachment"), (status = 409, description = "Stale If-Match (`stale`) or occupied path under If-None-Match (`exists`)"), (status = 413, description = "Too large")))]
 async fn upload_attachment() {}
 
 #[utoipa::path(delete, path = "/api/vaults/{id}/attachments/{path}", tag = "attachments", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Deleted attachment")))]
 async fn delete_attachment() {}
 
-#[utoipa::path(post, path = "/api/vaults/{id}/attachment-moves/{path}", tag = "attachments", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = Object, responses((status = 200, description = "Moved attachment")))]
+#[utoipa::path(post, path = "/api/vaults/{id}/attachment-moves/{path}", tag = "attachments", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), request_body = Object, responses((status = 200, description = "Moved attachment"), (status = 409, description = "Target path exists")))]
 async fn move_attachment() {}
 
 #[utoipa::path(post, path = "/api/vaults/{id}/attachment-shares", tag = "shares", security(("bearerAuth" = [])), params(("id" = String, Path)), request_body = Object, responses((status = 200, description = "Created or returned the attachment's current public share"), (status = 404, description = "Attachment not found")))]

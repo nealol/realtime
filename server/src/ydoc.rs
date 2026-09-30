@@ -55,6 +55,22 @@ pub(crate) async fn write_update_at_epoch(
         .map_err(AppError::from)
 }
 
+/// Read, decide, and write one document atomically (see
+/// [`DocumentStore::modify`]): `build` gets the current encoded state and
+/// returns the update to apply (empty: none) plus a result. No other write
+/// lands in between, so `build` may refuse a write based on what it sees.
+pub(crate) async fn modify<T>(
+    state: &AppState,
+    doc_id: &str,
+    build: impl FnOnce(&[u8]) -> AppResult<(Vec<u8>, T)>,
+) -> AppResult<T> {
+    state
+        .documents
+        .modify(doc_id, build)
+        .await
+        .map_err(AppError::from)?
+}
+
 pub async fn set_text(state: &AppState, doc_id: &str, new_content: &str) -> AppResult<()> {
     let (epoch, current) = read_update_for_write(state, doc_id).await?;
     let update = build_set_text_update(&current, "contents", new_content)?;
@@ -64,46 +80,69 @@ pub async fn set_text(state: &AppState, doc_id: &str, new_content: &str) -> AppR
     write_update_at_epoch(state, doc_id, epoch, update).await
 }
 
-/// Edit a note's text relative to one snapshot: `edit` computes the new text
-/// from the snapshot the update is then built against. Edits other clients
-/// apply after that snapshot are merged by the CRDT instead of being reverted
-/// (which is what diffing an earlier read against a later snapshot would do).
-/// Returns the snapshot's text and the edited text.
+/// Edit a note's text atomically: `edit` computes the new text from the
+/// current text, and no other write lands before the resulting update, so
+/// `edit` may refuse (e.g. a stale precondition) and a concurrent edit is
+/// never reverted by diffing against an older read. Returns the text before
+/// and after.
 pub async fn update_text<F>(state: &AppState, doc_id: &str, edit: F) -> AppResult<(String, String)>
 where
     F: FnOnce(&str) -> AppResult<String>,
 {
-    let (epoch, current) = read_update_for_write(state, doc_id).await?;
-    let before =
-        decode_text(&current, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
-    let after = edit(&before)?;
-    let update = build_set_text_update(&current, "contents", &after)?;
-    if !update.is_empty() {
-        write_update_at_epoch(state, doc_id, epoch, update).await?;
-    }
-    Ok((before, after))
+    modify(state, doc_id, |current| {
+        let before =
+            decode_text(current, "contents").map_err(|e| AppError::Internal(e.to_string()))?;
+        let after = edit(&before)?;
+        let update = build_set_text_update(current, "contents", &after)?;
+        Ok((update, (before, after)))
+    })
+    .await
 }
 
 pub async fn set_structured(state: &AppState, doc_id: &str, value: &JsonValue) -> AppResult<()> {
-    let (epoch, current) = read_update_for_write(state, doc_id).await?;
-    let update = build_structured_update(&current, value)?;
-    if update.is_empty() {
-        return Ok(());
-    }
-    write_update_at_epoch(state, doc_id, epoch, update).await
+    update_structured(state, doc_id, |_| Ok(value.clone()))
+        .await
+        .map(|_| ())
 }
 
+/// Replace a structured document's value atomically: `edit` sees the current
+/// value and may refuse a write whose caller based it on an older read.
+/// Returns the value before the edit.
+pub async fn update_structured<F>(state: &AppState, doc_id: &str, edit: F) -> AppResult<JsonValue>
+where
+    F: FnOnce(&JsonValue) -> AppResult<JsonValue>,
+{
+    modify(state, doc_id, |current| {
+        let before = decode_structured(current).map_err(|e| AppError::Internal(e.to_string()))?;
+        let after = edit(&before)?;
+        let update = build_structured_update(current, &after)?;
+        Ok((update, before))
+    })
+    .await
+}
+
+/// Map `path` to `guid` in the index. The check and the write are atomic, so
+/// a path another client took after the caller's own existence check (the
+/// `vault_files` mirror can lag the index) is refused instead of silently
+/// orphaning that client's document.
 pub async fn index_set_file(
     state: &AppState,
     vault_id: &str,
     path: &str,
     guid: &str,
 ) -> AppResult<()> {
-    let (epoch, current) = read_update_for_write(state, vault_id).await?;
-    let update = build_map_set_update(&current, "files", path, guid.to_string())?;
-    if !update.is_empty() {
-        write_update_at_epoch(state, vault_id, epoch, update).await?;
-    }
+    modify(state, vault_id, |current| {
+        let occupied = decode_files_map(current)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .into_iter()
+            .any(|(existing_path, existing_guid)| existing_path == path && existing_guid != guid);
+        if occupied {
+            return Err(AppError::Conflict("note already exists".into()));
+        }
+        let update = build_map_set_update(current, "files", path, guid.to_string())?;
+        Ok((update, ()))
+    })
+    .await?;
     upsert_vault_file(state, vault_id, path, guid).await
 }
 
@@ -136,18 +175,33 @@ pub async fn index_remove_file(state: &AppState, vault_id: &str, path: &str) -> 
 }
 
 pub async fn index_rename(state: &AppState, vault_id: &str, from: &str, to: &str) -> AppResult<()> {
-    let (epoch, current) = read_update_for_write(state, vault_id).await?;
-    let guid = decode_files_map(&current)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .into_iter()
-        .find(|(path, _)| path == from)
-        .map(|(_, guid)| guid)
-        .ok_or(AppError::NotFound)?;
-    let update = build_map_rename_update(&current, "files", from, to, guid.clone())?;
-    if !update.is_empty() {
-        write_update_at_epoch(state, vault_id, epoch, update).await?;
-    }
+    let guid = modify(state, vault_id, |current| {
+        let files = decode_files_map(current).map_err(|e| AppError::Internal(e.to_string()))?;
+        if files.iter().any(|(path, _)| path == to) {
+            return Err(AppError::Conflict("exists".into()));
+        }
+        let guid = files
+            .into_iter()
+            .find(|(path, _)| path == from)
+            .map(|(_, guid)| guid)
+            .ok_or(AppError::NotFound)?;
+        let update = build_map_rename_update(current, "files", from, to, guid.clone())?;
+        Ok((update, guid))
+    })
+    .await?;
     upsert_vault_file(state, vault_id, to, &guid).await
+}
+
+/// A condition on the attachment a path holds, checked atomically with the
+/// index write that replaces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttachmentPrecondition<'a> {
+    /// Write whatever the path holds.
+    None,
+    /// The path must hold no attachment (`If-None-Match: *`).
+    Absent,
+    /// The path must still hold this content hash (`If-Match`).
+    Hash(&'a str),
 }
 
 pub async fn index_set_binary(
@@ -157,16 +211,67 @@ pub async fn index_set_binary(
     hash: &str,
     size: i64,
 ) -> AppResult<()> {
-    let (epoch, current) = read_update_for_write(state, vault_id).await?;
-    let metadata = HashMap::from([
-        ("hash".to_string(), Any::String(hash.into())),
-        ("size".to_string(), Any::BigInt(size)),
-    ]);
-    let update = build_map_set_update(&current, "binaries", path, metadata)?;
-    if !update.is_empty() {
-        write_update_at_epoch(state, vault_id, epoch, update).await?;
-    }
-    Ok(())
+    index_set_binary_if(
+        state,
+        vault_id,
+        path,
+        hash,
+        size,
+        AttachmentPrecondition::None,
+    )
+    .await
+}
+
+/// Map `path` to a blob once `precondition` holds for the attachment it maps
+/// to now. Refusals are `Conflict("stale")` when the path no longer holds the
+/// expected hash and `Conflict("exists")` when it was meant to be empty.
+pub async fn index_set_binary_if(
+    state: &AppState,
+    vault_id: &str,
+    path: &str,
+    hash: &str,
+    size: i64,
+    precondition: AttachmentPrecondition<'_>,
+) -> AppResult<()> {
+    modify(state, vault_id, |current| {
+        let existing = decode_binaries_map(current)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .into_iter()
+            .find(|(p, _)| p == path)
+            .and_then(|(_, meta)| binary_hash_size(&meta));
+        let existing_hash = existing.as_ref().map(|(hash, _)| hash.as_str());
+        match precondition {
+            AttachmentPrecondition::None => {}
+            AttachmentPrecondition::Absent => {
+                if existing.is_some() {
+                    return Err(AppError::Conflict("exists".into()));
+                }
+            }
+            AttachmentPrecondition::Hash(expected) => {
+                if !existing_hash.is_some_and(|hash| hash.eq_ignore_ascii_case(expected)) {
+                    return Err(AppError::Conflict("stale".into()));
+                }
+            }
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|(existing, existing_size)| existing == hash && *existing_size == size)
+        {
+            return Ok((Vec::new(), ()));
+        }
+        // Record the version this replaces, like clients do, so a client whose
+        // concurrent publish loses the map to this one sees a conflict rather
+        // than a clean update.
+        let prev = existing_hash.map_or(Any::Null, |hash| Any::String(hash.into()));
+        let metadata = HashMap::from([
+            ("hash".to_string(), Any::String(hash.into())),
+            ("size".to_string(), Any::BigInt(size)),
+            ("prev".to_string(), prev),
+        ]);
+        let update = build_map_set_update(current, "binaries", path, metadata)?;
+        Ok((update, ()))
+    })
+    .await
 }
 
 pub async fn index_remove_binary(state: &AppState, vault_id: &str, path: &str) -> AppResult<()> {
@@ -197,18 +302,21 @@ pub async fn index_rename_binary(
     from: &str,
     to: &str,
 ) -> AppResult<()> {
-    let (epoch, current) = read_update_for_write(state, vault_id).await?;
-    let meta = decode_binaries_map(&current)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .into_iter()
-        .find(|(path, _)| path == from)
-        .map(|(_, meta)| meta)
-        .ok_or(AppError::NotFound)?;
-    let update = build_map_rename_update(&current, "binaries", from, to, meta)?;
-    if !update.is_empty() {
-        write_update_at_epoch(state, vault_id, epoch, update).await?;
-    }
-    Ok(())
+    modify(state, vault_id, |current| {
+        let binaries =
+            decode_binaries_map(current).map_err(|e| AppError::Internal(e.to_string()))?;
+        if binaries.iter().any(|(path, _)| path == to) {
+            return Err(AppError::Conflict("exists".into()));
+        }
+        let meta = binaries
+            .into_iter()
+            .find(|(path, _)| path == from)
+            .map(|(_, meta)| meta)
+            .ok_or(AppError::NotFound)?;
+        let update = build_map_rename_update(current, "binaries", from, to, meta)?;
+        Ok((update, ()))
+    })
+    .await
 }
 
 pub async fn index_set_structured(
@@ -218,16 +326,22 @@ pub async fn index_set_structured(
     guid: &str,
     kind: &str,
 ) -> AppResult<()> {
-    let (epoch, current) = read_update_for_write(state, vault_id).await?;
-    let metadata = HashMap::from([
-        ("guid".to_string(), Any::String(guid.into())),
-        ("kind".to_string(), Any::String(kind.into())),
-    ]);
-    let update = build_map_set_update(&current, "structured", path, metadata)?;
-    if !update.is_empty() {
-        write_update_at_epoch(state, vault_id, epoch, update).await?;
-    }
-    Ok(())
+    modify(state, vault_id, |current| {
+        let occupied = decode_structured_index(current)
+            .map_err(|e| AppError::Internal(e.to_string()))?
+            .into_iter()
+            .any(|entry| entry.path == path && entry.guid != guid);
+        if occupied {
+            return Err(AppError::Conflict("structured file already exists".into()));
+        }
+        let metadata = HashMap::from([
+            ("guid".to_string(), Any::String(guid.into())),
+            ("kind".to_string(), Any::String(kind.into())),
+        ]);
+        let update = build_map_set_update(current, "structured", path, metadata)?;
+        Ok((update, ()))
+    })
+    .await
 }
 
 pub async fn index_remove_structured(
@@ -260,21 +374,24 @@ pub async fn index_rename_structured(
     from: &str,
     to: &str,
 ) -> AppResult<()> {
-    let (epoch, current) = read_update_for_write(state, vault_id).await?;
-    let entry = decode_structured_index(&current)
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .into_iter()
-        .find(|entry| entry.path == from)
-        .ok_or(AppError::NotFound)?;
-    let metadata = HashMap::from([
-        ("guid".to_string(), Any::String(entry.guid.into())),
-        ("kind".to_string(), Any::String(entry.kind.into())),
-    ]);
-    let update = build_map_rename_update(&current, "structured", from, to, metadata)?;
-    if !update.is_empty() {
-        write_update_at_epoch(state, vault_id, epoch, update).await?;
-    }
-    Ok(())
+    modify(state, vault_id, |current| {
+        let entries =
+            decode_structured_index(current).map_err(|e| AppError::Internal(e.to_string()))?;
+        if entries.iter().any(|entry| entry.path == to) {
+            return Err(AppError::Conflict("exists".into()));
+        }
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.path == from)
+            .ok_or(AppError::NotFound)?;
+        let metadata = HashMap::from([
+            ("guid".to_string(), Any::String(entry.guid.into())),
+            ("kind".to_string(), Any::String(entry.kind.into())),
+        ]);
+        let update = build_map_rename_update(current, "structured", from, to, metadata)?;
+        Ok((update, ()))
+    })
+    .await
 }
 
 /// One index-doc mutation in a rollback batch.
@@ -1201,7 +1318,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn update_text_keeps_edits_applied_after_its_snapshot() {
+    async fn update_text_keeps_a_client_edit_that_races_it() {
         let root = std::env::temp_dir().join(format!("realtime-ydoc-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&root).await.unwrap();
         let mut config = crate::config::Config::test_default();
@@ -1222,18 +1339,19 @@ mod tests {
             text.insert(txn, "Café".len() as u32, " (typed meanwhile)");
         });
 
-        let handle = tokio::runtime::Handle::current();
         let documents = state.documents.clone();
+        let mut racing = None;
         let (before, after) = update_text(&state, doc_id, |content| {
-            // A client edit lands after the snapshot the edit is computed from.
-            tokio::task::block_in_place(|| {
-                handle.block_on(documents.apply_update(doc_id, &concurrent))
-            })
-            .unwrap();
+            // A client edit arrives while the new text is being computed. It
+            // cannot land before this write; it merges after it instead.
+            racing = Some(tokio::spawn(async move {
+                documents.apply_update(doc_id, &concurrent).await
+            }));
             Ok(content.replace("gamma", "GAMMA"))
         })
         .await
         .unwrap();
+        racing.unwrap().await.unwrap().unwrap();
 
         assert_eq!(before, "Café\nbeta\ngamma\n");
         assert_eq!(after, "Café\nbeta\nGAMMA\n");

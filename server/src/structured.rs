@@ -46,6 +46,58 @@ pub struct StructuredResponse {
     pub kind: String,
     pub value: JsonValue,
     pub permalink: String,
+    /// Opaque version of the stored value. Send it back as `If-Match` on a
+    /// replace to refuse the write if the file changed since it was read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_hash: Option<String>,
+}
+
+/// Hash of a stored structured value, independent of object key order.
+pub(crate) fn structured_value_hash(value: &JsonValue) -> String {
+    use sha2::{Digest, Sha256};
+    fn canonical(value: &JsonValue, out: &mut String) {
+        match value {
+            JsonValue::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                out.push('{');
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&JsonValue::String(key.clone()).to_string());
+                    out.push(':');
+                    canonical(&map[key], out);
+                }
+                out.push('}');
+            }
+            JsonValue::Array(items) => {
+                out.push('[');
+                for (index, item) in items.iter().enumerate() {
+                    if index > 0 {
+                        out.push(',');
+                    }
+                    canonical(item, out);
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+    let mut encoded = String::new();
+    canonical(value, &mut encoded);
+    format!("{:x}", Sha256::digest(encoded.as_bytes()))
+}
+
+/// The value hash an `If-Match` header names, if any (quotes are optional).
+pub(crate) fn if_match_hash(headers: &axum::http::HeaderMap) -> Option<String> {
+    let raw = headers
+        .get(axum::http::header::IF_MATCH)?
+        .to_str()
+        .ok()?
+        .trim();
+    let raw = raw.strip_prefix("W/").unwrap_or(raw);
+    Some(raw.trim_matches('"').to_string()).filter(|hash| !hash.is_empty())
 }
 
 #[derive(Deserialize)]
@@ -324,11 +376,22 @@ pub async fn replace_canvas(
     State(state): State<AppState>,
     principal: ApiPrincipal,
     Path((vault_id, path)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<JsonValue>,
 ) -> AppResult<Json<StructuredResponse>> {
     let value = canvas_file_to_map(body);
+    let expected = if_match_hash(&headers);
     Ok(Json(
-        write_structured_json(&state, &principal, &vault_id, &path, "canvas", value).await?,
+        write_structured_json(
+            &state,
+            &principal,
+            &vault_id,
+            &path,
+            "canvas",
+            value,
+            expected.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -575,6 +638,7 @@ pub(crate) async fn apply_canvas_operations_inner(
                 path: entry.path,
                 guid: entry.guid,
                 kind: entry.kind,
+                value_hash: Some(structured_value_hash(&value)),
                 value: canvas_to_file_json(value),
             });
         }
@@ -612,6 +676,7 @@ pub(crate) async fn apply_canvas_operations_inner(
         path: entry.path,
         guid: entry.guid,
         kind: entry.kind,
+        value_hash: Some(structured_value_hash(&value)),
         value: canvas_to_file_json(value),
     })
 }
@@ -660,11 +725,22 @@ pub async fn replace_base(
     State(state): State<AppState>,
     principal: ApiPrincipal,
     Path((vault_id, path)): Path<(String, String)>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<JsonValue>,
 ) -> AppResult<Json<StructuredResponse>> {
     let body = base_value_to_json(body)?;
+    let expected = if_match_hash(&headers);
     Ok(Json(
-        write_structured_json(&state, &principal, &vault_id, &path, "base", body).await?,
+        write_structured_json(
+            &state,
+            &principal,
+            &vault_id,
+            &path,
+            "base",
+            body,
+            expected.as_deref(),
+        )
+        .await?,
     ))
 }
 
@@ -1049,6 +1125,7 @@ where
         path: entry.path,
         guid: entry.guid,
         kind: entry.kind,
+        value_hash: Some(structured_value_hash(&value)),
         value,
     })
 }
@@ -1068,6 +1145,7 @@ pub(crate) async fn read_structured_json(
         path: entry.path,
         guid: entry.guid,
         kind: entry.kind,
+        value_hash: Some(structured_value_hash(&value)),
         value,
     })
 }
@@ -1079,17 +1157,20 @@ pub(crate) async fn write_structured_json(
     path: &str,
     kind: &str,
     value: JsonValue,
+    expected_hash: Option<&str>,
 ) -> AppResult<StructuredResponse> {
     let entry = require_structured_access(state, principal, vault_id, path, kind, true).await?;
-    // The before-image is only needed for the cursor audit trail; spare human
-    // callers the extra document read.
-    let before = if audit::is_cursor(principal) {
-        let update = ydoc::read_update(state, &doc_id(vault_id, &entry.guid)).await?;
-        Some(ydoc::decode_structured(&update).map_err(|e| AppError::Internal(e.to_string()))?)
-    } else {
-        None
-    };
-    ydoc::set_structured(state, &doc_id(vault_id, &entry.guid), &value).await?;
+    let before = ydoc::update_structured(state, &doc_id(vault_id, &entry.guid), |current| {
+        if expected_hash
+            .is_some_and(|expected| !expected.eq_ignore_ascii_case(&structured_value_hash(current)))
+        {
+            return Err(AppError::Conflict("stale".into()));
+        }
+        Ok(value.clone())
+    })
+    .await?;
+    // The before-image is only needed for the cursor audit trail.
+    let before = audit::is_cursor(principal).then_some(before);
     mark_structured_write(state, vault_id, principal).await;
     if let Some(before) = before {
         audit::record(
@@ -1108,6 +1189,7 @@ pub(crate) async fn write_structured_json(
         path: entry.path,
         guid: entry.guid,
         kind: entry.kind,
+        value_hash: Some(structured_value_hash(&value)),
         value,
     })
 }
@@ -1154,6 +1236,7 @@ pub(crate) async fn create_structured(
         path: path.into(),
         guid,
         kind: kind.into(),
+        value_hash: Some(structured_value_hash(&value)),
         value,
     })
 }

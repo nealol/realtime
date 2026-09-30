@@ -1802,6 +1802,111 @@ async fn periodic_daily_note_get_create_and_append() {
 }
 
 #[tokio::test]
+async fn attachment_uploads_honor_preconditions() {
+    let app = test_app().await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "Attachments"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap();
+    let url = format!("/api/vaults/{vault_id}/attachments/img/pic.png");
+    let png = |tail: &str| [b"\x89PNG\r\n\x1a\n".as_slice(), tail.as_bytes()].concat();
+    let put = |headers: Vec<(&'static str, String)>, bytes: Vec<u8>| {
+        let (app, url, token) = (app.clone(), url.clone(), token.clone());
+        async move {
+            let mut req = Request::builder()
+                .method("PUT")
+                .uri(&url)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"));
+            for (name, value) in headers {
+                req = req.header(name, value);
+            }
+            let res = app
+                .oneshot(req.body(Body::from(bytes)).unwrap())
+                .await
+                .unwrap();
+            let status = res.status();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+            )
+        }
+    };
+    let listed_hash = || {
+        let (app, token) = (app.clone(), token.clone());
+        let list_url = format!("/api/vaults/{vault_id}/attachments");
+        async move {
+            let (_, list) = send(&app, "GET", &list_url, Some(&token), None).await;
+            list[0]["hash"].as_str().map(str::to_string)
+        }
+    };
+
+    // Creating: If-None-Match: * wins only while the path is empty.
+    let (status, first) = put(vec![("if-none-match", "*".into())], png("one")).await;
+    assert_eq!(status, StatusCode::OK);
+    let first_hash = first["hash"].as_str().unwrap().to_string();
+    let (status, body) = put(vec![("if-none-match", "*".into())], png("two")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "exists");
+    assert_eq!(listed_hash().await.as_deref(), Some(first_hash.as_str()));
+
+    // Replacing: If-Match must name the hash the path holds right now.
+    let other = sha256_hex(b"something else");
+    let (status, body) = put(vec![("if-match", format!("\"{other}\""))], png("two")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "stale");
+    assert_eq!(listed_hash().await.as_deref(), Some(first_hash.as_str()));
+    let (status, second) = put(vec![("if-match", format!("\"{first_hash}\""))], png("two")).await;
+    assert_eq!(status, StatusCode::OK);
+    let second_hash = second["hash"].as_str().unwrap().to_string();
+    assert_eq!(listed_hash().await.as_deref(), Some(second_hash.as_str()));
+    let (status, _) = put(vec![("if-match", first_hash.clone())], png("three")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // If-Match against a path with no attachment is stale too.
+    let missing = format!("/api/vaults/{vault_id}/attachments/img/missing.png");
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&missing)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("if-match", format!("\"{first_hash}\""))
+                .body(Body::from(png("four")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+
+    // Unsupported or contradictory preconditions are rejected, not ignored.
+    let (status, _) = put(vec![("if-none-match", "\"etag\"".into())], png("five")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = put(
+        vec![
+            ("if-match", second_hash.clone()),
+            ("if-none-match", "*".into()),
+        ],
+        png("five"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(listed_hash().await.as_deref(), Some(second_hash.as_str()));
+
+    // No precondition: the upload replaces whatever is there.
+    let (status, third) = put(Vec::new(), png("six")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(listed_hash().await.as_deref(), third["hash"].as_str());
+}
+
+#[tokio::test]
 async fn attachment_upload_list_read_delete_roundtrip() {
     let app = test_app().await;
     let token = login(&app, "alice").await;
@@ -3969,6 +4074,117 @@ async fn note_move_rewrites_pathed_links_preserving_paths() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(a["content"], "[[new/New.md]] [x](new/New.md)");
+}
+
+#[tokio::test]
+async fn full_replaces_and_moves_refuse_to_clobber_concurrent_changes() {
+    use sha2::{Digest, Sha256};
+    let (app, state) = test_app_with_state().await;
+    let token = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&token),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let note_url = format!("/api/vaults/{vault_id}/notes/a.md");
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&token),
+        Some(json!({"path": "a.md", "content": "one\n"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A replace based on content the note no longer has is refused...
+    let stale = format!("{:x}", Sha256::digest(b"zero\n"));
+    let (status, _) = send(
+        &app,
+        "PUT",
+        &note_url,
+        Some(&token),
+        Some(json!({"content": "two\n", "expectedContentHash": stale})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // ...while one based on the current content (or with no precondition) applies.
+    let current = format!("{:x}", Sha256::digest(b"one\n"));
+    let (status, replaced) = send(
+        &app,
+        "PUT",
+        &note_url,
+        Some(&token),
+        Some(json!({"content": "two\n", "expectedContentHash": current})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replaced}");
+    assert_eq!(replaced["content"], "two\n");
+
+    // A client published b.md through the index; the registry mirror has not
+    // seen it yet. Moving onto it must not overwrite the client's entry.
+    state
+        .documents
+        .apply_update(&vault_id, &files_update(&[("b.md", "client-guid")]))
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/note-moves/a.md"),
+        Some(&token),
+        Some(json!({"toPath": "b.md"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let index = state.documents.read_update(&vault_id).await.unwrap();
+    let files = realtime_server::ydoc::decode_files_map(&index).unwrap();
+    assert!(files.contains(&("b.md".to_string(), "client-guid".to_string())));
+    assert!(files.iter().any(|(path, _)| path == "a.md"));
+
+    // Canvas replaces take the read's valueHash as If-Match.
+    let canvas_url = format!("/api/vaults/{vault_id}/canvas/Board.canvas");
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/canvases"),
+        Some(&token),
+        Some(json!({"path": "Board.canvas", "value": {"nodes": [], "edges": []}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, read) = send(&app, "GET", &canvas_url, Some(&token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let value_hash = read["valueHash"].as_str().unwrap().to_string();
+    let replace = |if_match: String| {
+        Request::builder()
+            .method("PUT")
+            .uri(&canvas_url)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::IF_MATCH, if_match)
+            .body(Body::from(
+                serde_json::to_vec(&json!({"nodes": [{"id": "n1", "type": "text", "text": "hi", "x": 0, "y": 0, "width": 10, "height": 10}], "edges": []}))
+                    .unwrap(),
+            ))
+            .unwrap()
+    };
+    let res = app
+        .clone()
+        .oneshot(replace("\"0000\"".into()))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT);
+    let res = app
+        .clone()
+        .oneshot(replace(format!("\"{value_hash}\"")))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -6573,20 +6789,29 @@ async fn rollback_restores_attachment_blob_from_git_after_gc() {
     assert_eq!(f["hash"], json!(hash));
     assert_eq!(f["inline"], true);
 
-    // Delete the attachment, then GC the now-orphaned blob.
+    // Delete the attachment, then GC the now-orphaned blob. A default sweep
+    // keeps blobs written within the last hour (uploads whose index entry may
+    // still be in flight), so ask for an immediate one.
     let (status, _) = send(&app, "DELETE", &att_url, Some(&alice), None).await;
     assert_eq!(status, StatusCode::OK);
     wait_for_commit_count(&repo, 2).await;
+    let gc_url = format!("/api/vaults/{vault_id}/storage/gc-blobs");
+    let blob_path = blob_dir.join(&vault_id).join(&hash);
+    let (status, gc) = send(&app, "POST", &gc_url, Some(&alice), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "gc failed: {gc}");
+    assert!(
+        blob_path.exists(),
+        "a fresh orphan survives the default sweep"
+    );
     let (status, gc) = send(
         &app,
         "POST",
-        &format!("/api/vaults/{vault_id}/storage/gc-blobs"),
+        &gc_url,
         Some(&alice),
-        Some(json!({})),
+        Some(json!({"minAgeSeconds": 0})),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "gc failed: {gc}");
-    let blob_path = blob_dir.join(&vault_id).join(&hash);
     assert!(!blob_path.exists(), "blob should be GC'd");
 
     // Preview: the attachment comes back via blob re-insert from git bytes.
@@ -7616,7 +7841,8 @@ async fn dmux_open_rejection_survives_a_full_outbound_queue() {
             .expect("mux socket closed")
             .expect("mux socket errored");
         if let TtMsg::Binary(frame) = message {
-            if frame.as_slice() == [3, 1] {
+            // OPEN_ERR on channel 1, with the trailing "rejected" reason.
+            if frame.as_slice() == [3, 1, 1] {
                 break;
             }
         }

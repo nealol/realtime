@@ -399,6 +399,77 @@ describe("RealtimeProvider", () => {
     }
   });
 
+  it("probes an idle document rarely and a document with pending changes quickly", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const probes = (socket: FakeSocket) =>
+      socket.sent.filter((message) => messageType(message) === 102).length;
+    try {
+      void f.provider.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      const socket = f.sockets[0];
+      socket.open();
+      const server = new Y.Doc();
+      socket.deliver(serverStep1(server));
+      socket.deliver(serverStep2(server));
+      server.destroy();
+      await vi.advanceTimersByTimeAsync(0);
+      socket.deliver(syncAcknowledgement(0));
+      const idle = probes(socket);
+
+      await vi.advanceTimersByTimeAsync(29_000);
+      expect(probes(socket)).toBe(idle);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(probes(socket)).toBe(idle + 1);
+      socket.deliver(syncAcknowledgement(0));
+
+      // An edit the server has not acknowledged is probed every 2s.
+      f.doc.getText("contents").insert(0, "pending");
+      const afterEdit = probes(socket);
+      // The server answers with an older version: the edit is still pending.
+      socket.deliver(syncAcknowledgement(0));
+      expect(f.provider.hasLocalChanges).toBe(true);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(probes(socket)).toBe(afterEdit + 1);
+    } finally {
+      f.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it("mints a new token as soon as the server refuses the current one", async () => {
+    const tokenSource = vi.fn(() => Promise.resolve({ ...TOKEN }));
+    const f = fixture(tokenSource);
+    try {
+      void f.provider.connect();
+      await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
+      f.sockets[0].onerror?.({ reason: "token-rejected" });
+      await vi.waitFor(() => expect(f.sockets).toHaveLength(2));
+      expect(tokenSource).toHaveBeenCalledTimes(2);
+      expect(f.provider.lastConnectionError).toBe("token rejected");
+    } finally {
+      f.destroy();
+    }
+  });
+
+  it("refreshes an expired token before reconnecting", async () => {
+    let expiresAt = Date.now() + 3_600_000;
+    const tokenSource = vi.fn(() => Promise.resolve({ ...TOKEN, expiresAt }));
+    const f = fixture(tokenSource);
+    try {
+      const socket = await openAndHandshake(f);
+      expect(tokenSource).toHaveBeenCalledTimes(1);
+      // An hour later the connection drops; the cached token has expired.
+      f.provider.clientToken = { ...f.provider.clientToken!, expiresAt: Date.now() - 1 };
+      expiresAt = Date.now() + 3_600_000;
+      socket.drop();
+      await vi.waitFor(() => expect(f.sockets).toHaveLength(2));
+      expect(tokenSource).toHaveBeenCalledTimes(2);
+    } finally {
+      f.destroy();
+    }
+  });
+
   it("polls quickly while the server activates an epoch this client accepted", async () => {
     vi.useFakeTimers();
     const tokenSource = vi.fn(() =>
