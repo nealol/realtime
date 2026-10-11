@@ -13,6 +13,11 @@ export interface YTextBindingReadiness {
   whenReady(): Promise<void>;
   isReady(): boolean;
   mayPushToShared(sharedEmpty: boolean): boolean;
+  /**
+   * The document has synced with the server, so its shared text is the real
+   * state even when empty. Before that, an empty text may just be unloaded.
+   */
+  hasSyncedOnce?(): boolean;
   /** Edits typed before readiness overlapped `shared`, which the editor's text replaced. */
   onConflict?(shared: string): void;
 }
@@ -67,7 +72,7 @@ export class YTextEditorBinding {
       this.mayPush()
     ) {
       this.writeShared(current);
-    } else if (shared.length > 0) {
+    } else if (shared.length > 0 || this.readiness.hasSyncedOnce?.()) {
       this.editor.applyText(shared);
     } else if (current.length > 0 && this.mayPush()) {
       this.writeShared(current);

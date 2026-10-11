@@ -170,7 +170,14 @@ impl AppState {
         vault_id: &str,
         document_id: &str,
     ) -> crate::error::AppResult<()> {
+        // Existing documents need no admission, so they never wait on the
+        // creation lock that serializes quota checks across the process.
+        if self.documents.document_exists(document_id).await? {
+            self.documents.ensure_document(document_id).await?;
+            return Ok(());
+        }
         let _guard = self.document_creation_lock.lock().await;
+        // Another request may have created it while this one waited.
         if self.documents.document_exists(document_id).await? {
             self.documents.ensure_document(document_id).await?;
             return Ok(());

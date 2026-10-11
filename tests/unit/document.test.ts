@@ -10,6 +10,7 @@ import { setDocumentEpoch } from "../../src/documentEpoch";
 import { LocalSyncState } from "../../src/localSyncState";
 import { storedContentFingerprint } from "../../src/SyncedDoc";
 import { sha256Text } from "../../src/hash";
+import type RealtimePlugin from "../../src/main";
 
 /**
  * The slice of VaultSync a Document reports disk/sync state to, backed by a
@@ -304,12 +305,14 @@ describe("Document sync", () => {
       doc.ytext.insert(doc.ytext.length, " third edit");
       releaseFirstSave();
 
-      await waitFor(() => conflictFiles(vault).length === 2, {
-        label: "queued read-only recovery saved",
-      });
-      const copies = conflictFiles(vault).map((path) => vault.files.get(path));
-      expect(copies).toContain("stale disk snapshot first edit second edit third edit");
-      expect(copies).not.toContain("stale disk snapshot");
+      // The queued recovery rewrites the one copy with the latest text.
+      await waitFor(
+        () =>
+          vault.files.get(conflictFiles(vault)[0]) ===
+          "stale disk snapshot first edit second edit third edit",
+        { label: "queued read-only recovery saved" },
+      );
+      expect(conflictFiles(vault)).toHaveLength(1);
       expect(vault.files.get("note.md")).toBe("stale disk snapshot");
     } finally {
       doc.destroy();
@@ -1529,6 +1532,116 @@ describe("Document sync", () => {
         label: "disk has the merge",
       });
       expect(conflictFiles(vault)).toHaveLength(0);
+    } finally {
+      doc.destroy();
+      peer.destroy();
+    }
+  });
+});
+
+describe("Document before its first server sync", () => {
+  /** Private startup state these tests observe. */
+  interface StartupState {
+    persistenceReady: boolean;
+    localChangedAtStartup: boolean;
+    flushPersistence(): Promise<void>;
+  }
+
+  /** An offline document over `vault` (it never connects). */
+  async function offlineDoc(plugin: FakePlugin, guid: string) {
+    // The fake implements the slice of the plugin a Document uses.
+    const realtime = plugin as unknown as RealtimePlugin;
+    const doc = new Document(realtime, "note.md", guid, docId(guid), false, {
+      autoConnect: false,
+    });
+    // Reads private startup state; every Document has these fields.
+    const startup = doc as unknown as StartupState;
+    await waitFor(() => startup.persistenceReady, { label: "store loaded" });
+    return { doc, startup };
+  }
+
+  it("keeps an edit made while Obsidian was closed when its editor closes before syncing", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("note.md", "base\n");
+    const first = await offlineDoc(plugin, guid);
+    first.doc.ydoc.transact(() => first.doc.ytext.insert(0, "base\n"), first.doc.provider);
+    await first.startup.flushPersistence();
+    first.doc.destroy();
+
+    vault.files.set("note.md", "base\nedited while closed\n");
+    const second = await offlineDoc(plugin, guid);
+    try {
+      expect(second.startup.localChangedAtStartup).toBe(true);
+      const reads = vi.spyOn(vault, "read");
+      second.doc.bindEditor();
+      second.doc.unbindEditor();
+      // The close defers its write with setTimeout(0), which reads the file
+      // first; a zero-delay timer queued after it runs once it has fired.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(reads).not.toHaveBeenCalled();
+      expect(vault.files.get("note.md")).toBe("base\nedited while closed\n");
+    } finally {
+      second.doc.destroy();
+      state.destroy();
+    }
+  });
+
+  it("leaves later disk edits to the startup reconcile instead of folding them", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    vault.files.set("note.md", "base\n");
+    const first = await offlineDoc(plugin, guid);
+    first.doc.ydoc.transact(() => first.doc.ytext.insert(0, "base\n"), first.doc.provider);
+    await first.startup.flushPersistence();
+    first.doc.destroy();
+
+    vault.files.set("note.md", "first edit while closed\nbase\n");
+    const second = await offlineDoc(plugin, guid);
+    try {
+      vault.files.set("note.md", "first edit while closed\nbase\nsecond edit\n");
+      await second.doc.onDiskChanged();
+      // Folding against the startup read would have dropped the first edit
+      // from the document, which never held it.
+      expect(second.doc.content).toBe("base\n");
+      expect(second.startup.localChangedAtStartup).toBe(true);
+    } finally {
+      second.doc.destroy();
+      state.destroy();
+    }
+  });
+
+  it("merges remote edits that arrive while a disk edit is being folded", async () => {
+    const guid = freshGuid();
+    const { doc, vault } = makeDoc(guid, { file: { path: "note.md", content: "base\n" } });
+    const peer = new Y.Doc();
+    try {
+      await doc.whenReady();
+      Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc.ydoc));
+      vault.files.set("note.md", "base\nlocal line\n");
+      const read = vault.read.bind(vault);
+      let reads = 0;
+      vault.read = async (file) => {
+        const text = await read(file);
+        reads += 1;
+        if (reads === 2) {
+          // A collaborator's edit lands while the fold reads the file again.
+          const before = Y.encodeStateVector(doc.ydoc);
+          peer.getText("contents").insert(0, "REMOTE\n");
+          Y.applyUpdate(doc.ydoc, Y.encodeStateAsUpdate(peer, before), doc.provider);
+        }
+        return text;
+      };
+      await doc.onDiskChanged();
+      expect(doc.content).toBe("REMOTE\nbase\nlocal line\n");
     } finally {
       doc.destroy();
       peer.destroy();

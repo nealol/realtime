@@ -112,8 +112,18 @@ export class Document extends SyncedDoc {
     // open anywhere: a vault.modify on an open file surfaces to Obsidian as an
     // external change, which it then 3-way merges into its editor buffer,
     // duplicating the just-typed text (and that merge gets re-sent to peers).
+    // Before the startup reconcile the shared text is only the stored
+    // baseline, and the file may hold edits made while Obsidian was closed.
+    // The reconcile merges those and writes the file itself.
     window.setTimeout(() => {
-      if (this.destroyed || this.boundEditors > 0 || this.isOpenInEditableMarkdown()) return;
+      if (
+        this.destroyed ||
+        !this.startupReady ||
+        this.boundEditors > 0 ||
+        this.isOpenInEditableMarkdown()
+      ) {
+        return;
+      }
       void this.writeToDisk();
     }, 0);
   }
@@ -420,7 +430,16 @@ export class Document extends SyncedDoc {
       else this.diskKnownContent = disk;
       return;
     }
-    if (disk === this.diskKnownContent || disk === this.writingTextToDisk) return;
+    if (disk === this.writingTextToDisk) return;
+    if (!this.startupReconciled) {
+      // The startup reconcile has not merged the file yet, and the shared
+      // text is still only the stored baseline. Folding against the startup
+      // read would drop edits made while Obsidian was closed, so a later edit
+      // simply replaces what the reconcile will merge.
+      this.adoptStartupDisk(disk);
+      return;
+    }
+    if (disk === this.diskKnownContent) return;
     if (disk === this.content) {
       this.noteDiskContent(disk);
       return;
@@ -428,39 +447,57 @@ export class Document extends SyncedDoc {
     await this.foldDiskEdit(disk);
   }
 
+  private adoptStartupDisk(disk: string): void {
+    this.diskAtStartup = disk;
+    this.diskKnownContent = disk;
+    this.startupDiskReadPending = false;
+    this.localChangedAtStartup = disk !== this.baselineAtStartup;
+  }
+
   /**
    * Fold a disk edit into the shared text. The document may have moved on
    * since the file last matched it (typically remote edits whose disk write
    * was still pending), so merge against that last known disk content rather
-   * than letting the file overwrite them.
+   * than letting the file overwrite them. The merge is computed and applied
+   * with no await in between, so remote edits that arrive during a disk read
+   * or a recovery copy are merged rather than reverted.
    */
   private async foldDiskEdit(disk: string): Promise<void> {
     this.plugin.vaultSync?.noteTextActivity();
     const base = this.diskKnownContent;
-    const shared = this.content;
-    const merge = base !== null ? mergeText(base, disk, shared) : null;
-    dbg(
-      "onDiskChanged FOLD disk->ytext",
-      this.path,
-      "disk",
-      snip(disk),
-      "ytext",
-      snip(shared),
-      "merge",
-      merge?.kind ?? "none",
-    );
-    if (merge?.kind === "conflict" && shared !== base) {
-      const preservedPath = await preserveTextConflict(this.plugin, this.path, shared, "remote");
-      if (this.destroyed) return;
-      new Notice(
-        `Realtime: "${this.path}" was edited on disk while newer changes were arriving; ` +
-          `kept the disk version and preserved the other as "${preservedPath}".`,
+    let preserved: string | null = null;
+    for (;;) {
+      const latest = await this.readFromDisk();
+      if (this.destroyed || latest !== disk) return;
+      const shared = this.content;
+      const merge = base !== null ? mergeText(base, disk, shared) : null;
+      dbg(
+        "onDiskChanged FOLD disk->ytext",
+        this.path,
+        "disk",
+        snip(disk),
+        "ytext",
+        snip(shared),
+        "merge",
+        merge?.kind ?? "none",
       );
+      if (merge?.kind === "conflict" && shared !== base && shared !== preserved) {
+        // The disk version wins a conflict, so keep the shared one beside it
+        // first. Remote edits may land while the copy is written; the next
+        // pass merges against them (and preserves them too if they conflict).
+        const preservedPath = await preserveTextConflict(this.plugin, this.path, shared, "remote");
+        if (this.destroyed) return;
+        preserved = shared;
+        new Notice(
+          `Realtime: "${this.path}" was edited on disk while newer changes were arriving; ` +
+            `kept the disk version and preserved the other as "${preservedPath}".`,
+        );
+        continue;
+      }
+      this.applyText(merge?.kind === "merged" ? merge.content : disk);
+      this.noteDiskContent(disk);
+      return;
     }
-    const latest = await this.readFromDisk();
-    if (this.destroyed || latest !== disk) return;
-    this.applyText(merge?.kind === "merged" ? merge.content : disk);
-    this.noteDiskContent(disk);
   }
 
   /** The file is known to hold `text`, which this document now contains. */

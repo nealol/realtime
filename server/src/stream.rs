@@ -60,6 +60,9 @@ const MAX_SESSION: Duration = Duration::from_secs(15 * 60);
 const MAX_INSERTED_BYTES: usize = 2 * 1024 * 1024;
 /// How long we wait for the `start` frame and initial Yjs sync.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Longest a session waits for the server to activate a proposed epoch it has
+/// acknowledged. Activation waits at most the acknowledgement timeout.
+const EPOCH_ACTIVATION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Deserialize)]
 pub struct StreamQuery {
@@ -228,6 +231,29 @@ async fn run_session(
             },
             msg = document.recv() => match msg {
                 Some(data) => {
+                    if let Some(epoch) = crate::crdt::epoch_proposal(&data) {
+                        // Acknowledge at once (an unacknowledged peer holds the
+                        // epoch back for everyone), then follow the document
+                        // into the new epoch and keep streaming there.
+                        flush(&mut session, &document, &mut cl_tx).await?;
+                        let caret = session.caret_offset();
+                        document.send(crate::crdt::epoch_acknowledgement(epoch)?).await?;
+                        match rejoin_epoch(&state, &doc_id, epoch, &mut session).await {
+                            Ok(rejoined) => {
+                                document = rejoined;
+                                session.pin_caret(caret);
+                                if let Some(msg) = session.awareness_message() {
+                                    document.send(msg).await?;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("stream: could not follow document epoch: {e}");
+                                error = Some(("sync_lost", "document epoch changed".into()));
+                                break 'main;
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(reply) = session.handle_upstream(&data) {
                         document.send(reply).await?;
                     }
@@ -392,6 +418,32 @@ async fn initial_sync(
     Ok(())
 }
 
+/// Join `doc_id` again once `epoch` is active, with a fresh replica, because
+/// the new epoch's items share no identity with the retired ones.
+async fn rejoin_epoch(
+    state: &AppState,
+    doc_id: &str,
+    epoch: u64,
+    session: &mut DocSession,
+) -> anyhow::Result<CrdtConnection> {
+    let deadline = Instant::now() + EPOCH_ACTIVATION_TIMEOUT;
+    while state.documents.current_epoch(doc_id).await? < epoch {
+        if Instant::now() > deadline {
+            anyhow::bail!("epoch {epoch} was not activated in time");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut document = state
+        .documents
+        .connect(doc_id, Level::Full, None, None)
+        .await?;
+    session.reset_replica();
+    timeout(SETUP_TIMEOUT, initial_sync(session, &mut document))
+        .await
+        .map_err(|_| anyhow::anyhow!("initial sync timed out"))??;
+    Ok(document)
+}
+
 struct FlushOut {
     update_message: Vec<u8>,
     awareness_message: Option<Vec<u8>>,
@@ -441,6 +493,39 @@ impl DocSession {
         let text = self.doc.get_or_insert_text("contents");
         let txn = self.doc.transact();
         text.get_string(&txn)
+    }
+
+    /// Byte offset of the insertion point, if one is pinned.
+    fn caret_offset(&self) -> Option<u32> {
+        let txn = self.doc.transact();
+        self.pos
+            .as_ref()
+            .and_then(|pos| pos.get_offset(&txn))
+            .map(|offset| offset.index)
+    }
+
+    /// Start over with an empty replica for a new document epoch.
+    fn reset_replica(&mut self) {
+        self.doc = Doc::new();
+        self.doc.get_or_insert_text("contents");
+        self.pos = None;
+        self.synced = false;
+    }
+
+    /// Pin the insertion point at `offset` in the current replica (moved back
+    /// to a character boundary), or leave it unpinned to append.
+    fn pin_caret(&mut self, offset: Option<u32>) {
+        let Some(offset) = offset else {
+            return;
+        };
+        let content = self.content();
+        let mut index = (offset as usize).min(content.len());
+        while !content.is_char_boundary(index) {
+            index -= 1;
+        }
+        let text = self.doc.get_or_insert_text("contents");
+        let mut txn = self.doc.transact_mut();
+        self.pos = text.sticky_index(&mut txn, index as u32, Assoc::Before);
     }
 
     fn sync_step1_message(&self) -> Vec<u8> {

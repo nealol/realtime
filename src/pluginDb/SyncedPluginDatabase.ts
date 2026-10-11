@@ -204,49 +204,96 @@ export class SyncedPluginDatabase {
         await this.bootstrapFromServer();
       }
 
-      await this.sync.whenSynced();
-      if (this.closed) return;
-
-      // Tombstone check: a deleted DB must not come back to life.
-      if (this.sync.getDeletedAt() !== null) {
-        await this.handleTombstoned();
-        return;
-      }
-
-      this.setState("syncing");
-      // Publish the CRR schema so the server can build a replica + git dump.
-      await this.publishSchema();
-      // Register the observers BEFORE the initial catch-up: the list covers
-      // batches already present, the observer covers later arrivals — a batch
-      // landing between the two would otherwise never be applied.
-      this.unobserveBatches = this.sync.observeBatches((batches) => this.applyBatches(batches));
-      this.unobserveMeta = this.sync.observeMeta(() => this.onMetaChanged());
-      const initialBatches = this.sync.listBatches();
-      await this.enqueueApply(initialBatches);
-      // Clamp the restored published watermarks to what is actually durable
-      // (in the log, or proven compacted), so the publish below re-reads any
-      // range a stale snapshot claims was published but nobody received.
-      this.reconcilePublished(initialBatches);
-      // The log may have been compacted past our snapshot cursor while we were
-      // away; a quiescent database gives no other trigger to catch up.
-      if (this.needsServerRebase()) {
-        await this.rebaseFromServer();
-      } else {
-        // Crash recovery: republish anything we produced (migrate/local
-        // edits) that never made it into the log.
-        await this.publishNow();
-      }
-
-      // The catch-up pass may have parked us in needs-migration; don't
-      // override that (whenLive resolves only after the schema upgrade).
-      if (this._state === "syncing") this.setState("live");
-      this.scheduleSnapshot();
+      await this.catchUp(this.sync);
     } catch (e) {
       const reason: DbErrorReason = e instanceof WasmError ? "wasm" : "unknown";
       console.error(`[Realtime] failed to start plugin db ${this.docId}`, e);
       this.setState("error", reason);
       throw e;
     }
+  }
+
+  /**
+   * Join the batch log in `sync`: apply what it holds, then publish what it
+   * lacks. Runs at start and whenever the log's document moves to a new epoch.
+   */
+  private async catchUp(sync: PluginDbSync): Promise<void> {
+    await sync.whenSynced();
+    if (this.closed || this.sync !== sync) return;
+
+    // Tombstone check: a deleted DB must not come back to life.
+    if (sync.getDeletedAt() !== null) {
+      await this.handleTombstoned();
+      return;
+    }
+
+    this.setState("syncing");
+    // Publish the CRR schema so the server can build a replica + git dump.
+    await this.publishSchema();
+    if (this.closed || this.sync !== sync) return;
+    // Register the observers BEFORE the initial catch-up: the list covers
+    // batches already present, the observer covers later arrivals — a batch
+    // landing between the two would otherwise never be applied.
+    this.unobserveBatches = sync.observeBatches((batches) => this.applyBatches(batches));
+    this.unobserveMeta = sync.observeMeta(() => this.onMetaChanged());
+    const initialBatches = sync.listBatches();
+    await this.enqueueApply(initialBatches);
+    // Clamp the restored published watermarks to what is actually durable
+    // (in the log, or proven compacted), so the publish below re-reads any
+    // range a stale snapshot claims was published but nobody received.
+    this.reconcilePublished(initialBatches);
+    // The log may have been compacted past our snapshot cursor while we were
+    // away; a quiescent database gives no other trigger to catch up.
+    if (this.needsServerRebase()) {
+      await this.rebaseFromServer();
+    } else {
+      // Crash recovery: republish anything we produced (migrate/local
+      // edits) that never made it into the log.
+      await this.publishNow();
+    }
+
+    // The catch-up pass may have parked us in needs-migration; don't
+    // override that (whenLive resolves only after the schema upgrade).
+    if (this._state === "syncing") this.setState("live");
+    this.scheduleSnapshot();
+  }
+
+  /**
+   * The batch log's document moved to a new epoch. Reconnect to the
+   * replacement while keeping the local database, its snapshot, and every
+   * open handle: the replacement carries the same batches, and anything
+   * published only into the retired log is published again.
+   */
+  async replaceTransport(): Promise<void> {
+    await this.startPromise?.catch(() => {});
+    if (this.closed || !this.sync) return;
+    this.unobserveBatches?.();
+    this.unobserveMeta?.();
+    this.unobserveBatches = null;
+    this.unobserveMeta = null;
+    const retired = this.sync;
+    const replacement = new PluginDbSync(this.opts.makeDoc(this.docId));
+    this.sync = replacement;
+    retired.destroy();
+    try {
+      await this.catchUp(replacement);
+    } catch (error) {
+      console.error(
+        `[Realtime] failed to rejoin plugin db ${this.docId} after an epoch change`,
+        error,
+      );
+      if (!this.closed && this.sync === replacement) this.setState("error", "unknown");
+    }
+  }
+
+  /**
+   * The cursor this device publishes: remote sites it has applied, plus the
+   * sites it published under itself. Each session opens a database with a new
+   * site id, and the server must not wait for this device to "apply" its own
+   * earlier sessions' batches before compacting them.
+   */
+  private publishedCursor(): Cursor {
+    return { ...this.cursor, ...this.published };
   }
 
   private async tryRestoreSnapshot(): Promise<boolean> {
@@ -537,7 +584,9 @@ export class SyncedPluginDatabase {
 
   /** Append batches for every change this device has produced past its cursor. */
   private async publishNow(): Promise<void> {
-    if (this.closed || !this.db || !this.sync) return;
+    const sync = this.sync;
+    const db = this.db;
+    if (this.closed || !db || !sync) return;
     // Every site id we own: the current one plus any we have published before
     // (crash recovery across restarts that minted new site ids).
     const ownSites = new Set<string>([this.siteHex, ...Object.keys(this.published)]);
@@ -546,12 +595,14 @@ export class SyncedPluginDatabase {
       const since = this.published[site] ?? 0;
       let rows: ChangeRow[];
       try {
-        rows = await readChangesForSite(this.db, hexToBytes(site), since);
+        rows = await readChangesForSite(db, hexToBytes(site), since);
       } catch (e) {
         console.warn(`[Realtime] reading changes for ${site} failed`, e);
         continue;
       }
-      if (rows.length === 0) continue;
+      // A retired log (epoch change) or a replaced database would take the
+      // batch and the watermark with it; the next pass publishes these rows.
+      if (rows.length === 0 || this.sync !== sync || this.db !== db) continue;
 
       // A cursor contains only db_version, so rows from one committed version
       // are indivisible: splitting them would make the receiver advance to V
@@ -586,14 +637,14 @@ export class SyncedPluginDatabase {
           format: SYNC_FORMAT,
         };
         this.appliedBatchIds.add(batch.id);
-        this.sync.appendBatch(batch);
+        sync.appendBatch(batch);
         this.published[site] = batch.toDbVersion;
         fromDbVersion = batch.toDbVersion;
         publishedAny = true;
       }
     }
     if (publishedAny) {
-      this.sync.setCursor(this.siteHex, this.cursor);
+      sync.setCursor(this.siteHex, this.publishedCursor());
       this.opts.touch?.();
       this.scheduleSnapshot();
     }
@@ -713,7 +764,7 @@ export class SyncedPluginDatabase {
     }
 
     if (cursorChanged) {
-      this.sync.setCursor(this.siteHex, this.cursor);
+      this.sync.setCursor(this.siteHex, this.publishedCursor());
       this.scheduleSnapshot();
     }
     if (needsRebase) {

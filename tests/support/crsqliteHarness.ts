@@ -29,7 +29,8 @@ const TASKS_MIGRATE: SyncedPluginDatabaseOptions["migrate"] = async (tx, from) =
 };
 
 export interface MakeEngineOpts {
-  doc: Y.Doc;
+  /** The batch log's document, or a function naming the current one. */
+  doc: Y.Doc | (() => Y.Doc);
   snap?: SnapStore;
   schemaVersion?: number;
   migrate?: SyncedPluginDatabaseOptions["migrate"];
@@ -40,6 +41,7 @@ export interface MakeEngineOpts {
 
 export function makeEngine(opts: MakeEngineOpts): SyncedPluginDatabase {
   const snap = opts.snap ?? newSnapStore();
+  const doc = opts.doc;
   return new SyncedPluginDatabase({
     vaultId: "vault",
     pluginId: opts.pluginId ?? "test-plugin",
@@ -47,7 +49,7 @@ export function makeEngine(opts: MakeEngineOpts): SyncedPluginDatabase {
     schemaVersion: opts.schemaVersion ?? 1,
     migrate: opts.migrate ?? TASKS_MIGRATE,
     locateWasm: () => WASM_DATA_URL,
-    makeDoc: () => makeMemoryDocHandle(opts.doc),
+    makeDoc: () => makeMemoryDocHandle(typeof doc === "function" ? doc() : doc),
     loadSnapshot: async () => snap.text,
     saveSnapshot: async (text) => {
       snap.text = text;

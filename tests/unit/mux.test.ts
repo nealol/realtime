@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import * as encoding from "lib0/encoding";
-import * as decoding from "lib0/decoding";
 import {
   MuxWebSocket,
   decodeFrame,
@@ -10,7 +9,6 @@ import {
   resetMuxForTests,
   setMuxWebSocketCtor,
 } from "../../src/sync/mux";
-import { setEpochProposalHandler } from "../../src/documentEpoch";
 
 /**
  * A controllable stand-in for the real WebSocket the mux opens to `/dmux`.
@@ -59,13 +57,11 @@ const DOC2_URL = "wss://sync.example.com/d/vault__def/ws/vault__def?token=t-def"
 
 beforeEach(() => {
   resetMuxForTests();
-  setEpochProposalHandler(null);
   FakeServerSocket.instances = [];
   setMuxWebSocketCtor(FakeServerSocket as unknown as { new (url: string): WebSocket });
 });
 
 afterEach(() => {
-  setEpochProposalHandler(null);
   vi.useRealTimers();
   vi.restoreAllMocks();
 });
@@ -102,7 +98,7 @@ describe("MuxWebSocket", () => {
     // Both channels resolve to the same origin -> one real socket to /dmux.
     expect(FakeServerSocket.instances).toHaveLength(1);
     const server = FakeServerSocket.instances[0];
-    expect(server.url).toBe("wss://sync.example.com/dmux");
+    expect(server.url).toBe("wss://sync.example.com/dmux?chunked=1");
 
     server.open();
     const opens = server.frames().filter((f) => f?.type === "open");
@@ -204,38 +200,42 @@ describe("MuxWebSocket", () => {
     expect(data?.type === "data" && Array.from(data.payload)).toEqual([1, 2, 3]);
   });
 
-  it("persists epoch proposals through the handler before acknowledging them", () => {
-    let persistedEpoch = 0;
-    setEpochProposalHandler((documentId, epoch) => {
-      expect(documentId).toBe("vault__abc");
-      persistedEpoch = epoch;
-    });
+  it("joins PART frames into one message for the provider", () => {
     const socket = new MuxWebSocket(DOC_URL);
-    const onmessage = vi.fn();
-    socket.onmessage = onmessage;
+    const received: Uint8Array[] = [];
+    socket.onmessage = (event) => received.push(event.data as Uint8Array);
     const server = FakeServerSocket.instances[0];
     server.open();
     const channel = openChannelId(server, "/d/vault__abc/ws/vault__abc?token=t-abc");
     server.deliver(simpleFrame(2, channel));
 
-    const proposal = encoding.createEncoder();
-    encoding.writeVarUint(proposal, 103);
-    encoding.writeVarUint8Array(proposal, new TextEncoder().encode(JSON.stringify({ epoch: 7 })));
-    server.deliver(encodeData(channel, encoding.toUint8Array(proposal)));
+    server.deliver(encodeData(channel, new Uint8Array([1, 2]), false));
+    server.deliver(encodeData(channel, new Uint8Array([3]), false));
+    expect(received).toHaveLength(0);
+    server.deliver(encodeData(channel, new Uint8Array([4, 5])));
+    expect(received.map((message) => Array.from(message))).toEqual([[1, 2, 3, 4, 5]]);
+  });
 
-    expect(persistedEpoch).toBe(7);
-    expect(onmessage).not.toHaveBeenCalled();
-    const acknowledgement = server
-      .frames()
-      .filter((frame) => frame?.type === "data")
-      .at(-1);
-    expect(acknowledgement?.type).toBe("data");
-    if (acknowledgement?.type !== "data") throw new Error("missing epoch acknowledgement");
-    const decoder = decoding.createDecoder(acknowledgement.payload);
-    expect(decoding.readVarUint(decoder)).toBe(104);
-    expect(JSON.parse(new TextDecoder().decode(decoding.readVarUint8Array(decoder)))).toEqual({
-      epoch: 7,
-    });
+  it("splits large payloads only after the server accepts chunked frames", () => {
+    const socket = new MuxWebSocket(DOC_URL);
+    const server = FakeServerSocket.instances[0];
+    server.open();
+    const channel = openChannelId(server, "/d/vault__abc/ws/vault__abc?token=t-abc");
+    server.deliver(simpleFrame(2, channel));
+    const payload = new Uint8Array(150 * 1024).map((_, index) => index % 251);
+    const sentData = () => server.frames().filter((f) => f?.type === "data" || f?.type === "part");
+
+    socket.send(payload);
+    expect(sentData()).toHaveLength(1);
+
+    server.deliver(simpleFrame(9, 0));
+    socket.send(payload);
+    const frames = sentData().slice(1);
+    expect(frames.map((frame) => frame?.type)).toEqual(["part", "part", "data"]);
+    const joined = frames.flatMap((frame) =>
+      frame?.type === "part" || frame?.type === "data" ? Array.from(frame.payload) : [],
+    );
+    expect(joined).toEqual(Array.from(payload));
   });
 
   it("fans a real-socket drop out to every channel as error+close", () => {
@@ -257,6 +257,29 @@ describe("MuxWebSocket", () => {
     expect(bClose).toHaveBeenCalledOnce();
     expect(a.readyState).toBe(MuxWebSocket.CLOSED);
     expect(b.readyState).toBe(MuxWebSocket.CLOSED);
+  });
+
+  it("fails the channels of a closing socket it replaces, not the channel that replaced it", () => {
+    const a = new MuxWebSocket(DOC_URL);
+    const first = FakeServerSocket.instances[0];
+    first.open();
+    const aClose = vi.fn();
+    a.onclose = aClose;
+
+    // The server is closing the socket; its close event has not fired yet.
+    first.readyState = 2;
+    const b = new MuxWebSocket(DOC2_URL);
+    const bClose = vi.fn();
+    b.onclose = bClose;
+    first.onclose?.({});
+
+    expect(aClose).toHaveBeenCalledOnce();
+    expect(bClose).not.toHaveBeenCalled();
+    expect(FakeServerSocket.instances).toHaveLength(2);
+    const second = FakeServerSocket.instances[1];
+    second.open();
+    expect(openChannelId(second, "/d/vault__def/ws/vault__def?token=t-def")).toBeTypeOf("number");
+    expect(b.readyState).toBe(MuxWebSocket.CONNECTING);
   });
 
   it("delivers a server CLOSE frame to just that channel", () => {

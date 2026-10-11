@@ -5,6 +5,7 @@ import * as syncProtocol from "y-protocols/sync";
 import * as awarenessProtocol from "y-protocols/awareness";
 import { DocumentEpochPendingError, clientTokenExpired, type ClientToken } from "./clientToken";
 import { handleEpochProposal } from "../documentEpoch";
+import { HttpError } from "../httpError";
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -45,6 +46,12 @@ const RESPONSE_TIMEOUT_MS = 10_000;
  */
 const CONNECT_TIMEOUT_MS = 60_000;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+/**
+ * Longest an epoch acknowledgement waits for the server to confirm this
+ * client's pending changes. Well inside the server's 30s acknowledgement
+ * window, after which it activates the epoch without this client.
+ */
+const EPOCH_FLUSH_TIMEOUT_MS = 10_000;
 
 export const SYNC_EVENT_STATUS = "connection-status";
 export const SYNC_EVENT_LOCAL_CHANGES = "local-changes";
@@ -89,6 +96,8 @@ export interface RealtimeProviderOptions {
   awareness?: awarenessProtocol.Awareness;
   socketFactory?: SyncSocketFactory;
   onReadOnlyUpdate?: (update: Uint8Array) => void;
+  /** Extra query parameters for the document socket URL. */
+  socketParams?: Record<string, string>;
 }
 
 type TokenSource = () => Promise<ClientToken>;
@@ -126,6 +135,7 @@ export class RealtimeProvider {
   private readonly listeners = new Map<ProviderEvent, Set<AnyProviderListener>>();
   private readonly socketFactory: SyncSocketFactory;
   private readonly onReadOnlyUpdate?: (update: Uint8Array) => void;
+  private readonly socketParams: Record<string, string>;
   private socket: SyncSocket | null = null;
   private connectTask: Promise<void> | null = null;
   private connectTaskLifecycle = -1;
@@ -153,7 +163,13 @@ export class RealtimeProvider {
   private responseTimer: number | null = null;
   private handshakeTimer: number | null = null;
   private retryTimer: number | null = null;
+  /** Ends the current backoff sleep early (connect nudges); null when it must run out. */
   private wakeRetry: (() => void) | null = null;
+  /** Ends the current backoff sleep for disconnect/destroy. */
+  private cancelRetry: (() => void) | null = null;
+  /** A proposed epoch whose acknowledgement waits for pending changes to be confirmed. */
+  private pendingEpoch: number | null = null;
+  private epochFlushTimer: number | null = null;
 
   private readonly documentUpdateListener = (update: Uint8Array, origin: unknown): void => {
     if (origin === this || this.destroyed) return;
@@ -196,6 +212,7 @@ export class RealtimeProvider {
     this.awareness = options.awareness ?? new awarenessProtocol.Awareness(document);
     this.socketFactory = options.socketFactory ?? defaultSocketFactory;
     this.onReadOnlyUpdate = options.onReadOnlyUpdate;
+    this.socketParams = options.socketParams ?? {};
     this.document.on("update", this.documentUpdateListener);
     this.awareness.on("update", this.awarenessUpdateListener);
     if (options.connect !== false) void this.connect();
@@ -233,7 +250,7 @@ export class RealtimeProvider {
     if (this.destroyed) return;
     this.shouldConnect = false;
     this.lifecycle += 1;
-    this.wakeRetry?.();
+    this.cancelRetry?.();
     this.closeSocket();
     this.setStatus(SYNC_STATUS_OFFLINE);
   }
@@ -243,7 +260,7 @@ export class RealtimeProvider {
     this.destroyed = true;
     this.shouldConnect = false;
     this.lifecycle += 1;
-    this.wakeRetry?.();
+    this.cancelRetry?.();
     this.closeSocket();
     this.document.off("update", this.documentUpdateListener);
     this.awareness.off("update", this.awarenessUpdateListener);
@@ -314,10 +331,12 @@ export class RealtimeProvider {
         console.warn("Realtime: failed to get a document token", error);
         this.lastConnectionError = error instanceof Error ? error.message : String(error);
         // Back off per document so one persistently failing document cannot
-        // keep hammering the token endpoint every few seconds.
+        // keep hammering the token endpoint every few seconds. A refusal
+        // about this document sleeps out its backoff even when reconnect
+        // nudges arrive; no response at all (offline) may retry on a nudge.
         const delay = Math.min(MAX_TOKEN_RETRY_MS, TOKEN_RETRY_MS * 2 ** this.tokenFailures);
         this.tokenFailures += 1;
-        await this.sleep(delay, lifecycle);
+        await this.sleep(delay, lifecycle, !(error instanceof HttpError));
         continue;
       }
       if (!this.canContinue(lifecycle)) return;
@@ -471,6 +490,9 @@ export class RealtimeProvider {
     if (this.socket !== socket) return;
     this.lastConnectionError = reason;
     this.socket = null;
+    // The acknowledgement can only travel on this socket. A reconnect learns
+    // the epoch from its token instead.
+    this.clearEpochHandoff();
     detachSocket(socket);
     try {
       socket.close();
@@ -489,6 +511,7 @@ export class RealtimeProvider {
   private closeSocket(): void {
     const socket = this.socket;
     this.socket = null;
+    this.clearEpochHandoff();
     this.clearSocketTimers();
     this.completeAttempt?.(false);
     this.removeRemoteAwareness();
@@ -506,6 +529,9 @@ export class RealtimeProvider {
     if (!url.pathname.endsWith("/")) url.pathname += "/";
     url.pathname += encodeURIComponent(token.docId);
     if (token.token) url.searchParams.set("token", token.token);
+    for (const [name, value] of Object.entries(this.socketParams)) {
+      url.searchParams.set(name, value);
+    }
     return url.toString();
   }
 
@@ -565,7 +591,7 @@ export class RealtimeProvider {
         break;
       }
       case MESSAGE_EPOCH_PROPOSAL:
-        this.acknowledgeEpoch(decoding.readVarUint8Array(decoder));
+        this.receiveEpochProposal(decoding.readVarUint8Array(decoder));
         break;
       case MESSAGE_DOCUMENT_INVALIDATED:
         this.receiveDocumentInvalidation(decoding.readVarUint8Array(decoder));
@@ -584,18 +610,55 @@ export class RealtimeProvider {
     this.emit(SYNC_EVENT_DOCUMENT_INVALIDATED, parsed.documentId);
   }
 
-  private acknowledgeEpoch(payload: Uint8Array): void {
+  /**
+   * The server proposed a new epoch. Acknowledging it retires this document,
+   * and the replacement can use this document's content as its merge
+   * baseline only once the server has confirmed all of it. The server keeps
+   * accepting this connection's writes until the acknowledgement, so pending
+   * changes are confirmed first (bounded by EPOCH_FLUSH_TIMEOUT_MS).
+   */
+  private receiveEpochProposal(payload: Uint8Array): void {
     const parsed = JSON.parse(new TextDecoder().decode(payload)) as { epoch?: unknown };
     if (!Number.isSafeInteger(parsed.epoch) || (parsed.epoch as number) < 0) {
       throw new Error("invalid document epoch proposal");
     }
-    const epoch = parsed.epoch as number;
-    handleEpochProposal(this.documentId, epoch);
+    this.pendingEpoch = parsed.epoch as number;
+    // A read-only server never confirms this client's content; waiting would
+    // only delay the epoch.
+    if (!this.hasLocalChanges || this.clientToken?.authorization === "read-only") {
+      this.finishEpochHandoff();
+      return;
+    }
+    this.checkSync();
+    this.epochFlushTimer ??= window.setTimeout(
+      () => this.finishEpochHandoff(),
+      EPOCH_FLUSH_TIMEOUT_MS,
+    );
+  }
 
+  /** Persist the pending epoch and acknowledge it on the current socket. */
+  private finishEpochHandoff(): void {
+    const epoch = this.pendingEpoch;
+    this.clearEpochHandoff();
+    const socket = this.socket;
+    if (epoch === null || !socket) return;
+    try {
+      handleEpochProposal(this.documentId, epoch);
+    } catch (error) {
+      console.warn("Realtime: could not accept a document epoch", error);
+      this.failSocket(socket, this.lifecycle, "epoch proposal rejected");
+      return;
+    }
     const encoder = encoding.createEncoder();
     encoding.writeVarUint(encoder, MESSAGE_EPOCH_ACKNOWLEDGEMENT);
     encoding.writeVarUint8Array(encoder, new TextEncoder().encode(JSON.stringify({ epoch })));
     this.send(encoding.toUint8Array(encoder));
+  }
+
+  private clearEpochHandoff(): void {
+    window.clearTimeout(this.epochFlushTimer ?? undefined);
+    this.epochFlushTimer = null;
+    this.pendingEpoch = null;
   }
 
   private broadcastAwareness(): void {
@@ -625,6 +688,7 @@ export class RealtimeProvider {
     if (this.clientToken?.authorization !== "read-only") this.readOnlyDivergence = false;
     this.acknowledgedVersion = Math.max(this.acknowledgedVersion, version);
     if (wasPending && !this.hasLocalChanges) this.emit(SYNC_EVENT_LOCAL_CHANGES, false);
+    if (this.pendingEpoch !== null && !this.hasLocalChanges) this.finishEpochHandoff();
   }
 
   /**
@@ -708,7 +772,7 @@ export class RealtimeProvider {
     return Math.min(MAX_RECONNECT_MS, RECONNECT_INITIAL_MS * Math.pow(1.1, this.retries));
   }
 
-  private sleep(ms: number, lifecycle: number): Promise<void> {
+  private sleep(ms: number, lifecycle: number, wakeable = true): Promise<void> {
     if (!this.canContinue(lifecycle)) return Promise.resolve();
     let resolve!: () => void;
     const promise = new Promise<void>((done) => {
@@ -718,9 +782,11 @@ export class RealtimeProvider {
       window.clearTimeout(this.retryTimer ?? undefined);
       this.retryTimer = null;
       this.wakeRetry = null;
+      this.cancelRetry = null;
       resolve();
     };
-    this.wakeRetry = finish;
+    this.wakeRetry = wakeable ? finish : null;
+    this.cancelRetry = finish;
     this.retryTimer = window.setTimeout(finish, ms);
     return promise;
   }

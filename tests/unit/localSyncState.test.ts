@@ -111,4 +111,28 @@ describe("LocalSyncState", () => {
       local.destroy();
     }
   });
+
+  it("forgets recorded identities once the vault index epoch goes back", async () => {
+    const scope = `local-state-test:${freshGuid()}`;
+    const first = new LocalSyncState(scope);
+    await first.whenSynced;
+    first.adoptIndexEpoch(2);
+    first.markSynced("note.md", "text", "guid", "fingerprint");
+    // A newer epoch keeps what this device agreed with the server.
+    expect(first.adoptIndexEpoch(3)).toBe(false);
+    expect(first.get("note.md")?.identity).toBe("guid");
+    first.destroy();
+
+    // A restored backup's older index is another timeline. The recorded epoch
+    // survives a restart, so the reset happens whenever sync next starts.
+    const restarted = new LocalSyncState(scope);
+    try {
+      await restarted.whenSynced;
+      expect(restarted.adoptIndexEpoch(1)).toBe(true);
+      expect(restarted.has("note.md")).toBe(false);
+      expect(restarted.adoptIndexEpoch(1)).toBe(false);
+    } finally {
+      restarted.destroy();
+    }
+  });
 });

@@ -234,11 +234,12 @@ pub async fn index_set_binary_if(
     precondition: AttachmentPrecondition<'_>,
 ) -> AppResult<()> {
     modify(state, vault_id, |current| {
-        let existing = decode_binaries_map(current)
+        let existing_meta = decode_binaries_map(current)
             .map_err(|e| AppError::Internal(e.to_string()))?
             .into_iter()
             .find(|(p, _)| p == path)
-            .and_then(|(_, meta)| binary_hash_size(&meta));
+            .map(|(_, meta)| meta);
+        let existing = existing_meta.as_ref().and_then(binary_hash_size);
         let existing_hash = existing.as_ref().map(|(hash, _)| hash.as_str());
         match precondition {
             AttachmentPrecondition::None => {}
@@ -262,16 +263,58 @@ pub async fn index_set_binary_if(
         // Record the version this replaces, like clients do, so a client whose
         // concurrent publish loses the map to this one sees a conflict rather
         // than a clean update.
-        let prev = existing_hash.map_or(Any::Null, |hash| Any::String(hash.into()));
-        let metadata = HashMap::from([
-            ("hash".to_string(), Any::String(hash.into())),
-            ("size".to_string(), Any::BigInt(size)),
-            ("prev".to_string(), prev),
-        ]);
+        let metadata = binary_metadata(hash, size, existing_meta.as_ref());
         let update = build_map_set_update(current, "binaries", path, metadata)?;
         Ok((update, ()))
     })
     .await
+}
+
+/// Ancestors one binary entry remembers, and the hash prefix length kept for
+/// each. Mirrors `src/lineage.ts`.
+const LINEAGE_LENGTH: usize = 8;
+const LINEAGE_PREFIX: usize = 16;
+
+/// Metadata for a binary version replacing `replaced` (the map value the path
+/// holds now, if any): the version it replaced and its lineage, like clients
+/// record, so devices can tell an update built on theirs from a concurrent one.
+fn binary_metadata(hash: &str, size: i64, replaced: Option<&Any>) -> HashMap<String, Any> {
+    let mut metadata = HashMap::from([
+        ("hash".to_string(), Any::String(hash.into())),
+        ("size".to_string(), Any::BigInt(size)),
+    ]);
+    let replaced_hash = match replaced {
+        Some(Any::Map(meta)) => match meta.get("hash") {
+            Some(Any::String(replaced_hash)) => Some(replaced_hash.to_string()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(replaced_hash) = replaced_hash else {
+        metadata.insert("prev".to_string(), Any::Null);
+        return metadata;
+    };
+    let mut lineage = vec![Any::String(
+        replaced_hash
+            .chars()
+            .take(LINEAGE_PREFIX)
+            .collect::<String>()
+            .into(),
+    )];
+    if let Some(Any::Map(meta)) = replaced {
+        if let Some(Any::Array(prior)) = meta.get("lineage") {
+            lineage.extend(
+                prior
+                    .iter()
+                    .filter(|entry| matches!(entry, Any::String(_)))
+                    .cloned(),
+            );
+        }
+    }
+    lineage.truncate(LINEAGE_LENGTH);
+    metadata.insert("prev".to_string(), Any::String(replaced_hash.into()));
+    metadata.insert("lineage".to_string(), Any::Array(lineage.into()));
+    metadata
 }
 
 pub async fn index_remove_binary(state: &AppState, vault_id: &str, path: &str) -> AppResult<()> {
@@ -457,10 +500,11 @@ pub fn build_index_batch_update(current_update: &[u8], ops: &[IndexOp]) -> AppRe
                     files_map.remove(&mut txn, path);
                 }
                 IndexOp::SetBinary { path, hash, size } => {
-                    let metadata = HashMap::from([
-                        ("hash".to_string(), Any::String(hash.as_str().into())),
-                        ("size".to_string(), Any::BigInt(*size)),
-                    ]);
+                    let replaced = binaries
+                        .iter()
+                        .find(|(p, _)| p == path)
+                        .map(|(_, meta)| meta);
+                    let metadata = binary_metadata(hash, *size, replaced);
                     binaries_map.insert(&mut txn, path.to_string(), metadata);
                 }
                 IndexOp::RemoveBinary { path } => {

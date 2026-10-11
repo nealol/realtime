@@ -140,6 +140,8 @@ aren't durable.
 Servers advertise this behavior through the `documentInvalidation` capability. When
 that capability is absent or unsupported, mobile sync remains available but document
 eviction is disabled so a continuously connected client cannot retain a stale file.
+Desktop clients never evict documents, so they opt out of invalidation messages
+(`invalidations=0` on the vault index connection) and the server skips sending them.
 
 Both limits are per-device settings under **Settings → Realtime → Advanced settings**.
 A transfer already in flight may finish its network request while Obsidian is hidden,
@@ -229,9 +231,18 @@ partially merged index as settled state.
 - Canvas and Bases merges preserve a full remote copy when both sides changed
   the same value. Binary and settings conflicts also retain the version that
   would otherwise be replaced.
+- Attachment and settings entries record the versions they descend from. A
+  device that missed several saves made elsewhere downloads the latest one
+  instead of treating it as a conflict or reverting it.
 - When another device deletes a path, an unchanged local file is removed. Local
   edits first move to a conflicted copy, including when the deletion reached
   IndexedDB before the previous process stopped.
+- Edits to a note this device can only read never reach the server. They are
+  kept in one conflicted copy per session, rewritten as the note changes.
+- A server restored from a backup can hold older document epochs than a
+  device last saw. The device then rejoins like a new device. Notes that
+  differ open the conflict picker, and files the restored index lacks are
+  uploaded again instead of being deleted locally.
 
 Conflicted copies include the device or `Remote` label plus a timestamp in
 their filename. Realtime excludes them from text, structured-file, attachment,

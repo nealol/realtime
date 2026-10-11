@@ -382,6 +382,16 @@ export class RealtimeSqlAPI {
     return engines.length;
   }
 
+  /**
+   * A plugin database's document moved to a new epoch. Only that database
+   * reconnects; its local data and every handle a plugin holds stay valid.
+   * A database that is not open picks up the new epoch when next opened.
+   */
+  async rebuildDocumentForEpoch(documentId: string): Promise<void> {
+    const engines = [...this.engines.values()].filter((engine) => engine.docId === documentId);
+    await Promise.all(engines.map((engine) => engine.replaceTransport()));
+  }
+
   /** Close every open database (plugin unload). */
   async destroy(): Promise<void> {
     for (const cancel of [...this.availabilityCancels]) cancel();

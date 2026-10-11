@@ -277,7 +277,17 @@ export abstract class StructuredDocument extends SyncedDoc {
       else this.diskKnownText = serialized;
       return;
     }
-    if (serialized === this.diskKnownText || serialized === this.writingTextToDisk) return;
+    if (serialized === this.writingTextToDisk) return;
+    if (!this.startupReconciled) {
+      // The startup reconcile has not merged the file yet, and the document
+      // still holds only its stored baseline. A later edit replaces what the
+      // reconcile will merge instead of being folded against a stale base.
+      this.diskAtStartup = disk;
+      this.diskKnownText = serialized;
+      this.localChangedAtStartup = serialized !== this.baselineTextAtStartup;
+      return;
+    }
+    if (serialized === this.diskKnownText) return;
     if (serialized === this.serialize(this.value)) {
       this.noteDiskContent(serialized);
       return;
@@ -288,21 +298,24 @@ export abstract class StructuredDocument extends SyncedDoc {
   /**
    * Fold a disk edit into the document, merging it against the content the
    * file last matched so changes the document gained since (typically remote
-   * edits whose disk write was pending) survive.
+   * edits whose disk write was pending) survive. The merge is computed and
+   * applied with no await in between, so remote edits that arrive during a
+   * disk read or a recovery copy are merged rather than reverted.
    */
   private async foldDiskEdit(disk: JsonValue): Promise<void> {
     this.plugin.vaultSync?.noteTextActivity();
     const diskText = this.serialize(disk);
-    // Compare file-level shapes: the CRDT value also carries internal state
-    // (e.g. canvas tombstone maps) that never reaches disk.
-    const sharedText = this.serialize(this.value);
-    const shared = this.parse(sharedText);
     const base = this.diskKnownText === null ? null : this.parse(this.diskKnownText);
-    let next: JsonValue = disk;
-    if (base !== null) {
-      const merge = mergeStructuredStartupResult(base, disk, shared);
-      next = merge.value;
-      if (merge.conflicted && sharedText !== this.diskKnownText) {
+    let preserved: string | null = null;
+    for (;;) {
+      const latest = await this.readParsedFromDisk();
+      if (this.destroyed || latest === null || this.serialize(latest) !== diskText) return;
+      // Compare file-level shapes: the CRDT value also carries internal state
+      // (e.g. canvas tombstone maps) that never reaches disk.
+      const sharedText = this.serialize(this.value);
+      const merge =
+        base === null ? null : mergeStructuredStartupResult(base, disk, this.parse(sharedText));
+      if (merge?.conflicted && sharedText !== this.diskKnownText && sharedText !== preserved) {
         const preservedPath = await preserveTextConflict(
           this.plugin,
           this.path,
@@ -310,16 +323,17 @@ export abstract class StructuredDocument extends SyncedDoc {
           "remote",
         );
         if (this.destroyed) return;
+        preserved = sharedText;
         new Notice(
           `Realtime: "${this.path}" was edited on disk while newer changes were arriving; ` +
             `merged them and preserved the other version as "${preservedPath}".`,
         );
+        continue;
       }
+      this.applyValue(merge ? merge.value : disk, DISK_ORIGIN);
+      this.noteDiskContent(diskText);
+      return;
     }
-    const latest = await this.readParsedFromDisk();
-    if (this.destroyed || latest === null || this.serialize(latest) !== diskText) return;
-    this.applyValue(next, DISK_ORIGIN);
-    this.noteDiskContent(diskText);
   }
 
   /** The file is known to hold `text`, which this document now contains. */

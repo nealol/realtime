@@ -246,6 +246,9 @@ failure stops the document instead of replacing it with an empty one. If the
 next record would cross the 512 MiB replay limit, the server compacts
 synchronously before appending it, and the append path rejects any segment
 that still cannot stay within that limit.
+An update that passes validation but cannot be integrated into the live
+document is rejected, and its log record is removed before the document
+accepts another write.
 
 Long-lived documents also use logical epochs. The server measures encoded
 state, encoded delete-set size, accepted updates, age, and active connections.
@@ -254,6 +257,8 @@ encoded state/delete-set growth above the epoch's clean logical baseline reaches
 a configured bound. Connected clients persist the epoch and acknowledge it before the
 server accepts any later write from that connection. The replacement contains
 the same logical Y.Text, Y.Map, and Y.Array content with fresh CRDT identities.
+The plugin acknowledges only after the server confirms its pending changes
+(waiting at most ten seconds), so the replacement includes them.
 Epochs are monotonic on the client: after acknowledging a proposal, a client
 retries token acquisition until that epoch activates rather than reopening the
 older namespace while another client is still acknowledging. While a proposal
@@ -262,11 +267,18 @@ is pending, newly minted document tokens name the pending epoch and carry
 client joins the retiring epoch after the proposal (its items would otherwise
 be re-uploaded into the replacement as duplicate content). Activation waits
 for connected peers to acknowledge for at most `CRDT_EPOCH_ACK_TIMEOUT_MS`.
+Activation closes every connection still on the retired epoch, including peers
+that never acknowledged, so their clients reconnect to the replacement.
 The old physical document remains immutable for
 `CRDT_EPOCH_RECOVERY_DAYS`; tokens for a retired epoch receive HTTP 409 and
 clients obtain a fresh token and Y.Doc. The epoch manifest is the activation
 commit point, so an interrupted replacement leaves the old epoch authoritative
 and resumes on restart.
+
+Restoring a full backup can leave a document at an older epoch than clients
+last acknowledged. Once tokens have named the older epoch for ten minutes, the
+plugin follows the server. It drops its local stores for the epochs that no
+longer exist and rejoins that document like a new device.
 
 Stop the server before running maintenance commands:
 

@@ -9,6 +9,7 @@ import { openBinaryConflictModal, type ConflictChoice } from "./BinaryConflictMo
 import type { LocalSyncState } from "./localSyncState";
 import { preserveBinaryConflict } from "./conflictRecovery";
 import { HttpError, isServerUnavailableStatus } from "./httpError";
+import { descendsFrom, lineageAfter } from "./lineage";
 
 /**
  * Upload-queue state surfaced to the status bar:
@@ -32,6 +33,16 @@ export interface BinaryMeta {
    * Absent on entries from older clients.
    */
   prev?: string | null;
+  /** Hash prefixes of the versions this one descends from (see `src/lineage.ts`). */
+  lineage?: string[];
+}
+
+/**
+ * Byte length of a remote entry. The server writes `size` as an i64, which
+ * Yjs decodes as a bigint, while clients write a plain number.
+ */
+function remoteSize(meta: BinaryMeta | undefined): number | undefined {
+  return meta?.size === undefined ? undefined : Number(meta.size);
 }
 
 /** Files at or above this size are uploaded in the background, deferred while
@@ -279,7 +290,9 @@ export class BinarySync {
       if (this.destroyed) break;
       // A local-only file is read (hashed and uploaded), so it costs its size too.
       const size =
-        this.binaries.get(path)?.size ?? getFileByPath(this.plugin.app, path)?.stat?.size ?? 0;
+        remoteSize(this.binaries.get(path)) ??
+        getFileByPath(this.plugin.app, path)?.stat?.size ??
+        0;
       while (
         running.size > 0 &&
         (running.size >= maxJobs || bytesInFlight + size > RECONCILE_MAX_BYTES_IN_FLIGHT)
@@ -498,18 +511,23 @@ export class BinarySync {
       if (base === remoteHash) {
         // Clean local edit: remote hasn't moved since our baseline.
         await this.queueLocalUpload(path, remoteHash, localHash);
-      } else if (base === localHash) {
+      } else if (base === localHash && remote) {
         // Local matches the baseline and the remote moved. That is a clean
-        // remote update only if the remote version was built on our baseline.
-        const remotePrev = remote && "prev" in remote ? (remote.prev ?? null) : undefined;
-        if (remotePrev === base) {
+        // remote update unless it raced a publish of ours.
+        const state = this.localSyncState?.get(path);
+        const ownBase = state?.identity === base && state.publishedFrom !== undefined;
+        if (descendsFrom(remote, base)) {
           await this.downloadToDisk(path, remoteHash, localHash);
-        } else if (remoteHash === this.localSyncState?.get(path)?.replacedIdentity) {
+        } else if (remoteHash === state?.replacedIdentity) {
           // The remote is still exactly the version our last publish replaced:
           // that publish never reached the shared index (e.g. the index moved
           // to a new epoch first). Publish it again rather than revert it.
           await this.queueLocalUpload(path, remoteHash, localHash);
-        } else if (remotePrev === undefined) {
+        } else if (this.localSyncState && !ownBase) {
+          // Another device published our baseline, so no publish of ours can
+          // have lost a race: the remote merely moved on by several versions.
+          await this.downloadToDisk(path, remoteHash, localHash);
+        } else if (!("prev" in remote)) {
           // Published by an older client that records no parent: assume, as
           // before, that it was built on ours.
           await this.downloadToDisk(path, remoteHash, localHash);
@@ -562,7 +580,7 @@ export class BinarySync {
       window.setTimeout(() => void this.reconcile(path), DRAIN_RETRY_MS);
       return false;
     }
-    const size = this.binaries.get(path)?.size ?? 0;
+    const size = remoteSize(this.binaries.get(path)) ?? 0;
     return this.downloadLimiter.run(size, () => this.transferToDisk(path, hash, expectedLocalHash));
   }
 
@@ -696,7 +714,7 @@ export class BinarySync {
     // so the attachment stays recoverable (its blob is retained until GC).
     const meta = this.binaries.get(path);
     if (meta?.hash) {
-      this.vaultSync.recordTrash({ path, kind: "binary", hash: meta.hash, size: meta.size });
+      this.vaultSync.recordTrash({ path, kind: "binary", hash: meta.hash, size: remoteSize(meta) });
     }
     this.indexDoc.transact(() => {
       this.binaries.delete(path);
@@ -729,8 +747,15 @@ export class BinarySync {
     if (this.destroyed) return false;
     this.ignoredPaths.delete(path);
     this.lastSyncedHash.delete(path);
+    const replaced = this.binaries.get(path);
+    const lineage = lineageAfter(replaced);
     this.indexDoc.transact(() => {
-      this.binaries.set(path, { hash, size, prev: this.binaries.get(path)?.hash ?? null });
+      this.binaries.set(path, {
+        hash,
+        size,
+        prev: replaced?.hash ?? null,
+        ...(lineage.length > 0 ? { lineage } : {}),
+      });
     });
     void this.reconcile(path);
     return true;
@@ -882,18 +907,21 @@ export class BinarySync {
       void this.reconcile(job.path);
       return true;
     }
+    const replaced = this.binaries.get(job.path);
     if (
       job.expectedRemoteHash !== undefined &&
-      (this.binaries.get(job.path)?.hash ?? null) !== job.expectedRemoteHash
+      (replaced?.hash ?? null) !== job.expectedRemoteHash
     ) {
       void this.reconcile(job.path);
       return true;
     }
     // Publish only now that the bytes are on the server.
+    const lineage = lineageAfter(replaced);
     this.publishMeta(job.path, {
       hash: job.hash,
       size,
       prev: job.expectedRemoteHash ?? null,
+      ...(lineage.length > 0 ? { lineage } : {}),
     });
     this.urgentPaths.delete(job.path);
     dbg("binary uploaded+published", job.path, job.hash, job.size);

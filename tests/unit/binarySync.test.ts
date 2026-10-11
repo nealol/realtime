@@ -9,6 +9,8 @@ import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { freshGuid, waitFor } from "../support/util";
 import { LocalSyncState } from "../../src/localSyncState";
 import { sha256Hex } from "../../src/hash";
+import type RealtimePlugin from "../../src/main";
+import type { VaultSync } from "../../src/VaultSync";
 
 const binaryModal = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -203,6 +205,44 @@ describe("BinarySync", () => {
       expect(peak).toBeLessThanOrEqual(6);
       // Two 20 MB files exceed the in-flight byte budget, so they run alone.
       expect(largePeak).toBe(1);
+    } finally {
+      bs.destroy();
+      indexDoc.destroy();
+    }
+  });
+
+  it("downloads attachments the server indexed with a bigint size", async () => {
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const data = bytes([4, 2]);
+    const hash = await sha256Hex(data);
+    const indexDoc = new Y.Doc();
+    const binaries = indexDoc.getMap<BinaryMeta>("binaries");
+
+    // The server writes `size` as an i64, which Yjs decodes as a bigint.
+    binaries.set("startup.png", { hash, size: 2n as unknown as number });
+    binaries.set("prioritized.png", { hash, size: 2n as unknown as number });
+    plugin.auth.getBlob = async () => data;
+
+    // The fakes cover only what BinarySync touches.
+    const bs = new BinarySync(
+      plugin as unknown as ConstructorParameters<typeof BinarySync>[0],
+      { isTextSyncBusy: () => false, recordTrash: () => {} } as unknown as ConstructorParameters<
+        typeof BinarySync
+      >[1],
+      indexDoc,
+    );
+    try {
+      bs.seedBaseline();
+      bs.prioritizePaths(["prioritized.png"]);
+      await bs.reconcileAll([]);
+      await waitFor(() => vault.binaries.has("prioritized.png"), {
+        label: "prioritized download",
+      });
+      expect(asArray(vault.binaries.get("startup.png"))).toEqual([4, 2]);
+      expect(asArray(vault.binaries.get("prioritized.png"))).toEqual([4, 2]);
     } finally {
       bs.destroy();
       indexDoc.destroy();
@@ -698,6 +738,64 @@ describe("BinarySync", () => {
       bs.destroy();
       indexDoc.destroy();
       localState.destroy();
+    }
+  });
+
+  it("downloads an untouched attachment saved twice elsewhere without a conflict", async () => {
+    for (const ownBaseline of [false, true]) {
+      binaryModal.calls.length = 0;
+      const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+        sessionToken: token,
+        activeVaultId: vaultId,
+      });
+      const [v1, v2, v3] = [bytes([1]), bytes([2, 2]), bytes([3, 3, 3])];
+      const [h1, h2, h3] = await Promise.all([v1, v2, v3].map(sha256Hex));
+      const blobs = new Map([
+        [h1, v1],
+        [h2, v2],
+        [h3, v3],
+      ]);
+      plugin.auth.getBlob = async (_vault: string, _path: string | null, hash: string) =>
+        blobs.get(hash)!;
+      plugin.auth.blobExists = async () => true;
+      vault.binaries.set("img.png", v1);
+      const localState = new LocalSyncState(`binary-missed:${freshGuid()}`);
+      await localState.whenSynced;
+      // Either another device published v1, or this one did (over nothing).
+      if (ownBaseline) localState.markPublished("img.png", "binary", h1, null);
+      else localState.markSynced("img.png", "binary", h1, h1);
+      const indexDoc = new Y.Doc();
+      const binaries = indexDoc.getMap<BinaryMeta>("binaries");
+      binaries.set("img.png", { hash: h1, size: 1, prev: null });
+      // The fakes implement the slices of the plugin and VaultSync used here.
+      const realtime = plugin as unknown as RealtimePlugin;
+      const vaultSync = {
+        isTextSyncBusy: () => false,
+        recordTrash: () => {},
+      } as unknown as VaultSync;
+      const bs = new BinarySync(realtime, vaultSync, indexDoc, localState);
+      try {
+        bs.seedBaseline();
+        await bs.reconcileAll(["img.png"]);
+        // Two saves elsewhere; only the latest entry reaches this device. A
+        // baseline another device published cannot have lost a race; this
+        // device's own baseline needs the lineage to show v3 descends from it.
+        binaries.set("img.png", {
+          hash: h3,
+          size: 3,
+          prev: h2,
+          ...(ownBaseline ? { lineage: [h2.slice(0, 16), h1.slice(0, 16)] } : {}),
+        });
+        await waitFor(() => asArray(vault.binaries.get("img.png"))?.length === 3, {
+          label: `downloaded v3 (own baseline: ${ownBaseline})`,
+        });
+        expect(binaryModal.calls).toEqual([]);
+        expect(binaries.get("img.png")?.hash).toBe(h3);
+      } finally {
+        bs.destroy();
+        indexDoc.destroy();
+        localState.destroy();
+      }
     }
   });
 

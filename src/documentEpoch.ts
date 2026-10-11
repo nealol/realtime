@@ -39,6 +39,36 @@ export function setDocumentEpoch(
   return previous !== epoch;
 }
 
+/**
+ * Move a document's epoch back to `epoch`. Only for a server whose epoch went
+ * backward (a restored backup); a proposal never lowers it.
+ */
+export function rewindDocumentEpoch(
+  plugin: RealtimePlugin,
+  documentId: string,
+  epoch: number,
+): void {
+  if (!Number.isSafeInteger(epoch) || epoch < 0) {
+    throw new Error(`Realtime: invalid document epoch ${String(epoch)} for "${documentId}".`);
+  }
+  const key = storageKey(plugin, documentId);
+  if (typeof localStorage === "undefined") fallbackEpochs.set(key, epoch);
+  else localStorage.setItem(key, String(epoch));
+}
+
+/**
+ * IndexedDB name, before the epoch suffix, of the local store that holds
+ * `documentId`: the vault index, a plugin database, or a file document.
+ */
+export function epochStoreBaseName(plugin: RealtimePlugin, documentId: string): string {
+  const server = plugin.settings.authServerId || plugin.settings.authServerUrl;
+  if (documentId === plugin.settings.activeVaultId) {
+    return `realtime:index:${server}:${documentId}`;
+  }
+  if (documentId.includes("__plugindb__")) return `realtime:plugindb:${server}:${documentId}`;
+  return documentId;
+}
+
 export function epochPersistenceName(
   plugin: RealtimePlugin,
   documentId: string,

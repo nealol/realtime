@@ -188,6 +188,35 @@ impl DocumentPersistence {
             .is_none_or(|projected| projected > self.max_log_bytes))
     }
 
+    /// Remove the record just appended, given the segment length before it.
+    pub(crate) async fn discard_last_record(
+        &mut self,
+        log_bytes_before: u64,
+    ) -> Result<(), StorageError> {
+        if log_bytes_before >= self.log_bytes {
+            return Ok(());
+        }
+        truncate_log(
+            &self.directory.join(log_name(self.generation)),
+            log_bytes_before,
+        )
+        .await?;
+        self.log_bytes = log_bytes_before;
+        self.records = self.records.saturating_sub(1);
+        self.total_records = self.total_records.saturating_sub(1);
+        Ok(())
+    }
+
+    /// Load this document again from its committed generation.
+    pub(crate) async fn reload(&self) -> Result<LoadedDocument, StorageError> {
+        load_existing(
+            &self.directory,
+            &self.document_id,
+            RecoveryMode::RecoverInterruptedAppend,
+        )
+        .await
+    }
+
     fn record_len(&self, update_bytes: usize) -> Result<u64, StorageError> {
         RECORD_HEADER_BYTES
             .checked_add(update_bytes)
@@ -588,7 +617,23 @@ async fn replay_log(
                 )
             }
         };
-        doc.transact_mut().apply_update(decoded);
+        let integrated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = doc.transact_mut().apply_update(decoded);
+        }))
+        .is_ok();
+        if !integrated {
+            // Every record here was integrated once before it was kept, so a
+            // panic now means damage; only an explicit repair may cut it.
+            if mode == RecoveryMode::Repair {
+                truncate_log(&path, record_start as u64).await?;
+                repaired = true;
+                break;
+            }
+            return corrupt(
+                document_id,
+                format!("update at record {records} cannot be integrated"),
+            );
+        }
         records += 1;
         offset = end;
         durable_len = end;
@@ -648,8 +693,15 @@ fn decode_doc(document_id: &str, update: &[u8]) -> Result<Doc, StorageError> {
     let decoded = crate::safe_yrs::validate_update(update)
         .map_err(|error| corruption(document_id, format!("invalid Yjs snapshot: {error}")))?;
     let doc = Doc::new();
-    doc.transact_mut().apply_update(decoded);
-    Ok(doc)
+    let integrated = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = doc.transact_mut().apply_update(decoded);
+    }))
+    .is_ok();
+    if integrated {
+        Ok(doc)
+    } else {
+        corrupt(document_id, "snapshot cannot be integrated")
+    }
 }
 
 #[cfg(any(test, feature = "fuzzing"))]
@@ -1184,6 +1236,41 @@ mod tests {
         assert!(tokio::fs::try_exists(root.join("doc.crdt/manifest.json"))
             .await
             .unwrap());
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn discarding_the_last_record_keeps_earlier_and_later_writes() {
+        let root = temp_store();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        let mut loaded = load_or_create(&root, "doc").await.unwrap();
+        apply(&mut loaded, &map_update("earlier", "kept")).await;
+        let before = loaded.persistence.log_bytes();
+        loaded
+            .persistence
+            .append_update(&map_update("rejected", "dropped"))
+            .await
+            .unwrap();
+
+        loaded
+            .persistence
+            .discard_last_record(before)
+            .await
+            .unwrap();
+        let mut reloaded = loaded.persistence.reload().await.unwrap();
+        drop(loaded);
+        assert_eq!(reloaded.persistence.log_bytes(), before);
+        assert_eq!(reloaded.persistence.records(), 1);
+        apply(&mut reloaded, &map_update("later", "kept")).await;
+        drop(reloaded);
+
+        let restarted = load_or_create(&root, "doc").await.unwrap();
+        assert_eq!(
+            map_value(&restarted.doc, "earlier").as_deref(),
+            Some("kept")
+        );
+        assert_eq!(map_value(&restarted.doc, "rejected"), None);
+        assert_eq!(map_value(&restarted.doc, "later").as_deref(), Some("kept"));
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 

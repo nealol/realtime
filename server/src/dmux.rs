@@ -15,9 +15,18 @@
 //!   OPEN_ERR = [3][channel][reason]                    server -> client
 //!   DATA     = [4][channel][raw yjs bytes …]           both directions
 //!   CLOSE    = [5][channel]                            both directions
+//!   PART     = [8][channel][raw yjs bytes …]           both directions
+//!   CHUNKED  = [9][0]                                  server -> client
 //!
 //! OPEN_ERR's trailing reason is optional on the wire: clients that predate
 //! it stop reading after the channel id and treat every rejection alike.
+//!
+//! Both sides' liveness checks only see whole frames, so one large payload
+//! would look like a dead connection on a slow link. A client that connects
+//! to `/dmux?chunked=1` is answered with CHUNKED; from then on either side
+//! sends payloads above [`CHUNK_BYTES`] as PART frames ending with a DATA
+//! frame, and the receiver joins them. Older clients never ask, and older
+//! servers never answer, so neither side splits.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -25,17 +34,18 @@ use std::sync::Arc;
 use axum::{
     extract::{
         ws::{Message as AxumMsg, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{interval, Duration, Instant, MissedTickBehavior};
 use url::Url;
 
-use crate::crdt::{read_varint, Attribution, CrdtConnection, CrdtError};
+use crate::crdt::{read_varint, Attribution, ConnectOptions, CrdtConnection, CrdtError};
 use crate::state::AppState;
 
 const FRAME_OPEN: u64 = 1;
@@ -45,6 +55,11 @@ const FRAME_DATA: u64 = 4;
 const FRAME_CLOSE: u64 = 5;
 const FRAME_PING: u64 = 6;
 const FRAME_PONG: u64 = 7;
+const FRAME_PART: u64 = 8;
+const FRAME_CHUNKED: u64 = 9;
+
+/// Payloads above this are split into PART frames for chunking clients.
+const CHUNK_BYTES: usize = 64 * 1024;
 
 /// Channel id reserved for connection-level control frames (PING/PONG).
 const CONTROL_CHANNEL: u64 = 0;
@@ -123,12 +138,23 @@ impl OpenLimiter {
     }
 }
 
-/// Accept the multiplexed sync socket.
-pub async fn dmux(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| handle(socket, state))
+#[derive(Deserialize)]
+pub struct DmuxQuery {
+    /// `1` asks for PART frames in both directions.
+    chunked: Option<String>,
 }
 
-async fn handle(client: WebSocket, state: AppState) {
+/// Accept the multiplexed sync socket.
+pub async fn dmux(
+    State(state): State<AppState>,
+    Query(query): Query<DmuxQuery>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let chunked = query.chunked.as_deref() == Some("1");
+    ws.on_upgrade(move |socket| handle(socket, state, chunked))
+}
+
+async fn handle(client: WebSocket, state: AppState, chunked: bool) {
     state.sync_metrics.physical_connection_opened();
     let (mut cl_sink, mut cl_stream) = client.split();
 
@@ -152,6 +178,21 @@ async fn handle(client: WebSocket, state: AppState) {
     // Session tasks notify this loop when their channel has ended, so terminal
     // paths do not leave stale senders behind.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<u64>();
+    // PART payloads per channel awaiting the DATA frame that ends them, and
+    // their total, which may not exceed one maximal frame per connection.
+    let mut partials: HashMap<u64, Vec<u8>> = HashMap::new();
+    let mut partial_bytes = 0usize;
+    if chunked
+        && out_tx
+            .send(encode_simple(FRAME_CHUNKED, CONTROL_CHANNEL))
+            .await
+            .is_err()
+    {
+        writer.abort();
+        let _ = writer.await;
+        state.sync_metrics.physical_connection_closed();
+        return;
+    }
 
     loop {
         tokio::select! {
@@ -196,13 +237,44 @@ async fn handle(client: WebSocket, state: AppState) {
                         let out = out_tx.clone();
                         let done = done_tx.clone();
                         tokio::spawn(async move {
-                            open_and_pump(state, channel, path_and_query, up_rx, out).await;
+                            open_and_pump(state, channel, path_and_query, up_rx, out, chunked)
+                                .await;
                             let _ = done.send(channel);
                         });
                     }
+                    Some(Frame::Part { channel, payload }) => {
+                        if !channels.contains_key(&channel) {
+                            continue;
+                        }
+                        if partial_bytes + payload.len() > MAX_DATA_FRAME_BYTES {
+                            discard_partial(&mut partials, &mut partial_bytes, channel);
+                            if !reset_oversized(&mut channels, channel, &state, &out_tx).await {
+                                break;
+                            }
+                            continue;
+                        }
+                        partials.entry(channel).or_default().extend_from_slice(payload);
+                        partial_bytes += payload.len();
+                    }
                     Some(Frame::Data { channel, payload }) => {
+                        let message = match partials.remove(&channel) {
+                            Some(mut joined) => {
+                                partial_bytes -= joined.len();
+                                if joined.len() + payload.len() > MAX_DATA_FRAME_BYTES {
+                                    if !reset_oversized(&mut channels, channel, &state, &out_tx)
+                                        .await
+                                    {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                joined.extend_from_slice(payload);
+                                joined
+                            }
+                            None => payload.to_vec(),
+                        };
                         if let Some(up_tx) = channels.get(&channel) {
-                            match up_tx.try_send(payload.to_vec()) {
+                            match up_tx.try_send(message) {
                                 Ok(()) => {}
                                 // The document session is backed up. Silently dropping a Yjs update
                                 // would diverge the doc (the provider thinks it sent it
@@ -224,21 +296,15 @@ async fn handle(client: WebSocket, state: AppState) {
                         }
                     }
                     Some(Frame::OversizedData { channel }) => {
-                        remove_channel(&mut channels, channel, &state);
-                        state.sync_metrics.document_channel_backpressure_reset();
-                        tracing::warn!(
-                            channel,
-                            payload_limit = MAX_DATA_FRAME_BYTES,
-                            "dmux: oversized document frame; reset channel"
-                        );
-                        let reset = encode_simple(FRAME_CLOSE, channel);
-                        if !send_control(&out_tx, reset, CONTROL_SEND_TIMEOUT).await {
+                        discard_partial(&mut partials, &mut partial_bytes, channel);
+                        if !reset_oversized(&mut channels, channel, &state, &out_tx).await {
                             break;
                         }
                     }
                     Some(Frame::Close { channel }) => {
                         // Dropping the sender ends that channel's upstream pump.
                         remove_channel(&mut channels, channel, &state);
+                        discard_partial(&mut partials, &mut partial_bytes, channel);
                     }
                     Some(Frame::Ping) => {
                         let _ = out_tx.try_send(encode_simple(FRAME_PONG, CONTROL_CHANNEL));
@@ -249,6 +315,7 @@ async fn handle(client: WebSocket, state: AppState) {
             done = done_rx.recv() => {
                 if let Some(channel) = done {
                     remove_channel(&mut channels, channel, &state);
+                    discard_partial(&mut partials, &mut partial_bytes, channel);
                 }
             }
             _ = idle_tick.tick() => {
@@ -289,6 +356,35 @@ fn remove_channel(
     }
 }
 
+fn discard_partial(partials: &mut HashMap<u64, Vec<u8>>, partial_bytes: &mut usize, channel: u64) {
+    if let Some(partial) = partials.remove(&channel) {
+        *partial_bytes -= partial.len();
+    }
+}
+
+/// Reset a channel whose payload exceeds the protocol limit. `false` means the
+/// connection cannot deliver the reset and must close.
+async fn reset_oversized(
+    channels: &mut HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    channel: u64,
+    state: &AppState,
+    out_tx: &mpsc::Sender<Vec<u8>>,
+) -> bool {
+    remove_channel(channels, channel, state);
+    state.sync_metrics.document_channel_backpressure_reset();
+    tracing::warn!(
+        channel,
+        payload_limit = MAX_DATA_FRAME_BYTES,
+        "dmux: oversized document frame; reset channel"
+    );
+    send_control(
+        out_tx,
+        encode_simple(FRAME_CLOSE, channel),
+        CONTROL_SEND_TIMEOUT,
+    )
+    .await
+}
+
 /// Validate a document-scoped token, open a native session, then pump one
 /// virtual channel. Runs in its own task so cold document I/O never blocks the
 /// multiplexed client read loop.
@@ -298,12 +394,14 @@ async fn open_and_pump(
     path_and_query: String,
     up_rx: mpsc::Receiver<Vec<u8>>,
     out_tx: mpsc::Sender<Vec<u8>>,
+    chunked: bool,
 ) {
-    let Some((document_id, token)) = parse_sync_target(&path_and_query) else {
+    let Some(target) = parse_sync_target(&path_and_query) else {
         let _ = out_tx.send(encode_open_err(channel, OPEN_ERR_TOKEN)).await;
         return;
     };
-    let Some(grant) = state.sync_grant(&token, &document_id).await else {
+    let document_id = target.document_id;
+    let Some(grant) = state.sync_grant(&target.token, &document_id).await else {
         let _ = out_tx.send(encode_open_err(channel, OPEN_ERR_TOKEN)).await;
         return;
     };
@@ -314,11 +412,12 @@ async fn open_and_pump(
     ));
     let connection = match state
         .documents
-        .connect(
+        .connect_with_options(
             &document_id,
             grant.level,
             Some(attribution),
             Some(grant.epoch),
+            target.options,
         )
         .await
     {
@@ -344,10 +443,18 @@ async fn open_and_pump(
         return;
     }
 
-    pump_channel(channel, connection, up_rx, out_tx).await;
+    pump_channel(channel, connection, up_rx, out_tx, chunked).await;
 }
 
-fn parse_sync_target(path_and_query: &str) -> Option<(String, String)> {
+/// What a channel's OPEN path names: the document, its token, and the
+/// connection options from the rest of the query.
+struct SyncTarget {
+    document_id: String,
+    token: String,
+    options: ConnectOptions,
+}
+
+fn parse_sync_target(path_and_query: &str) -> Option<SyncTarget> {
     let url = Url::parse(&format!("http://localhost{path_and_query}")).ok()?;
     let segments = url.path_segments()?.collect::<Vec<_>>();
     let ["d", document_id, "ws", repeated_id] = segments.as_slice() else {
@@ -360,7 +467,14 @@ fn parse_sync_target(path_and_query: &str) -> Option<(String, String)> {
         .query_pairs()
         .find(|(key, _)| key == "token")
         .map(|(_, value)| value.into_owned())?;
-    Some(((*document_id).to_string(), token))
+    let invalidations = !url
+        .query_pairs()
+        .any(|(key, value)| key == "invalidations" && value == "0");
+    Some(SyncTarget {
+        document_id: (*document_id).to_string(),
+        token,
+        options: ConnectOptions { invalidations },
+    })
 }
 
 /// Pump one channel's frames in both directions until either side closes.
@@ -370,6 +484,7 @@ async fn pump_channel(
     mut connection: CrdtConnection,
     mut up_rx: mpsc::Receiver<Vec<u8>>,
     out_tx: mpsc::Sender<Vec<u8>>,
+    chunked: bool,
 ) {
     loop {
         tokio::select! {
@@ -386,7 +501,7 @@ async fn pump_channel(
             from_document = connection.recv() => {
                 match from_document {
                     Some(bytes) => {
-                        if out_tx.send(encode_data(channel, &bytes)).await.is_err() {
+                        if send_payload(&out_tx, channel, &bytes, chunked).await.is_err() {
                             break;
                         }
                     }
@@ -398,6 +513,28 @@ async fn pump_channel(
     let _ = out_tx.send(encode_simple(FRAME_CLOSE, channel)).await;
 }
 
+/// Queue one payload for the client, split into PART frames when it allows.
+async fn send_payload(
+    out_tx: &mpsc::Sender<Vec<u8>>,
+    channel: u64,
+    payload: &[u8],
+    chunked: bool,
+) -> Result<(), mpsc::error::SendError<Vec<u8>>> {
+    if !chunked || payload.len() <= CHUNK_BYTES {
+        return out_tx.send(encode_data(channel, payload)).await;
+    }
+    let mut parts = payload.chunks(CHUNK_BYTES).peekable();
+    while let Some(part) = parts.next() {
+        let frame = if parts.peek().is_some() {
+            encode_payload(FRAME_PART, channel, part)
+        } else {
+            encode_data(channel, part)
+        };
+        out_tx.send(frame).await?;
+    }
+    Ok(())
+}
+
 // --- framing ---------------------------------------------------------------
 
 enum Frame<'a> {
@@ -406,6 +543,11 @@ enum Frame<'a> {
         path_and_query: String,
     },
     Data {
+        channel: u64,
+        payload: &'a [u8],
+    },
+    /// A non-final piece of a payload that a DATA frame completes.
+    Part {
         channel: u64,
         payload: &'a [u8],
     },
@@ -434,13 +576,20 @@ fn parse_frame(buf: &[u8]) -> Option<Frame<'_>> {
                 path_and_query,
             })
         }
-        t if t == FRAME_DATA => {
+        t if t == FRAME_DATA || t == FRAME_PART => {
             if rest.len() > MAX_DATA_FRAME_BYTES {
                 return Some(Frame::OversizedData { channel });
             }
-            Some(Frame::Data {
-                channel,
-                payload: rest,
+            Some(if t == FRAME_DATA {
+                Frame::Data {
+                    channel,
+                    payload: rest,
+                }
+            } else {
+                Frame::Part {
+                    channel,
+                    payload: rest,
+                }
             })
         }
         t if t == FRAME_CLOSE && rest.is_empty() => Some(Frame::Close { channel }),
@@ -460,7 +609,7 @@ pub fn fuzz_parse_frame(bytes: &[u8]) {
             } => {
                 std::hint::black_box((channel, path_and_query));
             }
-            Frame::Data { channel, payload } => {
+            Frame::Data { channel, payload } | Frame::Part { channel, payload } => {
                 std::hint::black_box((channel, payload));
             }
             Frame::OversizedData { channel } => {
@@ -505,8 +654,13 @@ fn encode_open_err(channel: u64, reason: u64) -> Vec<u8> {
 }
 
 fn encode_data(channel: u64, payload: &[u8]) -> Vec<u8> {
+    encode_payload(FRAME_DATA, channel, payload)
+}
+
+/// A DATA or PART frame carrying `payload`.
+fn encode_payload(frame_type: u64, channel: u64, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(payload.len() + 4);
-    write_varint(&mut buf, FRAME_DATA);
+    write_varint(&mut buf, frame_type);
     write_varint(&mut buf, channel);
     buf.extend_from_slice(payload);
     buf
@@ -669,14 +823,59 @@ mod tests {
 
     #[test]
     fn sync_target_requires_matching_document_ids_and_token() {
-        assert_eq!(
-            parse_sync_target("/d/vault__doc/ws/vault__doc?token=secret"),
-            Some(("vault__doc".to_string(), "secret".to_string()))
-        );
+        let target = parse_sync_target("/d/vault__doc/ws/vault__doc?token=secret").unwrap();
+        assert_eq!(target.document_id, "vault__doc");
+        assert_eq!(target.token, "secret");
+        assert!(target.options.invalidations);
+        let opted_out =
+            parse_sync_target("/d/vault/ws/vault?token=secret&invalidations=0").unwrap();
+        assert!(!opted_out.options.invalidations);
         assert!(parse_sync_target("/d/a/ws/b?token=secret").is_none());
         assert!(parse_sync_target("/d/a/ws/a").is_none());
         assert!(parse_sync_target("/other/a/ws/a?token=secret").is_none());
         assert!(parse_sync_target("//attacker.example/d/a/ws/a?token=secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn chunked_payloads_split_into_parts_that_rejoin() {
+        let payload: Vec<u8> = (0..(2 * CHUNK_BYTES + 17)).map(|i| i as u8).collect();
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(8);
+        send_payload(&out_tx, 3, &payload, true).await.unwrap();
+        drop(out_tx);
+        let mut joined = Vec::new();
+        let mut parts = 0;
+        while let Some(frame) = out_rx.recv().await {
+            match parse_frame(&frame) {
+                Some(Frame::Part {
+                    channel: 3,
+                    payload,
+                }) => {
+                    parts += 1;
+                    joined.extend_from_slice(payload);
+                }
+                Some(Frame::Data {
+                    channel: 3,
+                    payload,
+                }) => {
+                    joined.extend_from_slice(payload);
+                    assert!(out_rx.recv().await.is_none(), "DATA ends the payload");
+                    break;
+                }
+                _ => panic!("unexpected frame"),
+            }
+        }
+        assert_eq!(parts, 2);
+        assert_eq!(joined, payload);
+
+        // A client that did not ask for chunking gets one DATA frame.
+        let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(8);
+        send_payload(&out_tx, 3, &payload, false).await.unwrap();
+        drop(out_tx);
+        assert!(matches!(
+            parse_frame(&out_rx.recv().await.unwrap()),
+            Some(Frame::Data { channel: 3, payload: whole }) if whole == payload.as_slice()
+        ));
+        assert!(out_rx.recv().await.is_none());
     }
 
     #[test]
@@ -751,7 +950,7 @@ mod tests {
                     Frame::Open { path_and_query, .. } => {
                         prop_assert!(path_and_query.len() <= MAX_OPEN_PATH_BYTES);
                     }
-                    Frame::Data { payload, .. } => {
+                    Frame::Data { payload, .. } | Frame::Part { payload, .. } => {
                         prop_assert!(payload.len() <= bytes.len().min(MAX_DATA_FRAME_BYTES));
                     }
                     Frame::OversizedData { .. } | Frame::Close { .. } | Frame::Ping => {}

@@ -30,6 +30,13 @@ export interface LocalPathState {
    * published one, means the publish never reached the shared index.
    */
   replacedIdentity?: string | null;
+  /**
+   * Set while `identity` is a version this device published: the version it
+   * replaced (null for a new path). Agreeing with the shared index keeps it,
+   * so a later remote version is known to race this publish only when it
+   * does not descend from it. Absent when another device published `identity`.
+   */
+  publishedFrom?: string | null;
 }
 
 /** Keep `diskFingerprint` only while it describes the same identity. */
@@ -39,6 +46,16 @@ function carriedDiskFingerprint(
 ): { diskFingerprint?: string } {
   return current?.diskFingerprint && current.identity === identity
     ? { diskFingerprint: current.diskFingerprint }
+    : {};
+}
+
+/** Keep `publishedFrom` only while the identity is still this device's publish. */
+function carriedPublishedFrom(
+  current: LocalPathState | null,
+  identity: string | null,
+): { publishedFrom?: string | null } {
+  return current?.publishedFrom !== undefined && current.identity === identity
+    ? { publishedFrom: current.publishedFrom }
     : {};
 }
 
@@ -54,6 +71,7 @@ function carriedDiskFingerprint(
 export class LocalSyncState {
   private readonly doc = new Y.Doc();
   private readonly paths = this.doc.getMap<MaterializedKind | LocalPathState>("materialized");
+  private readonly meta = this.doc.getMap<number>("meta");
   private readonly persistence: IndexeddbPersistence;
   readonly whenSynced: Promise<void>;
 
@@ -65,6 +83,23 @@ export class LocalSyncState {
         console.error("[Realtime] local sync state failed to load", error);
       },
     );
+  }
+
+  /**
+   * Record the vault index epoch this state agrees with. An index whose epoch
+   * went down was restored from a server backup and holds an older timeline.
+   * Every recorded identity is then forgotten, so local files rejoin as
+   * candidates and a path missing from that index is not taken as a deletion.
+   * Returns whether the state was reset.
+   */
+  adoptIndexEpoch(epoch: number): boolean {
+    const recorded = this.meta.get("indexEpoch");
+    const rewound = typeof recorded === "number" && recorded > epoch;
+    this.doc.transact(() => {
+      if (rewound) this.paths.clear();
+      this.meta.set("indexEpoch", epoch);
+    });
+    return rewound;
   }
 
   has(path: string): boolean {
@@ -163,6 +198,7 @@ export class LocalSyncState {
         ? { candidateFingerprint: current.candidateFingerprint }
         : {}),
       ...carriedDiskFingerprint(current, identity),
+      ...carriedPublishedFrom(current, identity),
     });
   }
 
@@ -183,6 +219,7 @@ export class LocalSyncState {
       fingerprint: identity,
       candidate: false,
       replacedIdentity,
+      publishedFrom: replacedIdentity,
       ...carriedDiskFingerprint(current, identity),
     });
   }

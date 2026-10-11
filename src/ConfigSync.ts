@@ -11,6 +11,7 @@ import { dbg } from "./debug";
 import type { LocalSyncState } from "./localSyncState";
 import { isConflictCopy, preserveAdapterConflict } from "./conflictRecovery";
 import { mergeStructuredStartupResult, type JsonValue } from "./structured/reconcile";
+import { descendsFrom, lineageAfter } from "./lineage";
 
 export interface ConfigMeta {
   hash: string;
@@ -21,6 +22,8 @@ export interface ConfigMeta {
    * from older clients. See `BinaryMeta.prev`.
    */
   prev?: string | null;
+  /** Hash prefixes of the versions this one descends from (see `src/lineage.ts`). */
+  lineage?: string[];
 }
 
 export type ConfigReconcileAction =
@@ -52,6 +55,11 @@ export function decideConfigReconcile(
     canMerge?: boolean;
     /** The hash this device's last publish of the path replaced. */
     replacedHash?: string | null;
+    /**
+     * Whether `base` is a version this device published (undefined when
+     * unknown). Only such a baseline can have lost a last-writer-wins race.
+     */
+    ownBase?: boolean;
   } = {},
 ): ConfigReconcileAction {
   const localHash = local?.hash ?? null;
@@ -76,13 +84,15 @@ export function decideConfigReconcile(
     if (base === null) return "download";
     if (base === remote.hash) return "upload";
     if (base === local.hash) {
-      // A clean remote update only if the remote was built on our baseline:
-      // last-writer-wins may instead have kept a concurrent publish over ours.
-      const remotePrev = "prev" in remote ? (remote.prev ?? null) : undefined;
-      if (remotePrev === base) return "download";
+      // A clean remote update unless last-writer-wins kept a concurrent
+      // publish over one of ours.
+      if (descendsFrom(remote, base)) return "download";
       // Still the version our last publish replaced: that publish was lost.
       if (opts.replacedHash !== undefined && remote.hash === opts.replacedHash) return "upload";
-      if (remotePrev === undefined) return "download";
+      // Another device published our baseline: the remote moved on by
+      // several versions, and nothing of ours can have been overwritten.
+      if (opts.ownBase === false) return "download";
+      if (!("prev" in remote)) return "download";
     }
     if (opts.canMerge) return "merge";
     return local.mtime >= remote.mtime ? "upload" : "download";
@@ -371,10 +381,16 @@ export class ConfigSync {
       return this.canApply(generation);
     }
 
+    const ownPublishParent =
+      localState?.kind === "config" && localState.identity === base
+        ? localState.publishedFrom
+        : undefined;
+    const ownBase = this.localSyncState ? ownPublishParent !== undefined : undefined;
     const action = decideConfigReconcile(local, remote, base, {
       initialPull: this.initialPull,
       canMerge: path.endsWith(".json"),
       replacedHash: localState?.kind === "config" ? localState.replacedIdentity : undefined,
+      ownBase,
     });
     if (action === "none") {
       if (remote?.hash) {
@@ -390,16 +406,12 @@ export class ConfigSync {
     } else if (action === "deleteLocal") await this.deleteLocal(path, generation);
     else if (action === "deleteRemote") this.publishDelete(path, generation);
     else if (action === "merge" && local && remote) {
-      // After a concurrent publish, `base` is this device's own (optimistic)
-      // publish; both versions were built on the one the remote replaced.
-      const concurrent = base === local.hash && remote.prev !== undefined && remote.prev !== base;
-      await this.mergeConflict(
-        path,
-        local,
-        remote,
-        generation,
-        concurrent ? remote.prev : undefined,
-      );
+      // An unchanged local file merges only when last-writer-wins kept a
+      // concurrent publish over ours, so both sides descend from the version
+      // our publish replaced. Without that record, the remote's parent is the
+      // closest guess (older publishers recorded nothing else).
+      const ancestor = base === local.hash ? (ownBase ? ownPublishParent : remote.prev) : undefined;
+      await this.mergeConflict(path, local, remote, generation, ancestor);
     }
     return this.canApply(generation);
   }
@@ -502,15 +514,19 @@ export class ConfigSync {
       return;
     }
     const currentLocal = await this.localInfo(path);
+    const replaced = this.configFiles.get(path);
     if (
       !this.canApply(generation) ||
       !currentLocal ||
       currentLocal.hash !== finalMeta.hash ||
-      (this.configFiles.get(path)?.hash ?? null) !== expectedRemoteHash
+      (replaced?.hash ?? null) !== expectedRemoteHash
     ) {
       void this.reconcile(path);
       return;
     }
+    const lineage = lineageAfter(replaced);
+    if (lineage.length > 0) finalMeta.lineage = lineage;
+    else delete finalMeta.lineage;
     this.indexDoc.transact(() => this.configFiles.set(path, finalMeta));
     this.lastSyncedHash.set(path, finalMeta.hash);
     this.localSyncState?.markPublished(path, "config", finalMeta.hash, expectedRemoteHash);

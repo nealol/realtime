@@ -21,7 +21,15 @@ import { RealtimeSqlAPI } from "./pluginDb/api";
 import { RealtimeCursorsAPI } from "./cursors/api";
 import { RealtimeSharesAPI } from "./shares/api";
 import { SQL_QUERY_VIEW_TYPE, SqlQueryView } from "./sql/SqlQueryView";
-import { setDocumentEpoch, setEpochProposalHandler } from "./documentEpoch";
+import { clearDocument } from "y-indexeddb";
+import {
+  epochPersistenceName,
+  epochStoreBaseName,
+  getDocumentEpoch,
+  rewindDocumentEpoch,
+  setDocumentEpoch,
+  setEpochProposalHandler,
+} from "./documentEpoch";
 import { CompatibilityError } from "./caps";
 import type {
   RealtimeCursors,
@@ -84,8 +92,8 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   private status: ConnectionStatus = "offline";
   /** Attachment upload activity; overrides the "live" label when connected. */
   private uploadStatus: UploadStatus = "idle";
-  /** Pending epoch restart: `sql` rebuilds plugin databases, `all` all sync. */
-  private epochRestartScope: "sql" | "all" | null = null;
+  /** The vault index moved to a new epoch: all vault sync restarts once. */
+  private epochRestartPending = false;
   private epochRestartRunning = false;
   private unloading = false;
 
@@ -358,24 +366,55 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 
   /**
    * Persist a server-proposed document epoch before the transport acknowledges
-   * it, then rebuild what holds that document's retired-epoch state: just the
-   * file document, the plugin databases, or (for the vault index) all sync.
+   * it, then rebuild what holds that document's retired-epoch state.
    */
   acceptDocumentEpoch(documentId: string, epoch: number): void {
     const changed = setDocumentEpoch(this, documentId, epoch);
     if (!changed || this.unloading) return;
+    this.rebuildForEpoch(documentId);
+  }
+
+  /**
+   * The server's epoch for a document fell below this device's, which only a
+   * restored server backup does. The stores of the epochs that no longer
+   * exist hold another timeline's items and are dropped before the document
+   * rebuilds at the server's epoch; reusing one later would duplicate content.
+   */
+  rewindDocumentEpoch(documentId: string, epoch: number): void {
+    const previous = getDocumentEpoch(this, documentId);
+    if (epoch >= previous || this.unloading) return;
+    rewindDocumentEpoch(this, documentId, epoch);
+    const store = epochStoreBaseName(this, documentId);
+    for (let abandoned = epoch + 1; abandoned <= previous; abandoned++) {
+      void clearDocument(epochPersistenceName(this, documentId, store, abandoned)).catch(() => {});
+    }
+    this.rebuildForEpoch(documentId, true);
+  }
+
+  /**
+   * Replace what holds a document's state for an epoch it has left: just the
+   * file document, just the plugin database, or (for the vault index) all
+   * vault sync. Deferred so the transport can still acknowledge the epoch.
+   */
+  private rebuildForEpoch(documentId: string, rewound = false): void {
     const vaultId = this.settings.activeVaultId;
     if (vaultId && documentId.startsWith(`${vaultId}__plugindb__`)) {
-      this.requestEpochRestart("sql");
+      queueMicrotask(() => {
+        this.sqlApi.rebuildDocumentForEpoch(documentId).catch((error: unknown) => {
+          console.error(`[${PLUGIN_NAME}] plugin database epoch change failed`, error);
+        });
+      });
     } else if (vaultId && documentId.startsWith(`${vaultId}__`)) {
-      queueMicrotask(() => this.vaultSync?.rebuildDocumentForEpoch(documentId));
+      queueMicrotask(() => this.vaultSync?.rebuildDocumentForEpoch(documentId, rewound));
     } else {
-      this.requestEpochRestart("all");
+      // A rewound index resets this device's local agreement when sync
+      // restarts (see LocalSyncState.adoptIndexEpoch).
+      this.requestEpochRestart();
     }
   }
 
-  private requestEpochRestart(scope: "sql" | "all"): void {
-    this.epochRestartScope = scope === "all" || this.epochRestartScope === "all" ? "all" : "sql";
+  private requestEpochRestart(): void {
+    this.epochRestartPending = true;
     if (this.epochRestartRunning) return;
     this.epochRestartRunning = true;
     queueMicrotask(() => void this.runEpochRestarts());
@@ -383,15 +422,13 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 
   private async runEpochRestarts(): Promise<void> {
     try {
-      while (this.epochRestartScope !== null && !this.unloading) {
-        const scope = this.epochRestartScope;
-        this.epochRestartScope = null;
+      while (this.epochRestartPending && !this.unloading) {
+        this.epochRestartPending = false;
         try {
-          if (scope === "all") this.stopSync();
-          await this.sqlApi.destroy();
-          if (this.unloading) return;
-          this.sqlApi = new RealtimeSqlAPI(this);
-          if (scope === "all") await this.maybeStartSync();
+          // Plugin databases keep their own documents and epochs, so their
+          // handles stay open across a vault index restart.
+          this.stopSync();
+          await this.maybeStartSync();
           new Notice(`${PLUGIN_NAME}: document history was compacted; sync reconnected.`);
         } catch (error) {
           console.error(`[${PLUGIN_NAME}] restart after an epoch change failed`, error);

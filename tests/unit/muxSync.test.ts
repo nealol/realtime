@@ -135,7 +135,7 @@ describe("sub-cap mux sync (tier-2)", () => {
 
       // An ordinary sub-cap document set shares one client socket to /dmux.
       expect(opened).toHaveLength(1);
-      expect(opened[0]).toMatch(/\/dmux$/);
+      expect(opened[0]).toMatch(/\/dmux\?chunked=1$/);
 
       // mux -> server -> peer, on each independent channel.
       a.text.insert(0, "hello A");

@@ -13,7 +13,7 @@ import { TFile, TAbstractFile, Notice, Platform, type EventRef } from "obsidian"
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./sync/clientToken";
 import { createMuxSocket } from "./sync/mux";
-import { epochPersistenceName, getDocumentEpoch } from "./documentEpoch";
+import { epochPersistenceName, epochStoreBaseName, getDocumentEpoch } from "./documentEpoch";
 import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
@@ -119,6 +119,8 @@ export class VaultSync {
   private indexDoc: Y.Doc;
   private indexProvider: RealtimeProvider;
   private indexPersistence: IndexeddbPersistence;
+  /** Epoch of the vault index this instance syncs, pinned for its lifetime. */
+  private readonly indexEpoch: number;
   /** Shared map of vault-relative path -> document guid. */
   private files: Y.Map<string>;
   /** Shared map of vault-relative structured path -> document metadata. */
@@ -231,23 +233,31 @@ export class VaultSync {
     // doc keeps the bare vault id; file docs are namespaced as `${vaultId}__${guid}`.
     // Pin the epoch: an index epoch change restarts sync with a fresh store.
     const indexEpoch = getDocumentEpoch(plugin, vaultId);
+    this.indexEpoch = indexEpoch;
     this.indexProvider = new RealtimeProvider(
       vaultId,
       this.indexDoc,
       () => getClientToken(plugin, vaultId, undefined, indexEpoch),
-      { connect: false, socketFactory: createMuxSocket },
+      {
+        connect: false,
+        socketFactory: createMuxSocket,
+        // Only mobile evicts documents and reloads them on invalidation; the
+        // server otherwise sends one per write anywhere in the vault.
+        ...(Platform?.isMobile ? {} : { socketParams: { invalidations: "0" } }),
+      },
     );
     // Nobody views the index: publishing presence on it is pure overhead.
     this.indexProvider.awareness.setLocalState(null);
+    const indexStore = epochStoreBaseName(plugin, vaultId);
     this.indexPersistence = new IndexeddbPersistence(
-      epochPersistenceName(plugin, vaultId, `realtime:index:${localScope}`, indexEpoch),
+      epochPersistenceName(plugin, vaultId, indexStore, indexEpoch),
       this.indexDoc,
     );
     if (indexEpoch > 0) {
       // A retired epoch's index store is never read again.
-      void clearDocument(
-        epochPersistenceName(plugin, vaultId, `realtime:index:${localScope}`, indexEpoch - 1),
-      ).catch(() => {});
+      void clearDocument(epochPersistenceName(plugin, vaultId, indexStore, indexEpoch - 1)).catch(
+        () => {},
+      );
     }
 
     this.filesObserver = this.onFilesChanged.bind(this);
@@ -305,6 +315,7 @@ export class VaultSync {
       console.error("[Realtime] index persistence failed to load", e);
     }
     if (this.destroyed) return;
+    this.localSyncState.adoptIndexEpoch(this.indexEpoch);
     this.migrateLegacyLocalState();
     this.startupFiles = new Map(this.files.entries());
     this.startupStructured = new Map(
@@ -526,22 +537,27 @@ export class VaultSync {
    * A file document moved to a new epoch: its resident Y.Doc and IndexedDB
    * store hold retired-epoch state and must not reconnect. Replace just that
    * document; every other document keeps syncing undisturbed.
+   *
+   * After a rewind (a restored server backup) the server's content is older
+   * than this device's rather than derived from it, so it is no baseline.
+   * The replacement then reconciles like a new device, so differences become
+   * conflicts instead of silently rolling the file back.
    */
-  rebuildDocumentForEpoch(documentId: string): void {
+  rebuildDocumentForEpoch(documentId: string, rewound = false): void {
     if (this.destroyed) return;
     const prefix = `${this.plugin.settings.activeVaultId}__`;
     if (!documentId.startsWith(prefix)) return;
     const guid = documentId.slice(prefix.length);
     for (const [path, doc] of [...this.documents]) {
       if (doc.guid !== guid) continue;
-      const retiredBaseline = doc.retiredBaseline();
+      const retiredBaseline = rewound ? null : doc.retiredBaseline();
       this.removeDocument(path, { clearLocalStore: true });
       this.enqueueDoc({ path, guid, kind: "text", retiredBaseline }, true);
     }
     for (const [path, doc] of [...this.structuredDocuments]) {
       if (doc.guid !== guid) continue;
       const kind: StructuredKind = doc instanceof CanvasDocument ? "canvas" : "base";
-      const retiredBaseline = doc.retiredBaseline();
+      const retiredBaseline = rewound ? null : doc.retiredBaseline();
       this.removeStructuredDocument(path, { clearLocalStore: true });
       this.enqueueDoc({ path, guid, kind, retiredBaseline }, true);
     }

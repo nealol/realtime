@@ -235,4 +235,42 @@ describe("StructuredDocument disk sync", () => {
       peer.destroy();
     }
   });
+
+  it("merges remote edits that arrive while a disk edit is being folded", async () => {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    vault.files.set("views.base", serializeBase({ formulas: { a: "1" } }));
+    const doc = new BaseDocument(plugin as any, "views.base", guid, docId(guid), true);
+    const collaborator = new Y.Doc();
+    try {
+      await doc.whenReady();
+      Y.applyUpdate(collaborator, Y.encodeStateAsUpdate(doc.ydoc));
+      vault.files.set("views.base", serializeBase({ formulas: { a: "1", local: "2" } }));
+      const read = vault.read.bind(vault);
+      let reads = 0;
+      vault.read = async (file) => {
+        const text = await read(file);
+        reads += 1;
+        if (reads === 2) {
+          // A collaborator's edit lands while the fold reads the file again.
+          const before = Y.encodeStateVector(doc.ydoc);
+          collaborator.transact(() =>
+            reconcileInto(collaborator.getMap("root"), { formulas: { a: "1", remote: "3" } }),
+          );
+          Y.applyUpdate(doc.ydoc, Y.encodeStateAsUpdate(collaborator, before), doc.provider);
+        }
+        return text;
+      };
+
+      await doc.onDiskChanged();
+
+      expect(doc.value).toEqual({ formulas: { a: "1", local: "2", remote: "3" } });
+    } finally {
+      doc.destroy();
+      collaborator.destroy();
+    }
+  });
 });

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import * as Y from "yjs";
+import type { EditorView } from "@codemirror/view";
 
 const bind = vi.hoisted(() => ({ doc: null as any, requestSave: vi.fn() }));
 
@@ -260,6 +261,44 @@ describe("LiveEdit", () => {
     expect(editor.state.doc.toString()).toBe("remote ready");
     expect(bind.requestSave).toHaveBeenCalledTimes(1);
 
+    live.destroy();
+    ydoc.destroy();
+  });
+
+  it("applies a note emptied elsewhere instead of pushing the editor's stale text", async () => {
+    const ydoc = new Y.Doc();
+    const ytext = ydoc.getText("contents");
+    ytext.insert(0, "hello\n");
+    const ready = Promise.withResolvers<void>();
+    const doc = {
+      path: "note.md",
+      ytext,
+      isCreator: false,
+      hasSyncedOnce: false,
+      isProviderOnline: true,
+      readyNow: false,
+      bindEditor: vi.fn(),
+      unbindEditor: vi.fn(),
+      whenReady: () => ready.promise,
+      isReady: () => doc.readyNow,
+      isDestroyed: () => false,
+      onDestroy: () => () => {},
+    };
+    bind.doc = doc;
+    const editor = makeEditor("hello\n");
+    // LiveEdit reads `state.doc` and calls `dispatch`, which the stand-in provides.
+    const live = new LiveEditPluginValue(editor as unknown as EditorView);
+
+    // The first sync delivers another device's "select all, delete".
+    ytext.delete(0, ytext.length);
+    doc.hasSyncedOnce = true;
+    doc.readyNow = true;
+    ready.resolve();
+    await ready.promise;
+    await Promise.resolve();
+
+    expect(ytext.toString()).toBe("");
+    expect(editor.state.doc.toString()).toBe("");
     live.destroy();
     ydoc.destroy();
   });

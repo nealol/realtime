@@ -91,10 +91,13 @@ export class LiveEditPluginValue implements PluginValue {
   /**
    * Align the editor and the shared text when an editor attaches:
    *  - text typed before the document was ready is merged into the shared text;
-   *  - otherwise, if the shared text has content, it is authoritative -> update editor;
+   *  - otherwise, once the document has synced with the server, the shared
+   *    text is authoritative (even when empty) -> update editor;
+   *  - else if the shared text has content, update the editor;
    *  - else if the editor has content, seed the shared text from it;
    *  - if both are empty, do nothing.
-   * We never overwrite editor content with an empty shared document.
+   * An empty shared document overwrites the editor only after a server sync,
+   * because before one it may just be a store that has not loaded yet.
    */
   private reconcileOnAttach(): void {
     if (!this.ytext || this.destroyed) return;
@@ -134,7 +137,9 @@ export class LiveEditPluginValue implements PluginValue {
       return;
     }
 
-    if (shared.length > 0) {
+    if (shared.length > 0 || this.doc?.hasSyncedOnce) {
+      // After a server sync an empty shared text is a deletion made
+      // elsewhere; pushing the editor's stale text would undo it.
       this.applyTextToEditor(shared);
     } else if (current.length > 0 && this.mayPushToShared()) {
       // Seed the empty shared doc from the editor, unless a server sync that

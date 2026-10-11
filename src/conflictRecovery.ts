@@ -1,4 +1,4 @@
-import { normalizePath } from "obsidian";
+import { TFile, normalizePath } from "obsidian";
 import type RealtimePlugin from "./main";
 import { ensureParentFolder } from "./vaultHelpers";
 
@@ -87,6 +87,35 @@ export async function preserveTextConflict(
   await ensureParentFolder(plugin.app, destination);
   await plugin.app.vault.create(destination, content);
   return destination;
+}
+
+/**
+ * Keep `content` in a single recovery copy of `path` rather than one copy
+ * per change. Rewrites `current` while it exists. Otherwise it writes nothing
+ * when some copy already holds exactly this content (one an earlier session
+ * wrote), and creates a copy only when none does. Returns the path written,
+ * or null when an existing copy already held the content.
+ */
+export async function updateTextConflict(
+  plugin: RealtimePlugin,
+  path: string,
+  content: string,
+  source: ConflictSource,
+  current: string | null,
+): Promise<string | null> {
+  const vault = plugin.app.vault;
+  const existing = current === null ? null : vault.getAbstractFileByPath(current);
+  if (current !== null && existing instanceof TFile) {
+    await vault.modify(existing, content);
+    return current;
+  }
+  const { stem, extension } = splitPath(normalizePath(path));
+  for (const file of vault.getFiles()) {
+    if (!file.path.startsWith(`${stem} (conflicted copy `)) continue;
+    if (!file.path.endsWith(`)${extension}`)) continue;
+    if ((await vault.read(file)) === content) return null;
+  }
+  return preserveTextConflict(plugin, path, content, source);
 }
 
 export async function preserveBinaryConflict(

@@ -81,6 +81,20 @@ describe("YTextEditorBinding", () => {
     binding.destroy();
   });
 
+  it("clears the editor when a synced card's text was emptied elsewhere", async () => {
+    const doc = new Y.Doc();
+    const ytext = doc.getText("text");
+    const adapter = editor("text deleted on another device");
+    const binding = new YTextEditorBinding(adapter, ytext, {
+      ...ready(),
+      hasSyncedOnce: () => true,
+    });
+    await Promise.resolve();
+    expect(ytext.toString()).toBe("");
+    expect(adapter.getText()).toBe("");
+    binding.destroy();
+  });
+
   it("preserves text typed before a polled Canvas editor attaches", () => {
     const doc = new Y.Doc();
     const ytext = doc.getText("text");

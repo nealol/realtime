@@ -125,7 +125,9 @@ async fn blob_meta_for_path(
 }
 
 /// `HEAD /api/vaults/{id}/blobs/{hash}` — 200 if present, 404 otherwise. Lets the
-/// client skip an upload when the server already has the content (dedup).
+/// client skip an upload when the server already has the content (dedup). A
+/// client that skips its upload publishes an index entry next, so a present
+/// blob's age is refreshed exactly as a re-upload would.
 pub async fn head_blob(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
@@ -139,8 +141,23 @@ pub async fn head_blob(
             tracing::warn!(%vault_id, %hash, "stored blob has the wrong size; reporting it missing");
             Err(AppError::NotFound)
         }
-        Ok(_) => Ok(StatusCode::OK),
+        Ok(_) => {
+            refresh_blob_age(&path).await;
+            Ok(StatusCode::OK)
+        }
         Err(_) => Err(AppError::NotFound),
+    }
+}
+
+/// Mark a stored blob as just written, so an orphan sweep (which spares young
+/// blobs) cannot reclaim it while the index entry that references it is on
+/// its way.
+async fn refresh_blob_age(path: &FsPath) {
+    if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(path).await {
+        let file = file.into_std().await;
+        let _ =
+            tokio::task::spawn_blocking(move || file.set_modified(std::time::SystemTime::now()))
+                .await;
     }
 }
 
@@ -208,15 +225,8 @@ pub async fn put_blob(
         .and_then(|value| value.parse::<u64>().ok());
     if let Ok(metadata) = tokio::fs::metadata(&path).await {
         if expected_len.is_none_or(|len| len == metadata.len()) {
-            // The uploader is about to publish an index entry for this blob:
-            // refresh its age so an orphan sweep cannot reclaim it meanwhile.
-            if let Ok(file) = tokio::fs::OpenOptions::new().write(true).open(&path).await {
-                let file = file.into_std().await;
-                let _ = tokio::task::spawn_blocking(move || {
-                    file.set_modified(std::time::SystemTime::now())
-                })
-                .await;
-            }
+            // The uploader is about to publish an index entry for this blob.
+            refresh_blob_age(&path).await;
             return Ok(StatusCode::OK);
         }
     }

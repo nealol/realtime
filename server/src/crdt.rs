@@ -5,7 +5,7 @@
 //! synchronized over the same y-protocol wire format consumed by
 //! `@y-sweet/client`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use url::Url;
 use yrs::sync::{Awareness, Message, SyncMessage};
 use yrs::updates::encoder::Encode;
@@ -42,6 +42,27 @@ const EPOCH_PROPOSAL_MESSAGE: u8 = 103;
 const EPOCH_ACK_MESSAGE: u8 = 104;
 const DOCUMENT_INVALIDATED_MESSAGE: u8 = 105;
 const RETIRED_EPOCH_RETRY_MS: u64 = 60_000;
+/// Documents a token request loads stay resident this long, so the channel
+/// open that follows reuses them instead of loading them again.
+const WARM_DOCUMENT_TTL: Duration = Duration::from_secs(60);
+/// Bound on documents held only for that reason.
+const WARM_DOCUMENTS: usize = 256;
+
+/// Per-connection choices a client makes in its socket URL.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ConnectOptions {
+    /// Receive child-document invalidations on a vault index connection.
+    /// Only clients that evict documents use them; the rest opt out.
+    pub invalidations: bool,
+}
+
+impl Default for ConnectOptions {
+    fn default() -> Self {
+        Self {
+            invalidations: true,
+        }
+    }
+}
 
 /// Access level encoded in client tokens and enforced on every content update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -136,6 +157,10 @@ struct StoreInner {
     retirement_deadlines: StdMutex<HashMap<String, u64>>,
     next_connection_id: AtomicU64,
     sync_metrics: SyncMetrics,
+    warm: StdMutex<VecDeque<(Instant, Arc<PersistentDocument>)>>,
+    /// Content-document counts per vault, scanned once and then kept current
+    /// as manifests are created (manifests are never deleted).
+    vault_document_counts: Mutex<HashMap<String, u64>>,
     #[cfg(test)]
     write_pauses: Mutex<HashMap<String, WritePause>>,
     #[cfg(test)]
@@ -202,6 +227,8 @@ impl DocumentStore {
             retirement_deadlines: StdMutex::new(HashMap::new()),
             next_connection_id: AtomicU64::new(1),
             sync_metrics: SyncMetrics::default(),
+            warm: StdMutex::new(VecDeque::new()),
+            vault_document_counts: Mutex::new(HashMap::new()),
             #[cfg(test)]
             write_pauses: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -230,9 +257,27 @@ impl DocumentStore {
     }
 
     pub async fn ensure_document(&self, document_id: &str) -> Result<(), CrdtError> {
-        self.get_or_load(document_id).await?;
+        let (_, document) = self.get_or_load(document_id).await?;
+        self.keep_warm(document);
         self.maybe_activate_epoch(document_id).await?;
         Ok(())
+    }
+
+    fn keep_warm(&self, document: Arc<PersistentDocument>) {
+        let Ok(mut warm) = self.0.warm.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        while warm
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) > WARM_DOCUMENT_TTL)
+        {
+            warm.pop_front();
+        }
+        if warm.len() >= WARM_DOCUMENTS {
+            warm.pop_front();
+        }
+        warm.push_back((now, document));
     }
 
     pub async fn read_update(&self, document_id: &str) -> Result<Vec<u8>, CrdtError> {
@@ -448,16 +493,40 @@ impl DocumentStore {
 
     pub async fn document_count_for_vault(&self, vault_id: &str) -> Result<u64, CrdtError> {
         validate_document_id(vault_id)?;
+        let mut counts = self.0.vault_document_counts.lock().await;
+        if let Some(count) = counts.get(vault_id) {
+            return Ok(*count);
+        }
+        // Manifest file names are hashes, so the first count reads them all.
         let manifests = crdt_epoch::manifests_for_vault(&self.0.directory, vault_id)
             .await
             .map_err(epoch_error)?;
-        Ok(manifests
+        let count = manifests
             .iter()
-            .filter(|manifest| {
-                manifest.logical_document_id != vault_id
-                    && crate::plugindb::parse_doc_id(&manifest.logical_document_id).is_none()
-            })
-            .count() as u64)
+            .filter(|manifest| content_document_vault(&manifest.logical_document_id).is_some())
+            .count() as u64;
+        counts.insert(vault_id.to_string(), count);
+        Ok(count)
+    }
+
+    /// Create a document's manifest and keep its vault's scanned count
+    /// current. Holding the count lock while creating means a first scan
+    /// running at the same time either sees the new manifest or the increment,
+    /// never both.
+    async fn create_manifest(
+        &self,
+        document_id: &str,
+    ) -> Result<crdt_epoch::EpochManifest, CrdtError> {
+        let mut counts = self.0.vault_document_counts.lock().await;
+        let manifest = crdt_epoch::load_or_create_manifest(&self.0.directory, document_id)
+            .await
+            .map_err(epoch_error)?;
+        if let Some(count) =
+            content_document_vault(document_id).and_then(|vault_id| counts.get_mut(vault_id))
+        {
+            *count += 1;
+        }
+        Ok(manifest)
     }
 
     pub async fn document_exists(&self, document_id: &str) -> Result<bool, CrdtError> {
@@ -484,6 +553,24 @@ impl DocumentStore {
         attribution: Option<Arc<Attribution>>,
         requested_epoch: Option<u64>,
     ) -> Result<CrdtConnection, CrdtError> {
+        self.connect_with_options(
+            document_id,
+            level,
+            attribution,
+            requested_epoch,
+            ConnectOptions::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_options(
+        &self,
+        document_id: &str,
+        level: Level,
+        attribution: Option<Arc<Attribution>>,
+        requested_epoch: Option<u64>,
+        options: ConnectOptions,
+    ) -> Result<CrdtConnection, CrdtError> {
         let (epoch, document) = self.get_or_load(document_id).await?;
         if let Some(requested) = requested_epoch {
             if requested > epoch {
@@ -503,8 +590,10 @@ impl DocumentStore {
         let connection_id = self.0.next_connection_id.fetch_add(1, Ordering::Relaxed);
         // Subscribe before publishing the connection in the epoch runtime. A
         // proposal broadcast after registration is then queued even if the
-        // connection task has not started polling yet.
+        // connection task has not started polling yet, and an activation
+        // that retires this document still reaches the connection.
         let events = document.subscribe();
+        let retired = document.retirement();
         let runtime = self.epoch_runtime(document_id).await?;
         let pending_epoch = {
             let mut runtime = runtime.lock().await;
@@ -561,7 +650,11 @@ impl DocumentStore {
             to_client,
             attribution,
             pending_epoch,
-            events,
+            ConnectionEvents {
+                events,
+                retired,
+                invalidations: options.invalidations,
+            },
         ));
         Ok(CrdtConnection {
             sender: to_server,
@@ -651,9 +744,16 @@ impl DocumentStore {
         if let Some(runtime) = self.0.epochs.lock().await.get(document_id).cloned() {
             return Ok(runtime);
         }
-        let mut manifest = crdt_epoch::load_or_create_manifest(&self.0.directory, document_id)
+        let existed = crdt_epoch::manifest_exists(&self.0.directory, document_id)
             .await
             .map_err(epoch_error)?;
+        let mut manifest = if existed {
+            crdt_epoch::load_or_create_manifest(&self.0.directory, document_id)
+                .await
+                .map_err(epoch_error)?
+        } else {
+            self.create_manifest(document_id).await?
+        };
         crdt_epoch::remove_expired(&self.0.directory, &mut manifest, crdt_epoch::now_millis())
             .await
             .map_err(epoch_error)?;
@@ -1126,6 +1226,10 @@ impl DocumentStore {
                     document: Arc::downgrade(&document),
                 },
             );
+            // Connections still on the retired document would keep answering
+            // sync-status probes while missing every later change. Close
+            // them so their clients reconnect to the new epoch.
+            current_document.retire();
             Ok(())
         }
         .await;
@@ -1336,6 +1440,19 @@ fn validate_document_id(document_id: &str) -> Result<(), CrdtError> {
     }
 }
 
+/// The vault a file document belongs to: `None` for a vault index or a plugin
+/// database, which the per-vault document quota does not count.
+fn content_document_vault(document_id: &str) -> Option<&str> {
+    let (vault_id, rest) = document_id.split_once("__")?;
+    if vault_id.is_empty()
+        || rest.is_empty()
+        || crate::plugindb::parse_doc_id(document_id).is_some()
+    {
+        return None;
+    }
+    Some(vault_id)
+}
+
 struct PersistentDocument {
     awareness: RwLock<Awareness>,
     mutation: Mutex<()>,
@@ -1348,6 +1465,8 @@ struct PersistentDocument {
     /// Last full size measurement (see [`Self::epoch_measurements`]).
     measurement: StdMutex<Option<Measurement>>,
     full_measurements: AtomicU64,
+    /// Set once a newer epoch replaced this document; its connections end.
+    retired: watch::Sender<bool>,
 }
 
 /// A full encode of the document, taken occasionally rather than per write.
@@ -1375,7 +1494,16 @@ impl PersistentDocument {
             applied_update_bytes: AtomicU64::new(0),
             measurement: StdMutex::new(None),
             full_measurements: AtomicU64::new(0),
+            retired: watch::channel(false).0,
         }
+    }
+
+    fn retirement(&self) -> watch::Receiver<bool> {
+        self.retired.subscribe()
+    }
+
+    fn retire(&self) {
+        self.retired.send_replace(true);
     }
 
     fn read_with<R>(&self, read: impl FnOnce(&Doc) -> R) -> Result<R, CrdtError> {
@@ -1528,18 +1656,31 @@ impl PersistentDocument {
         if requires_compaction {
             self.compact_locked().await?;
         }
-        let should_compact = {
+        let (log_bytes_before, should_compact) = {
             let mut persistence = self.persistence.lock().await;
+            let log_bytes_before = persistence.log_bytes();
             persistence.append_update(update).await?;
-            persistence.should_compact()
+            (log_bytes_before, persistence.should_compact())
         };
 
-        {
+        // The preflight integrated the update into an empty document, where
+        // blocks referencing existing items stay pending. Integrating against
+        // the live state can still panic, so contain it here.
+        let integrated = {
             let mut awareness = self
                 .awareness
                 .write()
                 .map_err(|_| CrdtError::Protocol("document lock poisoned".into()))?;
-            awareness.doc_mut().transact_mut().apply_update(decoded);
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = awareness.doc_mut().transact_mut().apply_update(decoded);
+            }))
+            .is_ok()
+        };
+        if !integrated {
+            self.reject_appended_update(log_bytes_before).await?;
+            return Err(CrdtError::InvalidUpdate(
+                "update cannot be integrated into this document".into(),
+            ));
         }
         self.applied_update_bytes
             .fetch_add(update.len() as u64, Ordering::AcqRel);
@@ -1561,6 +1702,23 @@ impl PersistentDocument {
                     .store(false, Ordering::Release);
             });
         }
+        Ok(())
+    }
+
+    /// An update panicked while integrating. Its record is already durable and
+    /// would panic again on every reload, and the panic may have left the
+    /// in-memory document half-applied. Drop the record, then reload the
+    /// document from what remains.
+    async fn reject_appended_update(&self, log_bytes_before: u64) -> Result<(), CrdtError> {
+        let mut persistence = self.persistence.lock().await;
+        persistence.discard_last_record(log_bytes_before).await?;
+        let reloaded = persistence.reload().await?;
+        *persistence = reloaded.persistence;
+        let mut awareness = self
+            .awareness
+            .write()
+            .map_err(|_| CrdtError::Protocol("document lock poisoned".into()))?;
+        *awareness = Awareness::new(reloaded.doc);
         Ok(())
     }
 
@@ -1711,6 +1869,14 @@ impl CrdtConnection {
     }
 }
 
+/// What a connection hears from its document besides its own client.
+struct ConnectionEvents {
+    events: broadcast::Receiver<Vec<u8>>,
+    retired: watch::Receiver<bool>,
+    /// Forward child-document invalidations (see [`ConnectOptions`]).
+    invalidations: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connection(
     store: DocumentStore,
@@ -1723,8 +1889,13 @@ async fn run_connection(
     outgoing: mpsc::Sender<Vec<u8>>,
     attribution: Option<Arc<Attribution>>,
     pending_epoch: Option<u64>,
-    mut events: broadcast::Receiver<Vec<u8>>,
+    subscriptions: ConnectionEvents,
 ) {
+    let ConnectionEvents {
+        mut events,
+        mut retired,
+        invalidations,
+    } = subscriptions;
     let mut awareness_client = None;
     let result = async {
         for message in document.initial_messages()? {
@@ -1880,7 +2051,14 @@ async fn run_connection(
                 }
                 event = events.recv() => {
                     match event {
-                        Ok(message) => send_outgoing(&outgoing, message).await?,
+                        Ok(message) => {
+                            if !invalidations
+                                && message.first() == Some(&DOCUMENT_INVALIDATED_MESSAGE)
+                            {
+                                continue;
+                            }
+                            send_outgoing(&outgoing, message).await?
+                        }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
                             store.0.sync_metrics.crdt_connection_lagged();
                             return Err(CrdtError::Protocol(
@@ -1888,6 +2066,15 @@ async fn run_connection(
                             ));
                         }
                         Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                changed = retired.changed() => {
+                    if changed.is_err() || *retired.borrow() {
+                        return Err(CrdtError::RetiredEpoch {
+                            document_id: document_id.clone(),
+                            requested: epoch,
+                            current: epoch.saturating_add(1),
+                        });
                     }
                 }
             }
@@ -1945,9 +2132,27 @@ fn decode_epoch_payload(payload: &[u8]) -> Result<EpochWirePayload, CrdtError> {
         .map_err(|error| CrdtError::Protocol(format!("invalid epoch acknowledgement: {error}")))
 }
 
+/// The epoch a document message proposes, for in-process peers that must
+/// acknowledge proposals like clients do.
+pub(crate) fn epoch_proposal(message: &[u8]) -> Option<u64> {
+    match crate::safe_yrs::decode_message(message) {
+        Ok(Message::Custom(EPOCH_PROPOSAL_MESSAGE, payload)) => decode_epoch_payload(&payload)
+            .ok()
+            .map(|proposal| proposal.epoch),
+        _ => None,
+    }
+}
+
+/// The acknowledgement an in-process peer sends for a proposed epoch.
+pub(crate) fn epoch_acknowledgement(epoch: u64) -> Result<Vec<u8>, CrdtError> {
+    epoch_wire_message(EPOCH_ACK_MESSAGE, epoch)
+}
+
 #[derive(Deserialize)]
 pub struct TokenQuery {
     token: Option<String>,
+    /// `0` opts this connection out of child-document invalidations.
+    invalidations: Option<String>,
 }
 
 /// Yjs WebSocket endpoint compatible with `@y-sweet/client` token URLs.
@@ -1973,11 +2178,14 @@ pub async fn websocket(
     ));
     let connection = match state
         .documents
-        .connect(
+        .connect_with_options(
             &document_id,
             grant.level,
             Some(attribution),
             Some(grant.epoch),
+            ConnectOptions {
+                invalidations: query.invalidations.as_deref() != Some("0"),
+            },
         )
         .await
     {
@@ -2311,6 +2519,31 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.document_count_for_vault("vault").await.unwrap(), 1);
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn file_document_count_stays_current_after_the_first_scan() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        store.read_update("vault__first").await.unwrap();
+        assert_eq!(store.document_count_for_vault("vault").await.unwrap(), 1);
+
+        store.read_update("vault__second").await.unwrap();
+        store.read_update("vault__second").await.unwrap();
+        store
+            .read_update("vault__plugindb__tasks__main")
+            .await
+            .unwrap();
+        store.read_update("other__third").await.unwrap();
+
+        assert_eq!(store.document_count_for_vault("vault").await.unwrap(), 2);
+        drop(store);
+        let restarted = DocumentStore::new(&directory).await.unwrap();
+        assert_eq!(
+            restarted.document_count_for_vault("vault").await.unwrap(),
+            2
+        );
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
@@ -2689,6 +2922,47 @@ mod tests {
             serde_json::from_slice::<Value>(&payload).unwrap(),
             json!({ "documentId": "vault__document" })
         );
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn index_connections_can_opt_out_of_child_invalidations() {
+        let directory = temp_store();
+        let store = DocumentStore::new(&directory).await.unwrap();
+        let mut quiet = store
+            .connect_with_options(
+                "vault",
+                Level::Full,
+                None,
+                None,
+                ConnectOptions {
+                    invalidations: false,
+                },
+            )
+            .await
+            .unwrap();
+        quiet.recv().await.unwrap();
+        quiet.recv().await.unwrap();
+
+        store
+            .apply_update("vault__document", &map_update("child", "change"))
+            .await
+            .unwrap();
+        store
+            .apply_update("vault", &map_update("index", "change"))
+            .await
+            .unwrap();
+
+        // Broadcasts arrive in order, so the index update comes first only
+        // when the invalidation published before it was dropped.
+        let next = timeout(Duration::from_secs(2), quiet.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            crate::safe_yrs::decode_v1::<Message>(&next).unwrap(),
+            Message::Sync(SyncMessage::Update(_))
+        ));
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 
@@ -3397,6 +3671,48 @@ mod tests {
         assert_eq!(runtime.manifest.retired.len(), 1);
         assert!(directory.join("vault__document.crdt").is_dir());
         drop(runtime);
+        let _ = tokio::fs::remove_dir_all(directory).await;
+    }
+
+    #[tokio::test]
+    async fn activation_ends_connections_that_never_acknowledged() {
+        let directory = temp_store();
+        let store = DocumentStore::new_with_policy(
+            &directory,
+            EpochPolicy {
+                ack_timeout_ms: 50,
+                ..EpochPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
+        store
+            .apply_update("vault__document", &map_update("before", "kept"))
+            .await
+            .unwrap();
+        let mut silent = store
+            .connect_internal("vault__document", Level::Full)
+            .await
+            .unwrap();
+        // Ensure run_connection subscribed before the proposal broadcast.
+        silent.recv().await.unwrap();
+        silent.recv().await.unwrap();
+
+        assert_eq!(
+            store
+                .begin_epoch_transition("vault__document")
+                .await
+                .unwrap(),
+            1
+        );
+        // The peer never acknowledges. Once the timeout activates the new
+        // epoch, its connection ends instead of serving the retired document.
+        let closed = timeout(Duration::from_secs(5), async {
+            while silent.recv().await.is_some() {}
+        })
+        .await;
+        assert!(closed.is_ok(), "a retired connection stayed open");
+        assert_eq!(store.current_epoch("vault__document").await.unwrap(), 1);
         let _ = tokio::fs::remove_dir_all(directory).await;
     }
 

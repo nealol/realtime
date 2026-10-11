@@ -16,7 +16,7 @@ import { IndexeddbPersistence, clearDocument } from "y-indexeddb";
 import type RealtimePlugin from "../main";
 import { getClientToken } from "../sync/clientToken";
 import { createMuxSocket } from "../sync/mux";
-import { epochPersistenceName, getDocumentEpoch } from "../documentEpoch";
+import { epochPersistenceName, epochStoreBaseName, getDocumentEpoch } from "../documentEpoch";
 import { CRSQLITE_WASM_DATA_URL } from "./wasmBinary";
 import type { PluginDbDocHandle } from "./PluginDbSync";
 import type { SyncedPluginDatabaseOptions } from "./SyncedPluginDatabase";
@@ -121,8 +121,7 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
   );
   // A database has no viewers to show presence to.
   provider.awareness.setLocalState(null);
-  const serverScope = plugin.settings.authServerId || plugin.settings.authServerUrl;
-  const storeBase = `realtime:plugindb:${serverScope}:${docId}`;
+  const storeBase = epochStoreBaseName(plugin, docId);
   const persistence = new IndexeddbPersistence(
     epochPersistenceName(plugin, docId, storeBase, epoch),
     doc,

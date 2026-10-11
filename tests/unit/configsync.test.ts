@@ -13,6 +13,7 @@ import { makeFakePlugin } from "../support/fakePlugin";
 import { freshGuid } from "../support/util";
 import { waitFor } from "../support/util";
 import { HttpError } from "../../src/httpError";
+import type RealtimePlugin from "../../src/main";
 
 const local: ConfigMeta = { hash: "local", size: 1, mtime: 200 };
 const remote: ConfigMeta = { hash: "remote", size: 1, mtime: 100 };
@@ -294,9 +295,12 @@ describe("ConfigSync reconcile decisions", () => {
     expect(decideConfigReconcile(local, { ...remote, prev: local.hash }, local.hash)).toBe(
       "download",
     );
-    // Published concurrently from an older version: both sides changed.
+    // Published concurrently with ours from an older version: both sides changed.
     expect(
-      decideConfigReconcile(local, { ...remote, prev: "older" }, local.hash, { canMerge: true }),
+      decideConfigReconcile(local, { ...remote, prev: "older" }, local.hash, {
+        canMerge: true,
+        ownBase: true,
+      }),
     ).toBe("merge");
     // Still exactly the version our publish replaced: that publish was lost.
     expect(
@@ -306,6 +310,25 @@ describe("ConfigSync reconcile decisions", () => {
     ).toBe("upload");
     // Older publishers record no parent: keep the previous behavior.
     expect(decideConfigReconcile(local, remote, local.hash)).toBe("download");
+  });
+
+  it("downloads a remote that moved several versions past an untouched baseline", () => {
+    // Another device published our baseline, so nothing of ours was overwritten.
+    expect(
+      decideConfigReconcile(local, { ...remote, prev: "middle" }, local.hash, {
+        canMerge: true,
+        ownBase: false,
+      }),
+    ).toBe("download");
+    // Our own publish, then two remote versions built on it: its lineage says so.
+    expect(
+      decideConfigReconcile(
+        local,
+        { ...remote, prev: "middle", lineage: ["middle", local.hash.slice(0, 16)] },
+        local.hash,
+        { canMerge: true, ownBase: true },
+      ),
+    ).toBe("download");
   });
 
   it("falls back to newest-wins on non-mergeable conflicts", () => {
@@ -412,6 +435,117 @@ describe("three-way JSON settings merge", () => {
     } finally {
       sync.destroy();
       indexDoc.destroy();
+    }
+  });
+});
+
+describe("ConfigSync with versions missed while away", () => {
+  const path = ".obsidian/app.json";
+  const json = (value: Record<string, number>) => {
+    const bytes = new TextEncoder().encode(JSON.stringify(value, null, 2));
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+  };
+
+  /** One device's config sync over an in-memory adapter and blob store. */
+  async function device(onDisk: ArrayBuffer, blobs: Map<string, ArrayBuffer>) {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const disk = new Map([[path, onDisk]]);
+    Object.assign(plugin.app.vault, {
+      configDir: ".obsidian",
+      adapter: {
+        exists: async (p: string) => p === ".obsidian" || disk.has(p),
+        stat: async (p: string) => {
+          const stored = disk.get(p);
+          return stored ? { mtime: 1, ctime: 1, size: stored.byteLength, type: "file" } : null;
+        },
+        readBinary: async (p: string) => disk.get(p),
+        writeBinary: async (p: string, data: ArrayBuffer) => {
+          disk.set(p, data);
+        },
+        mkdir: async () => {},
+        remove: async (p: string) => {
+          disk.delete(p);
+        },
+        list: async () => ({ files: [...disk.keys()], folders: [] }),
+      },
+    });
+    Object.assign(plugin.auth, {
+      getBlob: async (_vault: string, _path: string | null, hash: string) => blobs.get(hash),
+      blobExists: async (_vault: string, _path: string, hash: string) => blobs.has(hash),
+      putBlob: async (_vault: string, _path: string, hash: string, data: ArrayBuffer) => {
+        blobs.set(hash, data);
+      },
+    });
+    const localState = new LocalSyncState(`config-missed:${freshGuid()}`);
+    await localState.whenSynced;
+    const indexDoc = new Y.Doc();
+    // The fake implements the slice of the plugin ConfigSync uses.
+    const realtime = plugin as unknown as RealtimePlugin;
+    const sync = new ConfigSync(realtime, indexDoc, localState);
+    return {
+      disk,
+      localState,
+      configFiles: indexDoc.getMap<ConfigMeta>("configFiles"),
+      sync,
+      destroy: () => {
+        sync.destroy();
+        indexDoc.destroy();
+        localState.destroy();
+      },
+    };
+  }
+
+  it("downloads a settings file changed twice elsewhere instead of reverting the first change", async () => {
+    const [v1, v2, v3] = [json({ a: 1, b: 1 }), json({ a: 2, b: 1 }), json({ a: 2, b: 2 })];
+    const [h1, h2, h3] = await Promise.all([v1, v2, v3].map(sha256Hex));
+    const blobs = new Map([
+      [h1, v1],
+      [h2, v2],
+      [h3, v3],
+    ]);
+    const away = await device(v1, blobs);
+    try {
+      away.localState.markSynced(path, "config", h1, h1);
+      away.configFiles.set(path, { hash: h1, size: v1.byteLength, mtime: 1, prev: null });
+      away.sync.seedBaseline();
+      // Another device changed `a`, then `b`; only the latest entry arrives.
+      away.configFiles.set(path, { hash: h3, size: v3.byteLength, mtime: 3, prev: h2 });
+      away.sync.start(new Set(["mainSettings"]));
+      await waitFor(() => away.disk.get(path) === v3 || away.configFiles.get(path)?.hash !== h3, {
+        label: "reconciled",
+      });
+      expect(away.configFiles.get(path)?.hash).toBe(h3);
+      expect(JSON.parse(new TextDecoder().decode(away.disk.get(path)))).toEqual({ a: 2, b: 2 });
+    } finally {
+      away.destroy();
+    }
+  });
+
+  it("merges a publish that lost a race against the version both were built on", async () => {
+    const [v1, ours, theirs] = [json({ a: 1, b: 1 }), json({ a: 1, b: 9 }), json({ a: 7, b: 1 })];
+    const [h1, hOurs, hTheirs] = await Promise.all([v1, ours, theirs].map(sha256Hex));
+    const blobs = new Map([
+      [h1, v1],
+      [hOurs, ours],
+      [hTheirs, theirs],
+    ]);
+    const racer = await device(ours, blobs);
+    try {
+      // This device published `ours` over v1 and saw it in its own index...
+      racer.localState.markPublished(path, "config", hOurs, h1);
+      racer.localState.markSynced(path, "config", hOurs, hOurs);
+      racer.configFiles.set(path, { hash: hOurs, size: ours.byteLength, mtime: 2, prev: h1 });
+      racer.sync.seedBaseline();
+      // ...then last-writer-wins kept another device's concurrent publish.
+      racer.configFiles.set(path, { hash: hTheirs, size: theirs.byteLength, mtime: 2, prev: h1 });
+      racer.sync.start(new Set(["mainSettings"]));
+      await waitFor(() => racer.configFiles.get(path)?.hash !== hTheirs, { label: "merged" });
+      expect(JSON.parse(new TextDecoder().decode(racer.disk.get(path)))).toEqual({ a: 7, b: 9 });
+    } finally {
+      racer.destroy();
     }
   });
 });

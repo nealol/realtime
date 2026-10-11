@@ -57,6 +57,7 @@ export class CanvasTextCardBinding {
     this.binding = new YTextEditorBinding(active.editor, ytext, {
       whenReady: () => this.doc.whenReady(),
       isReady: () => this.doc.isReady(),
+      hasSyncedOnce: () => this.doc.hasSyncedOnce,
       mayPushToShared: (sharedEmpty) =>
         shouldPushEditorToShared({
           sharedEmpty,

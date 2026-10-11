@@ -10,8 +10,8 @@ import {
   SYNC_STATUS_OFFLINE,
 } from "./sync/RealtimeProvider";
 import { createMuxSocket } from "./sync/mux";
-import { epochPersistenceName, getDocumentEpoch } from "./documentEpoch";
-import { preserveTextConflict } from "./conflictRecovery";
+import { epochPersistenceName, epochStoreBaseName, getDocumentEpoch } from "./documentEpoch";
+import { updateTextConflict } from "./conflictRecovery";
 import { sha256Text } from "./hash";
 import { registerPresenceOwner, type PresenceOwner } from "./presenceOwners";
 import type { MaterializedKind } from "./localSyncState";
@@ -75,6 +75,8 @@ export abstract class SyncedDoc implements PresenceOwner {
   private readOnlyRecoveryPending = false;
   private readOnlyRecoveryRequested = false;
   private readOnlyRecoveryBaseline: string | null = null;
+  /** The one recovery copy this document keeps its read-only edits in. */
+  private readOnlyRecoveryPath: string | null = null;
   private destroyListeners = new Set<() => void>();
   /** This client's presence fields (name, colors, avatar). */
   private presenceUser: Record<string, unknown> | null = null;
@@ -120,16 +122,17 @@ export abstract class SyncedDoc implements PresenceOwner {
     // on screen, so publish presence only while a view holds it.
     this.awareness.setLocalState(null);
     registerPresenceOwner(this.awareness, this);
+    const store = epochStoreBaseName(plugin, serverDocId);
     this.persistence = new IndexeddbPersistence(
-      epochPersistenceName(plugin, serverDocId, serverDocId, this.epoch),
+      epochPersistenceName(plugin, serverDocId, store, this.epoch),
       this.ydoc,
     );
     // The previous epoch's store can never be connected again; drop it even
     // when the document was not resident (or the app was closed) at rollover.
     if (this.epoch > 0) {
-      void clearDocument(
-        epochPersistenceName(plugin, serverDocId, serverDocId, this.epoch - 1),
-      ).catch(() => {});
+      void clearDocument(epochPersistenceName(plugin, serverDocId, store, this.epoch - 1)).catch(
+        () => {},
+      );
     }
     const storeUpdate = this.persistence._storeUpdate;
     this.ydoc.off("update", storeUpdate);
@@ -371,9 +374,16 @@ export abstract class SyncedDoc implements PresenceOwner {
         this.readOnlyRecoveryRequested = false;
         const value = this.serializeRecoveryContent();
         if (value === this.readOnlyRecoveryBaseline) continue;
-        await preserveTextConflict(this.plugin, this.path, value, "local");
+        const recoveryPath = await updateTextConflict(
+          this.plugin,
+          this.path,
+          value,
+          "local",
+          this.readOnlyRecoveryPath,
+        );
         if (!this.destroyed) {
           this.readOnlyRecoveryBaseline = value;
+          this.readOnlyRecoveryPath = recoveryPath ?? this.readOnlyRecoveryPath;
         }
       }
     } catch (error) {

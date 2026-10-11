@@ -2550,6 +2550,50 @@ async fn blob_put_head_get_roundtrip() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// A client that finds a blob through the HEAD check skips its upload and
+/// publishes an index entry next, so the check must protect an old orphan
+/// from the default sweep exactly as a re-upload would.
+#[tokio::test]
+async fn blob_existence_check_protects_an_old_orphan_from_gc() {
+    let (app, _git_dir, blob_dir) = history_test_app().await;
+    let alice = login(&app, "alice").await;
+    let (_, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&alice),
+        Some(json!({"name": "V"})),
+    )
+    .await;
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let content = b"attachment whose first index entry never landed".to_vec();
+    let hash = sha256_hex(&content);
+    let uri = format!("/api/vaults/{vault_id}/blobs/{hash}");
+    let (status, _) = send_raw(&app, "PUT", &uri, Some(&alice), content).await;
+    assert_eq!(status, StatusCode::OK);
+    let blob_path = blob_dir.join(&vault_id).join(&hash);
+    std::fs::File::options()
+        .write(true)
+        .open(&blob_path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 60 * 60))
+        .unwrap();
+
+    let (status, _) = send_raw(&app, "HEAD", &uri, Some(&alice), vec![]).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, gc) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/storage/gc-blobs"),
+        Some(&alice),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "gc failed: {gc}");
+    assert_eq!(gc["removed"], 0);
+    assert!(blob_path.exists());
+}
+
 #[tokio::test]
 async fn path_scoped_blob_get_checks_the_index_entry() {
     let (app, state) = test_app_with_state().await;
@@ -6123,6 +6167,106 @@ async fn stream_ws_e2e_tokens_caret_audit_and_undo() {
     )
     .await;
     assert!(page["entries"][0]["undoneAt"].is_i64());
+}
+
+/// A stream session acknowledges an epoch proposal at once and keeps
+/// streaming into the replacement, so the epoch activates without waiting for
+/// the acknowledgement timeout and no streamed text is lost.
+#[tokio::test]
+async fn stream_ws_e2e_follows_an_epoch_change_mid_stream() {
+    let (app, state) = test_app_with_state().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    {
+        let app = app.clone();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    }
+
+    let session = login(&app, "alice").await;
+    let (status, vault) = send(
+        &app,
+        "POST",
+        "/api/vaults",
+        Some(&session),
+        Some(json!({ "name": "Epoch Stream Vault" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let vault_id = vault["id"].as_str().unwrap().to_string();
+    let (status, note_created) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/notes"),
+        Some(&session),
+        Some(json!({ "path": "epoch.md", "content": "# Title\n" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let note_doc_id = format!("{vault_id}__{}", note_created["guid"].as_str().unwrap());
+    let (status, cursor) = send(
+        &app,
+        "POST",
+        &format!("/api/vaults/{vault_id}/cursors"),
+        Some(&session),
+        Some(json!({ "name": "Streamy" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let secret = cursor["secretToken"].as_str().unwrap().to_string();
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/api/vaults/{vault_id}/stream?token={secret}"
+    ))
+    .await
+    .unwrap();
+    send_stream_frame(
+        &mut ws,
+        json!({ "type": "start", "path": "epoch.md", "anchor": { "mode": "append" } }),
+    )
+    .await;
+    let started = next_stream_frame(&mut ws).await;
+    assert_eq!(started["type"], "started", "got: {started}");
+    send_stream_frame(&mut ws, json!({ "type": "text", "text": "Hello " })).await;
+    let ack = next_stream_frame(&mut ws).await;
+    assert_eq!(ack["type"], "ack", "got: {ack}");
+
+    let epoch = state
+        .documents
+        .begin_epoch_transition(&note_doc_id)
+        .await
+        .unwrap();
+    let activated = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+        while state.documents.current_epoch(&note_doc_id).await.unwrap() < epoch {
+            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        activated.is_ok(),
+        "the stream session never acknowledged the epoch"
+    );
+
+    send_stream_frame(&mut ws, json!({ "type": "text", "text": "world" })).await;
+    send_stream_frame(&mut ws, json!({ "type": "end" })).await;
+    let done = loop {
+        let frame = next_stream_frame(&mut ws).await;
+        match frame["type"].as_str() {
+            Some("ack") => {}
+            Some("done") => break frame,
+            other => panic!("unexpected stream frame {other:?}: {frame}"),
+        }
+    };
+    assert_eq!(done["inserted"], 11);
+    let (status, note) = send(
+        &app,
+        "GET",
+        &format!("/api/vaults/{vault_id}/notes/epoch.md"),
+        Some(&session),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(note["content"], "# Title\nHello world");
 }
 
 /// Streaming into a note after an anchor while a "human" concurrently edits

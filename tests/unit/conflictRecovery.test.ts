@@ -3,7 +3,9 @@ import {
   preserveAdapterConflict,
   preserveBinaryConflict,
   preserveTextConflict,
+  updateTextConflict,
 } from "../../src/conflictRecovery";
+import type RealtimePlugin from "../../src/main";
 import { makeFakePlugin } from "../support/fakePlugin";
 
 describe("conflict recovery copies", () => {
@@ -18,6 +20,32 @@ describe("conflict recovery copies", () => {
     expect(second).not.toBe(first);
     expect(vault.files.get(first)).toBe("first");
     expect(vault.files.get(second)).toBe("second");
+  });
+
+  it("keeps successive versions in one recovery copy", async () => {
+    const { plugin, vault } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    // The fake implements the slice of the plugin recovery copies use.
+    const realtime = plugin as unknown as RealtimePlugin;
+    const copies = () => [...vault.files.keys()].filter((path) => path.includes("conflicted copy"));
+
+    const first = await updateTextConflict(realtime, "note.md", "one", "local", null);
+    const second = await updateTextConflict(realtime, "note.md", "one two", "local", first);
+    expect(second).toBe(first);
+    expect(copies()).toEqual([first]);
+    expect(vault.files.get(first!)).toBe("one two");
+
+    // A later session finds a copy that already holds its content.
+    expect(await updateTextConflict(realtime, "note.md", "one two", "local", null)).toBeNull();
+    expect(copies()).toEqual([first]);
+
+    // A copy deleted meanwhile is recreated rather than silently lost.
+    vault.files.delete(first!);
+    const third = await updateTextConflict(realtime, "note.md", "one two three", "local", first);
+    expect(copies()).toEqual([third]);
+    expect(vault.files.get(third!)).toBe("one two three");
   });
 
   it("preserves binary bytes exactly", async () => {

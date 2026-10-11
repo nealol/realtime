@@ -127,6 +127,36 @@ describe("document epochs", () => {
     expect(getDocumentEpoch(instance, "vault__note")).toBe(3);
   });
 
+  it("rebuilds at the server's epoch once tokens stay behind longer than any activation", async () => {
+    vi.useFakeTimers();
+    try {
+      const instance = plugin();
+      instance.rewindDocumentEpoch = vi.fn();
+      setDocumentEpoch(instance, "vault__note", 3);
+      instance.auth.docToken.mockResolvedValue({ ...tokenFor("vault__note"), epoch: 2 });
+
+      await expect(getClientToken(instance, "vault__note")).rejects.toBeInstanceOf(
+        DocumentEpochPendingError,
+      );
+      vi.advanceTimersByTime(9 * 60_000);
+      await expect(getClientToken(instance, "vault__note")).rejects.toBeInstanceOf(
+        DocumentEpochPendingError,
+      );
+      expect(instance.rewindDocumentEpoch).not.toHaveBeenCalled();
+
+      // An activation never takes this long, so the server went back to an
+      // older epoch (a restored backup) and this device follows it.
+      vi.advanceTimersByTime(60_000);
+      await expect(getClientToken(instance, "vault__note")).rejects.toMatchObject({
+        name: "DocumentEpochChangedError",
+        epoch: 2,
+      });
+      expect(instance.rewindDocumentEpoch).toHaveBeenCalledWith("vault__note", 2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("waits while the server activates the epoch a token names", async () => {
     const instance = plugin();
     setDocumentEpoch(instance, "vault__note", 3);

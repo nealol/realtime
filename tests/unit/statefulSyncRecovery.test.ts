@@ -26,6 +26,7 @@ import type { ClientToken } from "../../src/sync/clientToken";
 import type RealtimePlugin from "../../src/main";
 
 const MESSAGE_SYNC = 0;
+const MESSAGE_SYNC_STATUS = 102;
 const MESSAGE_EPOCH_PROPOSAL = 103;
 const MESSAGE_EPOCH_ACKNOWLEDGEMENT = 104;
 const SOCKET_OPEN = 1;
@@ -68,6 +69,21 @@ function syncStep2(): Uint8Array {
   encoding.writeVarUint(encoder, MESSAGE_SYNC);
   syncProtocol.writeSyncStep2(encoder, new Y.Doc());
   return encoding.toUint8Array(encoder);
+}
+
+/** The server's half of a handshake: its state vector, then its state. */
+function handshake(socket: ModelSocket | undefined): void {
+  const encoder = encoding.createEncoder();
+  encoding.writeVarUint(encoder, MESSAGE_SYNC);
+  syncProtocol.writeSyncStep1(encoder, new Y.Doc());
+  socket?.receive(encoding.toUint8Array(encoder));
+  socket?.receive(syncStep2());
+}
+
+/** The server echoes a sync-status probe once everything sent before it is durable. */
+function answerSyncStatus(socket: ModelSocket): void {
+  const probe = socket.sent.findLast((message) => messageKind(message) === MESSAGE_SYNC_STATUS);
+  if (probe) socket.receive(probe);
 }
 
 function epochProposal(epoch: number): Uint8Array {
@@ -152,7 +168,7 @@ describe("stateful sync boundary properties", () => {
                 connected = true;
                 void provider.connect();
                 await flush();
-                sockets.at(-1)?.receive(syncStep2());
+                handshake(sockets.at(-1));
                 await flush();
               } else if (command.type === "disconnect") {
                 connected = false;
@@ -167,7 +183,7 @@ describe("stateful sync boundary properties", () => {
                   await flush();
                   const retrySocket = sockets.at(-1);
                   if (retrySocket && retrySocket !== activeSocket) {
-                    retrySocket.receive(syncStep2());
+                    handshake(retrySocket);
                     await flush();
                   }
                   if (tokenCalls > before) expect(retrySocket).not.toBe(activeSocket);
@@ -182,6 +198,10 @@ describe("stateful sync boundary properties", () => {
                 if (socket?.readyState === SOCKET_OPEN) {
                   const sentBefore = socket.sent.length;
                   socket.receive(epochProposal(proposed));
+                  await flush();
+                  // The acknowledgement waits until the server confirms this
+                  // client's changes, which it does by answering a probe.
+                  answerSyncStatus(socket);
                   await flush();
                   expect(getDocumentEpoch(plugin as unknown as RealtimePlugin, "vault__doc")).toBe(
                     proposed,

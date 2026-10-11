@@ -1,6 +1,5 @@
 import * as encoding from "lib0/encoding";
 import * as decoding from "lib0/decoding";
-import { handleEpochProposal } from "../documentEpoch";
 import { SOCKET_ERROR_TOKEN_REJECTED, type SyncSocket } from "./RealtimeProvider";
 
 /**
@@ -28,6 +27,8 @@ import { SOCKET_ERROR_TOKEN_REJECTED, type SyncSocket } from "./RealtimeProvider
  *   CLOSE    = [5][channelId]                            both directions
  *   PING     = [6][0]                                    client -> server
  *   PONG     = [7][0]                                    server -> client
+ *   PART     = [8][channelId][raw yjs bytes …]           both directions
+ *   CHUNKED  = [9][0]                                    server -> client
  *
  * OPEN_ERR's optional reason says whether the rejection is admission
  * pressure (back off every open on the shard), a token the server will not
@@ -45,6 +46,14 @@ import { SOCKET_ERROR_TOKEN_REJECTED, type SyncSocket } from "./RealtimeProvider
  * keeps `readyState === OPEN`, so every reconnect would re-attach to a dead
  * socket. This heartbeat detects that and tears the real socket down so every
  * channel's provider reconnects and rebuilds it.
+ *
+ * The heartbeat only sees whole frames, so one large message would look like
+ * a dead socket on a slow link (and so would a large upload to the server's
+ * idle check). The client therefore asks for `/dmux?chunked=1`; a server that
+ * supports it answers CHUNKED, and from then on both sides split payloads
+ * larger than CHUNK_BYTES into PART frames ending with a DATA frame, which
+ * the receiver joins back into one message. Servers that predate it never
+ * answer, and neither side splits.
  */
 
 const FRAME_OPEN = 1;
@@ -54,8 +63,13 @@ const FRAME_DATA = 4;
 const FRAME_CLOSE = 5;
 const FRAME_PING = 6;
 const FRAME_PONG = 7;
-const EPOCH_PROPOSAL_MESSAGE = 103;
-const EPOCH_ACK_MESSAGE = 104;
+const FRAME_PART = 8;
+const FRAME_CHUNKED = 9;
+
+/** Payloads above this travel as PART frames once the server allows it. */
+const CHUNK_BYTES = 64 * 1024;
+/** A joined message may not exceed the server's update limit. */
+const MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
 /** OPEN_ERR reasons (see server/src/dmux.rs); 0 means the server sent none. */
 const OPEN_ERR_UNSPECIFIED = 0;
@@ -95,28 +109,10 @@ export function encodeOpen(channelId: number, pathAndQuery: string): Uint8Array 
   return encoding.toUint8Array(enc);
 }
 
-function decodeEpochProposal(payload: Uint8Array): number | null {
-  const decoder = decoding.createDecoder(payload);
-  if (decoding.readVarUint(decoder) !== EPOCH_PROPOSAL_MESSAGE) return null;
-  const body = decoding.readVarUint8Array(decoder);
-  if (decoding.hasContent(decoder)) throw new Error("trailing bytes in document epoch proposal");
-  const parsed = JSON.parse(new TextDecoder().decode(body)) as { epoch?: unknown };
-  if (!Number.isSafeInteger(parsed.epoch) || (parsed.epoch as number) < 0) {
-    throw new Error("invalid document epoch proposal");
-  }
-  return parsed.epoch as number;
-}
-
-function encodeEpochAcknowledgement(epoch: number): Uint8Array {
-  const encoder = encoding.createEncoder();
-  encoding.writeVarUint(encoder, EPOCH_ACK_MESSAGE);
-  encoding.writeVarUint8Array(encoder, new TextEncoder().encode(JSON.stringify({ epoch })));
-  return encoding.toUint8Array(encoder);
-}
-
-export function encodeData(channelId: number, payload: Uint8Array): Uint8Array {
+/** A DATA frame, or with `final` false a PART frame that more of the payload follows. */
+export function encodeData(channelId: number, payload: Uint8Array, final = true): Uint8Array {
   const enc = encoding.createEncoder();
-  encoding.writeVarUint(enc, FRAME_DATA);
+  encoding.writeVarUint(enc, final ? FRAME_DATA : FRAME_PART);
   encoding.writeVarUint(enc, channelId);
   encoding.writeUint8Array(enc, payload);
   return encoding.toUint8Array(enc);
@@ -148,9 +144,11 @@ export type DecodedFrame =
   | { type: "open_ok"; channelId: number }
   | { type: "open_err"; channelId: number; reason: number }
   | { type: "data"; channelId: number; payload: Uint8Array }
+  | { type: "part"; channelId: number; payload: Uint8Array }
   | { type: "close"; channelId: number }
   | { type: "ping" }
   | { type: "pong" }
+  | { type: "chunked" }
   | null;
 
 export function decodeFrame(buf: Uint8Array): DecodedFrame {
@@ -171,12 +169,16 @@ export function decodeFrame(buf: Uint8Array): DecodedFrame {
         };
       case FRAME_DATA:
         return { type: "data", channelId, payload: decoding.readTailAsUint8Array(dec) };
+      case FRAME_PART:
+        return { type: "part", channelId, payload: decoding.readTailAsUint8Array(dec) };
       case FRAME_CLOSE:
         return { type: "close", channelId };
       case FRAME_PING:
         return { type: "ping" };
       case FRAME_PONG:
         return { type: "pong" };
+      case FRAME_CHUNKED:
+        return channelId === CONTROL_CHANNEL ? { type: "chunked" } : null;
       default:
         return null;
     }
@@ -234,6 +236,10 @@ class MuxConnection {
   private openBurstRemaining = OPEN_BURST_SIZE;
   /** Timestamp of the last frame received on the real socket. */
   private lastActivity = 0;
+  /** The server on the current socket accepts and sends PART frames. */
+  private chunked = false;
+  /** PART payloads received per channel, awaiting the DATA frame that ends them. */
+  private readonly partials = new Map<number, { parts: Uint8Array[]; bytes: number }>();
 
   constructor(private readonly url: string) {}
 
@@ -264,14 +270,22 @@ class MuxConnection {
   }
 
   sendData(channelId: number, payload: Uint8Array): void {
-    if (this.ws && this.ws.readyState === WS_OPEN) {
-      this.ws.send(encodeData(channelId, payload));
+    const ws = this.ws;
+    if (!ws || ws.readyState !== WS_OPEN) return;
+    if (!this.chunked || payload.length <= CHUNK_BYTES) {
+      ws.send(encodeData(channelId, payload));
+      return;
+    }
+    for (let start = 0; start < payload.length; start += CHUNK_BYTES) {
+      const end = Math.min(start + CHUNK_BYTES, payload.length);
+      ws.send(encodeData(channelId, payload.subarray(start, end), end === payload.length));
     }
   }
 
   closeChannel(channelId: number): void {
     this.pendingOpens.delete(channelId);
     this.channels.delete(channelId);
+    this.partials.delete(channelId);
     if (this.ws && this.ws.readyState === WS_OPEN) {
       this.ws.send(encodeClose(channelId));
     }
@@ -285,18 +299,44 @@ class MuxConnection {
     if (this.ws && (this.ws.readyState === WS_OPEN || this.ws.readyState === WS_CONNECTING)) {
       return;
     }
+    // A socket still closing must not report its close against the new one.
+    const closing = this.ws;
+    if (closing) discardSocket(closing);
     const ws = new webSocketCtor(this.url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    this.chunked = false;
+    this.partials.clear();
     ws.onopen = () => {
+      if (this.ws !== ws) return;
       this.lastActivity = Date.now();
       this.openBurstRemaining = OPEN_BURST_SIZE;
       this.startHeartbeat();
       this.flushOpens();
     };
-    ws.onmessage = (event: MessageEvent) => this.receive(new Uint8Array(event.data as ArrayBuffer));
-    ws.onclose = () => this.handleDown();
-    ws.onerror = () => this.handleDown();
+    ws.onmessage = (event: MessageEvent) => {
+      if (this.ws === ws) this.receive(new Uint8Array(event.data as ArrayBuffer));
+    };
+    ws.onclose = () => {
+      if (this.ws === ws) this.handleDown();
+    };
+    ws.onerror = () => {
+      if (this.ws === ws) this.handleDown();
+    };
+    // Channels whose OPEN went out on the closing socket end with it. The
+    // new socket is in place first, so a provider that reconnects at once
+    // joins it instead of replacing it again.
+    if (closing) this.failOpenedChannels();
+  }
+
+  /** Fail every channel whose OPEN was already sent; pending ones stay queued. */
+  private failOpenedChannels(): void {
+    const opened = [...this.channels].filter(([channelId]) => !this.pendingOpens.has(channelId));
+    for (const [channelId] of opened) this.channels.delete(channelId);
+    for (const [, channel] of opened) {
+      channel.deliverError();
+      channel.deliverClose(CLOSE_CODE_TRANSPORT);
+    }
   }
 
   private flushOpens(): void {
@@ -385,9 +425,41 @@ class MuxConnection {
       case "ping":
         // Liveness only; `lastActivity` is already refreshed above.
         break;
-      case "data":
-        this.channels.get(frame.channelId)?.deliverData(frame.payload);
+      case "chunked":
+        this.chunked = true;
         break;
+      case "part": {
+        if (!this.channels.has(frame.channelId)) break;
+        const partial = this.partials.get(frame.channelId) ?? { parts: [], bytes: 0 };
+        partial.parts.push(frame.payload);
+        partial.bytes += frame.payload.length;
+        if (partial.bytes > MAX_MESSAGE_BYTES) {
+          // Larger than any message the protocol allows: drop the channel
+          // rather than buffer without bound. Its provider reconnects.
+          this.partials.delete(frame.channelId);
+          const channel = this.channels.get(frame.channelId);
+          channel?.deliverError();
+          channel?.close();
+          break;
+        }
+        this.partials.set(frame.channelId, partial);
+        break;
+      }
+      case "data": {
+        const partial = this.partials.get(frame.channelId);
+        let payload = frame.payload;
+        if (partial) {
+          this.partials.delete(frame.channelId);
+          payload = new Uint8Array(partial.bytes + frame.payload.length);
+          let offset = 0;
+          for (const part of [...partial.parts, frame.payload]) {
+            payload.set(part, offset);
+            offset += part.length;
+          }
+        }
+        this.channels.get(frame.channelId)?.deliverData(payload);
+        break;
+      }
       case "open_ok":
         // OPEN_OK for an earlier admitted channel can arrive after a later
         // OPEN_ERR because upstream dials complete out of order. Only a success
@@ -408,6 +480,7 @@ class MuxConnection {
         }
         const channel = this.channels.get(frame.channelId);
         this.channels.delete(frame.channelId);
+        this.partials.delete(frame.channelId);
         channel?.deliverError(
           frame.reason === OPEN_ERR_TOKEN ? SOCKET_ERROR_TOKEN_REJECTED : undefined,
         );
@@ -418,6 +491,7 @@ class MuxConnection {
       case "close": {
         const channel = this.channels.get(frame.channelId);
         this.channels.delete(frame.channelId);
+        this.partials.delete(frame.channelId);
         channel?.deliverClose(CLOSE_CODE_TRANSPORT);
         this.teardownIfIdle();
         break;
@@ -475,6 +549,8 @@ class MuxConnection {
     const channels = [...this.channels.values()];
     this.channels.clear();
     this.pendingOpens.clear();
+    this.partials.clear();
+    this.chunked = false;
     const ws = this.ws;
     this.ws = null;
     if (ws) discardSocket(ws);
@@ -490,6 +566,8 @@ class MuxConnection {
     this.stopHeartbeat();
     this.resetOpenBackoff();
     this.clearOpenPaceTimer();
+    this.partials.clear();
+    this.chunked = false;
     const ws = this.ws;
     this.ws = null;
     if (ws) discardSocket(ws);
@@ -542,14 +620,11 @@ export class MuxWebSocket implements SyncSocket {
 
   private readonly conn: MuxConnection;
   private readonly channelId: number;
-  private readonly documentId: string;
 
   constructor(url: string) {
     const parsed = new URL(url);
-    const segments = parsed.pathname.split("/");
-    this.documentId = decodeURIComponent(segments[2] ?? "");
     const pathAndQuery = parsed.pathname + parsed.search;
-    const muxUrl = `${parsed.protocol}//${parsed.host}/dmux`;
+    const muxUrl = `${parsed.protocol}//${parsed.host}/dmux?chunked=1`;
     this.conn = MuxConnection.acquire(muxUrl);
     this.channelId = this.conn.register(this);
     this.conn.openChannel(this.channelId, pathAndQuery);
@@ -576,18 +651,6 @@ export class MuxWebSocket implements SyncSocket {
   }
 
   deliverData(payload: Uint8Array): void {
-    try {
-      const epoch = decodeEpochProposal(payload);
-      if (epoch !== null) {
-        handleEpochProposal(this.documentId, epoch);
-        this.conn.sendData(this.channelId, encodeEpochAcknowledgement(epoch));
-        return;
-      }
-    } catch {
-      this.deliverError();
-      this.close();
-      return;
-    }
     this.onmessage?.({ data: payload });
   }
 

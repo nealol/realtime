@@ -60,11 +60,21 @@ const SERVER_FAILURES_BEFORE_BACKOFF = 3;
  */
 const MAX_CONCURRENT_TOKEN_REQUESTS = 6;
 
+/**
+ * How long tokens may name an epoch older than this device's before the
+ * server is taken to have gone back (a restored backup) rather than to be
+ * activating an epoch this client already accepted. Activation waits at most
+ * the server's acknowledgement timeout, 30 seconds by default.
+ */
+const EPOCH_REGRESSION_GRACE_MS = 10 * 60_000;
+
 let tokenRetryDelayMs = TOKEN_RETRY_DELAY_MS;
 let nextTokenAttemptAt = 0;
 let consecutiveServerFailures = 0;
 let activeTokenRequests = 0;
 let tokenRequestWaiters: Array<() => void> = [];
+/** Document id -> when tokens first named an epoch behind this device's. */
+const epochLagSince = new Map<string, number>();
 
 /**
  * Test-only: clear the module-global token backoff/queue and optionally shrink
@@ -78,6 +88,7 @@ export function resetTokenRetryStateForTests(delayMs = TOKEN_RETRY_DELAY_MS): vo
   consecutiveServerFailures = 0;
   activeTokenRequests = 0;
   tokenRequestWaiters = [];
+  epochLagSince.clear();
 }
 
 /**
@@ -167,11 +178,22 @@ export async function getClientToken(
     }
     const serverEpoch = token.epoch ?? 0;
     const localEpoch = getDocumentEpoch(plugin, docId);
+    if (serverEpoch >= localEpoch) epochLagSince.delete(docId);
     if (serverEpoch > localEpoch) {
       plugin.acceptDocumentEpoch(docId, serverEpoch);
       throw new DocumentEpochChangedError(docId, serverEpoch);
     }
     if (serverEpoch < localEpoch) {
+      const since = epochLagSince.get(docId) ?? Date.now();
+      if (Date.now() - since >= EPOCH_REGRESSION_GRACE_MS) {
+        // No activation takes this long, so the server lost the epochs this
+        // device moved to. Rebuild at the server's epoch instead of waiting
+        // forever for one that will never come.
+        epochLagSince.delete(docId);
+        plugin.rewindDocumentEpoch(docId, serverEpoch);
+        throw new DocumentEpochChangedError(docId, serverEpoch);
+      }
+      epochLagSince.set(docId, since);
       // This client already accepted a proposed epoch that the server has not
       // activated yet (it is waiting for other peers to acknowledge, for at
       // most its acknowledgement timeout). Wait for it: connecting to the

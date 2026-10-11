@@ -608,6 +608,68 @@ describe("SyncedPluginDatabase", () => {
     }
   });
 
+  it("keeps its data and handle when its batch log moves to a new epoch", async () => {
+    _resetSqliteForTests();
+    const retired = new Y.Doc();
+    const replacement = new Y.Doc();
+    let current = retired;
+    const db = makeEngine({ doc: () => current, snap: newSnapStore() });
+    const consumer = makeEngine({ doc: replacement, snap: newSnapStore() });
+    try {
+      await db.start();
+      await db.whenLive();
+      await db.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["t1", "before"]);
+      await waitFor(() => retired.getArray("batches").length === 1, {
+        label: "published into the retired log",
+      });
+
+      // The replacement log lacks that batch, as if it never reached the server.
+      current = replacement;
+      await db.replaceTransport();
+      await db.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["t2", "after"]);
+      expect(await titles(db)).toEqual(["before", "after"]);
+
+      await consumer.start();
+      await consumer.whenLive();
+      await waitFor(async () => (await titles(consumer)).length === 2, {
+        label: "the replacement log carries both rows",
+      });
+      expect(await titles(consumer)).toEqual(["before", "after"]);
+    } finally {
+      await db.close();
+      await consumer.close();
+    }
+  });
+
+  it("publishes a cursor that covers batches from its own earlier sessions", async () => {
+    _resetSqliteForTests();
+    const doc = new Y.Doc();
+    const snap = newSnapStore();
+    const batches = doc.getArray<{ siteId: string; toDbVersion: number }>("batches");
+    const first = makeEngine({ doc, snap });
+    await first.start();
+    await first.whenLive();
+    await first.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["t1", "first session"]);
+    await waitFor(() => batches.length === 1, { label: "first session published" });
+    await first.close();
+
+    const second = makeEngine({ doc, snap });
+    try {
+      await second.start();
+      await second.whenLive();
+      await second.exec(`INSERT INTO tasks (id, title) VALUES (?, ?)`, ["t2", "second session"]);
+      await waitFor(() => batches.length === 2, { label: "second session published" });
+      const [earlier, later] = batches.toArray();
+      // The server compacts a batch once every recent cursor covers it. A
+      // restart can give this device a new site, and its cursor must still
+      // cover what the earlier site published.
+      const cursor = doc.getMap<Record<string, number>>("cursors").get(later.siteId);
+      expect(cursor?.[earlier.siteId]).toBeGreaterThanOrEqual(earlier.toDbVersion);
+    } finally {
+      await second.close();
+    }
+  });
+
   it("does not skip an own-site batch when it is newer than the local published watermark", async () => {
     const producerDoc = new Y.Doc();
     const producer = makeEngine({ doc: producerDoc, snap: newSnapStore() });

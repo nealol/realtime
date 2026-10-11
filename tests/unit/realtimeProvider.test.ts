@@ -256,7 +256,7 @@ describe("RealtimeProvider", () => {
     f.doc.destroy();
   });
 
-  it("persists and acknowledges a direct-socket epoch proposal", async () => {
+  it("persists and acknowledges an epoch proposal once the handshake is confirmed", async () => {
     const f = fixture();
     let proposal: { documentId: string; epoch: number } | null = null;
     setEpochProposalHandler((documentId, epoch) => {
@@ -264,6 +264,8 @@ describe("RealtimeProvider", () => {
     });
     try {
       const socket = await openAndHandshake(f);
+      // The handshake's reply is unconfirmed until the first sync status.
+      socket.deliver(syncAcknowledgement(0));
       const body = new TextEncoder().encode(JSON.stringify({ epoch: 7 }));
       const encoder = encoding.createEncoder();
       encoding.writeVarUint(encoder, 103);
@@ -291,6 +293,40 @@ describe("RealtimeProvider", () => {
       socket.deliver(documentInvalidation("vault__remote-guid"));
       expect(invalidated).toEqual(["vault__remote-guid"]);
       expect(f.provider.status).toBe("connected");
+    } finally {
+      f.destroy();
+    }
+  });
+
+  it("acknowledges an epoch only after the server confirms pending local changes", async () => {
+    const f = fixture();
+    const accepted: number[] = [];
+    let pendingAtAccept: boolean | null = null;
+    setEpochProposalHandler((_documentId, epoch) => {
+      accepted.push(epoch);
+      pendingAtAccept = f.provider.hasLocalChanges;
+    });
+    try {
+      const socket = await openAndHandshake(f);
+      socket.deliver(syncAcknowledgement(0));
+      f.doc.getMap("values").set("typed", "just now");
+      expect(f.provider.hasLocalChanges).toBe(true);
+
+      const encoder = encoding.createEncoder();
+      encoding.writeVarUint(encoder, 103);
+      encoding.writeVarUint8Array(encoder, new TextEncoder().encode(JSON.stringify({ epoch: 4 })));
+      socket.deliver(encoding.toUint8Array(encoder));
+
+      // The change is still unconfirmed: the proposal waits, and a fresh
+      // sync-status probe asks the server to confirm it.
+      expect(accepted).toEqual([]);
+      expect(socket.sent.map(messageType)).not.toContain(104);
+      expect(messageType(socket.sent.at(-1)!)).toBe(102);
+
+      socket.deliver(syncAcknowledgement(1));
+      expect(accepted).toEqual([4]);
+      expect(pendingAtAccept).toBe(false);
+      expect(messageType(socket.sent.at(-1)!)).toBe(104);
     } finally {
       f.destroy();
     }
@@ -393,6 +429,28 @@ describe("RealtimeProvider", () => {
       expect(tokenSource).toHaveBeenCalledTimes(3);
       await vi.advanceTimersByTimeAsync(1_000);
       expect(tokenSource).toHaveBeenCalledTimes(4);
+    } finally {
+      f.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not cut a refused document's token backoff short on reconnect nudges", async () => {
+    vi.useFakeTimers();
+    const tokenSource = vi.fn(() => Promise.reject(new HttpError("forbidden", 403)));
+    const f = fixture(tokenSource);
+    try {
+      void f.provider.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(tokenSource).toHaveBeenCalledTimes(1);
+      // The periodic reconnect sweep nudges every errored document.
+      void f.provider.connect();
+      await vi.advanceTimersByTimeAsync(2_000);
+      void f.provider.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(tokenSource).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(tokenSource).toHaveBeenCalledTimes(2);
     } finally {
       f.destroy();
       vi.useRealTimers();
