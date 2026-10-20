@@ -1,4 +1,5 @@
 use axum::extract::{Form, Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::Json;
 use base64::Engine;
@@ -16,13 +17,23 @@ use crate::state::{AppState, OAuthFlow};
 const CODE_TTL_MS: i64 = 5 * 60 * 1000;
 const ACCESS_TTL_MS: i64 = 60 * 60 * 1000;
 const REFRESH_TTL_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const TOKEN_ENDPOINT_AUTH_METHODS: [&str; 3] =
+    ["none", "client_secret_post", "client_secret_basic"];
 
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct RegisterResponse {
     client_id: String,
+    client_id_issued_at: i64,
+
+    // RFC 7591 §3.2.1: public clients get no secret field at all. Clients
+    // such as ChatGPT reject `"client_secret": null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_secret_expires_at: Option<i64>,
     redirect_uris: Vec<String>,
+    token_endpoint_auth_method: String,
 }
 
 #[derive(Deserialize)]
@@ -100,34 +111,52 @@ pub async fn authorization_server(State(state): State<AppState>) -> Json<serde_j
         "code_challenge_methods_supported": ["S256"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "response_types_supported": ["code"],
+        "token_endpoint_auth_methods_supported": TOKEN_ENDPOINT_AUTH_METHODS,
     }))
 }
 
 pub async fn register_client(
     State(state): State<AppState>,
     Json(body): Json<RegisterRequest>,
-) -> AppResult<Json<RegisterResponse>> {
+) -> AppResult<(StatusCode, Json<RegisterResponse>)> {
     if body.redirect_uris.is_empty() {
         return Err(AppError::BadRequest("redirect_uris is required".into()));
     }
     for uri in &body.redirect_uris {
         url::Url::parse(uri).map_err(|_| AppError::BadRequest("invalid redirect_uri".into()))?;
     }
-    let confidential = body.token_endpoint_auth_method.as_deref() == Some("client_secret_post");
-    let client_secret = confidential.then(random_token);
+
+    // An omitted method registers a public PKCE client. RFC 7591 defaults to
+    // client_secret_basic, but existing MCP clients rely on the public default.
+    let auth_method = body
+        .token_endpoint_auth_method
+        .unwrap_or_else(|| "none".to_string());
+    if !TOKEN_ENDPOINT_AUTH_METHODS.contains(&auth_method.as_str()) {
+        return Err(AppError::BadRequest(
+            "unsupported token_endpoint_auth_method".into(),
+        ));
+    }
+    let client_secret = (auth_method != "none").then(random_token);
+    let now = now_millis();
     let model = oauth_clients::ActiveModel {
         id: Set(uuid::Uuid::new_v4().to_string()),
         client_secret_hash: Set(client_secret.as_deref().map(hash_token)),
         redirect_uris: Set(serde_json::to_string(&body.redirect_uris).unwrap_or_default()),
         app_id: Set(None),
-        created_at: Set(now_millis()),
+        created_at: Set(now),
     };
     let client = model.insert(&state.db).await?;
-    Ok(Json(RegisterResponse {
-        client_id: client.id,
-        client_secret,
-        redirect_uris: body.redirect_uris,
-    }))
+    Ok((
+        StatusCode::CREATED,
+        Json(RegisterResponse {
+            client_id: client.id,
+            client_id_issued_at: now / 1000,
+            client_secret_expires_at: client_secret.as_ref().map(|_| 0),
+            client_secret,
+            redirect_uris: body.redirect_uris,
+            token_endpoint_auth_method: auth_method,
+        }),
+    ))
 }
 
 pub async fn authorize(
@@ -240,14 +269,51 @@ pub async fn finish_authorize(
 
 pub async fn token(
     State(state): State<AppState>,
-    Form(body): Form<TokenRequest>,
+    headers: HeaderMap,
+    Form(mut body): Form<TokenRequest>,
 ) -> AppResult<Json<TokenResponse>> {
     prune_oauth_flows(&state).await;
+    if let Some((client_id, client_secret)) = basic_client_credentials(&headers)? {
+        // RFC 6749 §2.3: a client uses one authentication method per request.
+        if body.client_secret.is_some()
+            || body.client_id.as_deref().is_some_and(|id| id != client_id)
+        {
+            return Err(AppError::Unauthorized);
+        }
+        body.client_id = Some(client_id);
+        body.client_secret = Some(client_secret);
+    }
     match body.grant_type.as_str() {
         "authorization_code" => exchange_code(&state, body).await.map(Json),
         "refresh_token" => refresh(&state, body).await.map(Json),
         _ => Err(AppError::BadRequest("unsupported grant_type".into())),
     }
+}
+
+/// Parses `Authorization: Basic` client credentials (RFC 6749 §2.3.1).
+fn basic_client_credentials(headers: &HeaderMap) -> AppResult<Option<(String, String)>> {
+    let Some(value) = headers.get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let Some(encoded) = value.to_str().ok().and_then(|v| {
+        v.strip_prefix("Basic ")
+            .or_else(|| v.strip_prefix("basic "))
+    }) else {
+        return Ok(None);
+    };
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or(AppError::Unauthorized)?;
+    let (id, secret) = decoded.split_once(':').ok_or(AppError::Unauthorized)?;
+    let unescape = |s: &str| {
+        percent_encoding::percent_decode_str(&s.replace('+', " "))
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .map_err(|_| AppError::Unauthorized)
+    };
+    Ok(Some((unescape(id)?, unescape(secret)?)))
 }
 
 async fn exchange_code(state: &AppState, body: TokenRequest) -> AppResult<TokenResponse> {

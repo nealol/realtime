@@ -533,7 +533,50 @@ fn pkce_challenge(verifier: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-async fn oauth_token(app: &Router, owner_sub: &str, verifier: &str) -> (String, String, String) {
+struct OAuthGrant {
+    access: String,
+    refresh: String,
+    vault_id: String,
+    client_id: String,
+    client_secret: Option<String>,
+}
+
+/// Posts a form to `/oauth/token`, optionally with HTTP Basic client credentials.
+async fn token_request(
+    app: &Router,
+    body: String,
+    basic: Option<(&str, &str)>,
+) -> (StatusCode, Value) {
+    use base64::Engine;
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some((id, secret)) = basic {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{id}:{secret}"));
+        req = req.header(header::AUTHORIZATION, format!("Basic {encoded}"));
+    }
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap();
+    let status = res.status();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// Runs registration, authorization, and code exchange. `auth_method` is the
+/// registered `token_endpoint_auth_method`; `None` omits it.
+async fn oauth_token(
+    app: &Router,
+    owner_sub: &str,
+    verifier: &str,
+    auth_method: Option<&str>,
+) -> OAuthGrant {
     let session = login(app, owner_sub).await;
     let (status, vault) = send(
         app,
@@ -557,16 +600,14 @@ async fn oauth_token(app: &Router, owner_sub: &str, verifier: &str) -> (String, 
     assert_eq!(status, StatusCode::OK);
     let resource = cursor["mcpUrl"].as_str().unwrap();
 
-    let (status, client) = send(
-        app,
-        "POST",
-        "/oauth/register",
-        None,
-        Some(json!({"redirect_uris": ["http://client/cb"]})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let client_id = client["client_id"].as_str().unwrap();
+    let mut registration = json!({"redirect_uris": ["http://client/cb"]});
+    if let Some(method) = auth_method {
+        registration["token_endpoint_auth_method"] = json!(method);
+    }
+    let (status, client) = send(app, "POST", "/oauth/register", None, Some(registration)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let client_id = client["client_id"].as_str().unwrap().to_string();
+    let client_secret = client["client_secret"].as_str().map(str::to_string);
 
     let authorize_uri = format!(
         "/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=http%3A%2F%2Fclient%2Fcb&code_challenge={}&code_challenge_method=S256&resource={}&state=s1&mock_sub={owner_sub}&mock_name={owner_sub}",
@@ -624,29 +665,29 @@ async fn oauth_token(app: &Router, owner_sub: &str, verifier: &str) -> (String, 
         .1
         .into_owned();
 
-    let body = format!(
-        "grant_type=authorization_code&code={code}&redirect_uri=http%3A%2F%2Fclient%2Fcb&client_id={client_id}&code_verifier={verifier}"
+    let mut body = format!(
+        "grant_type=authorization_code&code={code}&redirect_uri=http%3A%2F%2Fclient%2Fcb&code_verifier={verifier}"
     );
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/oauth/token")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let tokens: Value = serde_json::from_slice(&bytes).unwrap();
-    (
-        tokens["access_token"].as_str().unwrap().to_string(),
-        tokens["refresh_token"].as_str().unwrap().to_string(),
+    let basic = match (auth_method, client_secret.as_deref()) {
+        (Some("client_secret_basic"), Some(secret)) => Some((client_id.as_str(), secret)),
+        (_, Some(secret)) => {
+            body.push_str(&format!("&client_id={client_id}&client_secret={secret}"));
+            None
+        }
+        (_, None) => {
+            body.push_str(&format!("&client_id={client_id}"));
+            None
+        }
+    };
+    let (status, tokens) = token_request(app, body, basic).await;
+    assert_eq!(status, StatusCode::OK);
+    OAuthGrant {
+        access: tokens["access_token"].as_str().unwrap().to_string(),
+        refresh: tokens["refresh_token"].as_str().unwrap().to_string(),
         vault_id,
-    )
+        client_id,
+        client_secret,
+    }
 }
 
 // ---------- tests ----------
@@ -1038,7 +1079,12 @@ async fn openapi_json_and_swagger_docs_are_served() {
 async fn oauth_authorize_token_refresh_and_rest_access() {
     let app = test_app().await;
     let verifier = "correct-horse-battery-staple";
-    let (access, refresh, vault_id) = oauth_token(&app, "alice", verifier).await;
+    let OAuthGrant {
+        access,
+        refresh,
+        vault_id,
+        ..
+    } = oauth_token(&app, "alice", verifier, None).await;
 
     let (status, note) = send(
         &app,
@@ -1052,19 +1098,95 @@ async fn oauth_authorize_token_refresh_and_rest_access() {
     assert_eq!(note["path"], "oauth.md");
 
     let body = format!("grant_type=refresh_token&refresh_token={refresh}");
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/oauth/token")
-                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-                .body(Body::from(body))
-                .unwrap(),
+    let (status, _) = token_request(&app, body, None).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn oauth_registration_response_matches_rfc7591() {
+    let app = test_app().await;
+
+    let (status, metadata) = send(
+        &app,
+        "GET",
+        "/.well-known/oauth-authorization-server",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        metadata["token_endpoint_auth_methods_supported"],
+        json!(["none", "client_secret_post", "client_secret_basic"])
+    );
+
+    // Public clients must not receive a `client_secret` key, not even null.
+    for request in [
+        json!({"redirect_uris": ["http://client/cb"]}),
+        json!({"redirect_uris": ["http://client/cb"], "token_endpoint_auth_method": "none"}),
+    ] {
+        let (status, client) = send(&app, "POST", "/oauth/register", None, Some(request)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let client = client.as_object().unwrap();
+        assert_eq!(client["token_endpoint_auth_method"], "none");
+        assert!(!client.contains_key("client_secret"));
+        assert!(!client.contains_key("client_secret_expires_at"));
+    }
+
+    for method in ["client_secret_post", "client_secret_basic"] {
+        let (status, client) = send(
+            &app,
+            "POST",
+            "/oauth/register",
+            None,
+            Some(json!({"redirect_uris": ["http://client/cb"], "token_endpoint_auth_method": method})),
         )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(client["token_endpoint_auth_method"], method);
+        assert!(client["client_secret"].is_string());
+        assert_eq!(client["client_secret_expires_at"], 0);
+    }
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/oauth/register",
+        None,
+        Some(json!({"redirect_uris": ["http://client/cb"], "token_endpoint_auth_method": "private_key_jwt"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn oauth_confidential_clients_authenticate_with_post_and_basic() {
+    let app = test_app().await;
+    for method in ["client_secret_post", "client_secret_basic"] {
+        let grant = oauth_token(&app, "alice", "correct-horse-battery-staple", Some(method)).await;
+        let secret = grant.client_secret.as_deref().unwrap();
+        let body = format!("grant_type=refresh_token&refresh_token={}", grant.refresh);
+
+        let (status, _) =
+            token_request(&app, body.clone(), Some((&grant.client_id, "wrong"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{method}: wrong secret");
+
+        // Credentials in both the header and the body are ambiguous.
+        let (status, _) = token_request(
+            &app,
+            format!("{body}&client_secret={secret}"),
+            Some((&grant.client_id, secret)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{method}: two auth methods"
+        );
+
+        let (status, _) = token_request(&app, body, Some((&grant.client_id, secret))).await;
+        assert_eq!(status, StatusCode::OK, "{method}: basic refresh");
+    }
 }
 
 #[tokio::test]
@@ -1099,7 +1221,7 @@ async fn oauth_rejects_bad_pkce_and_is_single_use() {
         Some(json!({"redirect_uris":["http://client/cb"]})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CREATED);
     let client_id = client["client_id"].as_str().unwrap();
     let uri = format!("/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=http%3A%2F%2Fclient%2Fcb&code_challenge={}&code_challenge_method=S256&resource={}&mock_sub=alice", pkce_challenge("good"), url::form_urlencoded::byte_serialize(resource.as_bytes()).collect::<String>());
     let res = app
@@ -1212,7 +1334,7 @@ async fn oauth_wrong_owner_authorize_forbidden() {
         Some(json!({"redirect_uris":["http://client/cb"]})),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(status, StatusCode::CREATED);
     let client_id = client["client_id"].as_str().unwrap();
     let uri = format!("/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri=http%3A%2F%2Fclient%2Fcb&code_challenge={}&code_challenge_method=S256&resource={}&mock_sub=bob", pkce_challenge("good"), url::form_urlencoded::byte_serialize(resource.as_bytes()).collect::<String>());
     let res = app

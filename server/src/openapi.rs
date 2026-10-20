@@ -231,7 +231,7 @@ async fn base_properties() {}
 #[utoipa::path(post, path = "/api/vaults/{id}/base-moves/{path}", tag = "bases", security(("bearerAuth" = [])), params(("id" = String, Path), ("path" = String, Path)), responses((status = 200, description = "Moved Base"), (status = 409, description = "Target path exists")))]
 async fn move_base() {}
 
-#[utoipa::path(post, path = "/oauth/register", tag = "oauth", request_body = Object, responses((status = 200, description = "Dynamic client registration response"), (status = 400, description = "Invalid registration")))]
+#[utoipa::path(post, path = "/oauth/register", tag = "oauth", request_body = Object, responses((status = 201, description = "RFC 7591 dynamic client registration response"), (status = 400, description = "Invalid registration")))]
 async fn oauth_register() {}
 
 #[utoipa::path(get, path = "/oauth/authorize", tag = "oauth", responses((status = 303, description = "Starts login and authorization-code flow"), (status = 400, description = "Invalid OAuth request")))]
