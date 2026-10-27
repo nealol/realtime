@@ -5,6 +5,7 @@ import * as syncProtocol from "y-protocols/sync";
 import * as awarenessProtocol from "y-protocols/awareness";
 import { DocumentEpochPendingError, clientTokenExpired, type ClientToken } from "./clientToken";
 import { handleEpochProposal } from "../documentEpoch";
+import { createAwareness } from "./awareness";
 import { HttpError } from "../httpError";
 
 const MESSAGE_SYNC = 0;
@@ -28,10 +29,11 @@ const MAX_RECONNECT_MS = 5_000;
 /** Probe interval while local changes await the server's durable acknowledgement. */
 const HEARTBEAT_MS = 2_000;
 /**
- * Probe interval for an idle document. Every document in the vault holds a
- * channel, so a 2s probe cost thousands of round trips a second in a large
- * vault while nothing changed; a dead shared socket is caught by the mux's
- * own 5s ping instead.
+ * Probe interval for an idle document on a transport that does not detect a
+ * dead connection itself. Mux channels never probe while idle (see
+ * {@link SyncSocket.livenessMonitored}): every document in the vault holds a
+ * channel, so even a 30s probe cost a steady stream of round trips per second
+ * in a large vault while nothing changed.
  */
 const IDLE_HEARTBEAT_MS = 30_000;
 /**
@@ -80,6 +82,11 @@ export interface SyncSocket {
   onerror: ((event: unknown) => void) | null;
   send(data: Uint8Array | ArrayBuffer): void;
   close(): void;
+  /**
+   * The transport itself detects a dead connection and reports every failed
+   * document as a close, so an idle document needs no probe of its own.
+   */
+  readonly livenessMonitored?: boolean;
 }
 
 export type SyncSocketFactory = (url: string) => SyncSocket;
@@ -209,7 +216,7 @@ export class RealtimeProvider {
     private readonly tokenSource: TokenSource,
     options: RealtimeProviderOptions = {},
   ) {
-    this.awareness = options.awareness ?? new awarenessProtocol.Awareness(document);
+    this.awareness = options.awareness ?? createAwareness(document);
     this.socketFactory = options.socketFactory ?? defaultSocketFactory;
     this.onReadOnlyUpdate = options.onReadOnlyUpdate;
     this.socketParams = options.socketParams ?? {};
@@ -219,7 +226,15 @@ export class RealtimeProvider {
   }
 
   get hasLocalChanges(): boolean {
-    return this.readOnlyDivergence || this.acknowledgedVersion < this.localVersion;
+    return this.readOnlyDivergence || this.awaitingAcknowledgement;
+  }
+
+  /**
+   * Sent local changes the server has not yet confirmed. Unlike
+   * `hasLocalChanges`, excludes read-only divergence: probing never clears it.
+   */
+  private get awaitingAcknowledgement(): boolean {
+    return this.acknowledgedVersion < this.localVersion;
   }
 
   /** Start one idempotent reconnect loop and resolve after connect or cancellation. */
@@ -731,13 +746,17 @@ export class RealtimeProvider {
 
   private resetHeartbeat(): void {
     window.clearTimeout(this.heartbeatTimer ?? undefined);
-    const interval =
-      this.receivedServerSyncStep1 && !this.hasLocalChanges ? IDLE_HEARTBEAT_MS : HEARTBEAT_MS;
-    this.heartbeatTimer = window.setTimeout(() => {
-      this.heartbeatTimer = null;
-      if (this.receivedServerSyncStep1) this.checkSync();
-      else this.sendSyncStep1();
-    }, interval);
+    this.heartbeatTimer = null;
+    const idle = this.receivedServerSyncStep1 && !this.awaitingAcknowledgement;
+    if (idle && this.socket?.livenessMonitored) return;
+    this.heartbeatTimer = window.setTimeout(
+      () => {
+        this.heartbeatTimer = null;
+        if (this.receivedServerSyncStep1) this.checkSync();
+        else this.sendSyncStep1();
+      },
+      idle ? IDLE_HEARTBEAT_MS : HEARTBEAT_MS,
+    );
   }
 
   private clearResponseTimeout(): void {

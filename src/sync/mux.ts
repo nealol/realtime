@@ -617,6 +617,11 @@ export class MuxWebSocket implements SyncSocket {
   onmessage: WsMessageHandler = null;
   onclose: WsHandler = null;
   onerror: WsHandler = null;
+  /**
+   * The shared connection pings the real socket, and the server sends CLOSE
+   * whenever a channel's document session ends.
+   */
+  readonly livenessMonitored = true;
 
   private readonly conn: MuxConnection;
   private readonly channelId: number;

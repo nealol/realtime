@@ -31,6 +31,7 @@ class FakeSocket implements SyncSocket {
   onerror: ((event: unknown) => void) | null = null;
   readonly sent: Uint8Array[] = [];
   closeCount = 0;
+  livenessMonitored = false;
 
   constructor(readonly url: string) {}
 
@@ -68,6 +69,7 @@ interface ProviderFixture {
 
 function fixture(
   tokenSource: () => Promise<ClientToken> = () => Promise.resolve(TOKEN),
+  { livenessMonitored = false } = {},
 ): ProviderFixture {
   const doc = new Y.Doc();
   const sockets: FakeSocket[] = [];
@@ -75,6 +77,7 @@ function fixture(
     connect: false,
     socketFactory: (url) => {
       const socket = new FakeSocket(url);
+      socket.livenessMonitored = livenessMonitored;
       sockets.push(socket);
       return socket;
     },
@@ -490,6 +493,76 @@ describe("RealtimeProvider", () => {
       await vi.advanceTimersByTimeAsync(2_000);
       expect(probes(socket)).toBe(afterEdit + 1);
     } finally {
+      f.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it("never probes an idle document on a transport that monitors liveness", async () => {
+    vi.useFakeTimers();
+    const f = fixture(undefined, { livenessMonitored: true });
+    const probes = (socket: FakeSocket) =>
+      socket.sent.filter((message) => messageType(message) === 102).length;
+    try {
+      void f.provider.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      const socket = f.sockets[0];
+      socket.open();
+      const server = new Y.Doc();
+      socket.deliver(serverStep1(server));
+      socket.deliver(serverStep2(server));
+      server.destroy();
+      await vi.advanceTimersByTimeAsync(0);
+      socket.deliver(syncAcknowledgement(0));
+      const idle = probes(socket);
+
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(probes(socket)).toBe(idle);
+
+      // Unconfirmed edits are still probed until the server acknowledges them.
+      f.doc.getText("contents").insert(0, "pending");
+      const afterEdit = probes(socket);
+      socket.deliver(syncAcknowledgement(0));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(probes(socket)).toBe(afterEdit + 1);
+      socket.deliver(syncAcknowledgement(1));
+      expect(f.provider.hasLocalChanges).toBe(false);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(probes(socket)).toBe(afterEdit + 1);
+      expect(socket.closeCount).toBe(0);
+    } finally {
+      f.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it("expires a silent peer's presence and keeps renewing its own", async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const peer = new Y.Doc();
+    const peerAwareness = new awarenessProtocol.Awareness(peer);
+    try {
+      const socket = await openAndHandshake(f);
+      socket.deliver(syncAcknowledgement(0));
+      f.provider.awareness.setLocalState({ user: "me" });
+      peerAwareness.setLocalState({ user: "peer" });
+      const encoder = encoding.createEncoder();
+      encoding.writeVarUint(encoder, 1);
+      encoding.writeVarUint8Array(
+        encoder,
+        awarenessProtocol.encodeAwarenessUpdate(peerAwareness, [peer.clientID]),
+      );
+      socket.deliver(encoding.toUint8Array(encoder));
+      expect(f.provider.awareness.getStates().has(peer.clientID)).toBe(true);
+      const awarenessSent = () => socket.sent.filter((m) => messageType(m) === 1).length;
+      const before = awarenessSent();
+
+      await vi.advanceTimersByTimeAsync(33_000);
+      expect(f.provider.awareness.getStates().has(peer.clientID)).toBe(false);
+      expect(awarenessSent()).toBeGreaterThan(before);
+    } finally {
+      peerAwareness.destroy();
+      peer.destroy();
       f.destroy();
       vi.useRealTimers();
     }
