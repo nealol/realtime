@@ -10,6 +10,33 @@ export function getPlugin(editor: EditorView): RealtimePlugin | null {
   return app?.plugins?.plugins?.["realtime"] ?? null;
 }
 
+/**
+ * Whether this editor's buffer holds only part of the note its
+ * editorInfoField names. Such an editor must never bind to the note's shared
+ * state: syncing it would replace the whole note with the fragment, or load
+ * the whole note into the fragment's slot. Obsidian creates two kinds:
+ *
+ * - The Live Preview table widget edits each cell in a nested EditorView
+ *   mounted inside a `.table-cell-wrapper`. It shares the host view's owner,
+ *   so it names the note's file. The host editor already carries the cell's
+ *   edits.
+ * - A markdown embed scoped to a heading or block (e.g. a Canvas file node
+ *   linking `note.md#Section`) is the owner, with a non-empty `subpath`. Its
+ *   buffer is that section, and every edit to it, including ones we apply, is
+ *   spliced back into the file around the section, so the note on disk would
+ *   end up nested inside itself.
+ *
+ * Whole-file embeds (`subpath === ""`) hold the entire note and bind normally.
+ * Both signals exist before Obsidian installs plugin extensions, so this is
+ * reliable from a view plugin's constructor.
+ */
+export function isNoteFragmentEditor(editor: EditorView): boolean {
+  if (editor.dom.closest(".table-cell-wrapper") !== null) return true;
+  const info: unknown = editor.state.field(editorInfoField, false);
+  if (!info || typeof info !== "object" || !("subpath" in info)) return false;
+  return typeof info.subpath === "string" && info.subpath.length > 0;
+}
+
 export function requestSaveForEditor(editor: EditorView): void {
   const info = editor.state.field(editorInfoField, false);
   const file = info?.file;

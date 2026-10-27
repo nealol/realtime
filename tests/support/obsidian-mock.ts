@@ -1,3 +1,5 @@
+import { StateField } from "@codemirror/state";
+
 // Minimal stand-in for the `obsidian` module so that src/Document.ts,
 // src/VaultSync.ts and src/sync/clientToken.ts can run under Node/vitest.
 // Only the symbols those files actually import are provided.
@@ -42,6 +44,12 @@ export class ToggleComponent {}
 export const Platform = {
   isMobile: false,
 };
+
+/** Obsidian's per-editor owner field (MarkdownView, embed, …); provide it with `.init`. */
+export const editorInfoField = StateField.define<unknown>({
+  create: () => null,
+  update: (value) => value,
+});
 
 /** Minimal Modal stand-in so modules that subclass it can be imported under Node. */
 export class Modal {

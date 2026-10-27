@@ -18,7 +18,7 @@ import * as Y from "yjs";
 import type { Awareness } from "y-protocols/awareness";
 import type * as YType from "yjs";
 import type { Document } from "../Document";
-import { getDocumentForEditor } from "./context";
+import { getDocumentForEditor, isNoteFragmentEditor } from "./context";
 
 export const yRemoteSelectionsTheme = EditorView.baseTheme({
   ".cm-ySelection": {},
@@ -151,15 +151,18 @@ class YRemoteSelectionsPluginValue implements PluginValue {
   private awareness: Awareness | null = null;
   private listener: ((change: AwarenessChange) => void) | null = null;
   private destroyed = false;
+  /** Edits only part of its note: never binds (see {@link isNoteFragmentEditor}). */
+  private readonly inert: boolean;
 
   constructor(editor: EditorView) {
     this.editor = editor;
     this.decorations = RangeSet.of([]);
+    this.inert = isNoteFragmentEditor(editor);
     this.bind();
   }
 
   private bind(): void {
-    if (this.destroyed || this.doc) return;
+    if (this.destroyed || this.inert || this.doc) return;
     const doc = getDocumentForEditor(this.editor);
     if (!doc) return;
     this.doc = doc;

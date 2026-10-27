@@ -4,7 +4,7 @@
 
 import { EditorView, ViewPlugin, type PluginValue, type ViewUpdate } from "@codemirror/view";
 import type { Document } from "../Document";
-import { getDocumentForEditor } from "./context";
+import { getDocumentForEditor, isNoteFragmentEditor } from "./context";
 import { mountPresenceStack } from "../presence";
 
 class MarkdownPresencePluginValue implements PluginValue {
@@ -12,14 +12,17 @@ class MarkdownPresencePluginValue implements PluginValue {
   private doc: Document | null = null;
   private cleanup: (() => void) | null = null;
   private destroyed = false;
+  /** Edits only part of its note: never mounts (see {@link isNoteFragmentEditor}). */
+  private readonly inert: boolean;
 
   constructor(editor: EditorView) {
     this.editor = editor;
+    this.inert = isNoteFragmentEditor(editor);
     this.bind();
   }
 
   private bind(): void {
-    if (this.destroyed || this.doc) return;
+    if (this.destroyed || this.inert || this.doc) return;
     const doc = getDocumentForEditor(this.editor);
     if (!doc) return;
     this.doc = doc;

@@ -1,20 +1,25 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import * as Y from "yjs";
-import type { EditorView } from "@codemirror/view";
+import type { EditorView, ViewUpdate } from "@codemirror/view";
+import type * as EditorContext from "../../src/editor/context";
 
 const bind = vi.hoisted(() => ({ doc: null as any, requestSave: vi.fn() }));
 
-vi.mock("../../src/editor/context", () => ({
+vi.mock("../../src/editor/context", async (importOriginal) => ({
+  ...(await importOriginal<typeof EditorContext>()),
   ensureDocumentForEditor: () => bind.doc,
   requestSaveForEditor: bind.requestSave,
 }));
 
 import { LiveEditPluginValue } from "../../src/editor/LiveEdit";
 
-function makeEditor(text: string) {
+/** `owner` is the editorInfoField value: Obsidian's MarkdownView, embed, … */
+function makeEditor(text: string, owner: object | null = null) {
   return {
+    dom: document.createElement("div"),
     state: {
       doc: { toString: () => text },
+      field: () => owner,
     },
     setText(next: string) {
       text = next;
@@ -203,6 +208,85 @@ describe("LiveEdit", () => {
     newYdoc.destroy();
   });
 
+  describe("editors that hold only part of the note", () => {
+    const note = "# Note\n\n## Table\n| a | b |\n| - | - |\n| 1 | 2 |\n";
+
+    function bindSyncedNote() {
+      const ydoc = new Y.Doc();
+      const ytext = ydoc.getText("contents");
+      ytext.insert(0, note);
+      bind.doc = {
+        path: "note.md",
+        ytext,
+        isCreator: false,
+        hasSyncedOnce: true,
+        isProviderOnline: true,
+        bindEditor: vi.fn(),
+        unbindEditor: vi.fn(),
+        whenReady: () => Promise.resolve(),
+        isReady: () => true,
+        isDestroyed: () => false,
+        onDestroy: () => () => {},
+      };
+      return { ydoc, ytext };
+    }
+
+    it.each([
+      {
+        name: "a Live Preview table cell",
+        // Mounted inside the cell's `.table-cell-wrapper`; owned by the host view.
+        makeFragmentEditor: () => {
+          const editor = makeEditor("1", { file: { path: "note.md" } });
+          const wrapper = document.createElement("div");
+          wrapper.className = "table-cell-wrapper";
+          wrapper.appendChild(editor.dom);
+          return { editor, typed: "12" };
+        },
+      },
+      {
+        name: "a section embed such as a Canvas file node for note.md#Table",
+        makeFragmentEditor: () => ({
+          editor: makeEditor("| a | b |\n| - | - |\n| 1 | 2 |\n", { subpath: "#Table" }),
+          typed: "| a | b |\n| - | - |\n| 1 | 2 |\n| 3 | 4 |\n",
+        }),
+      },
+    ])("never syncs $name with the note's shared text", async ({ makeFragmentEditor }) => {
+      const { ydoc, ytext } = bindSyncedNote();
+      const { editor, typed } = makeFragmentEditor();
+      // Stand-in: LiveEdit only reads `dom`, `state` and calls `dispatch`.
+      const live = new LiveEditPluginValue(editor as unknown as EditorView);
+      await Promise.resolve();
+
+      editor.setText(typed);
+      live.update({ docChanged: true, state: editor.state } as unknown as ViewUpdate);
+      ydoc.transact(() => ytext.insert(0, "remote "));
+
+      expect(bind.doc.bindEditor).not.toHaveBeenCalled();
+      expect(ytext.toString()).toBe(`remote ${note}`);
+      expect(editor.state.doc.toString()).toBe(typed);
+
+      live.destroy();
+      ydoc.destroy();
+    });
+
+    it("still syncs a whole-file embed, which holds the entire note", async () => {
+      const { ydoc, ytext } = bindSyncedNote();
+      const editor = makeEditor(note, { subpath: "" });
+      const live = new LiveEditPluginValue(editor as unknown as EditorView);
+      await Promise.resolve();
+
+      editor.setText(`${note}more\n`);
+      live.update({ docChanged: true, state: editor.state } as unknown as ViewUpdate);
+      ydoc.transact(() => ytext.insert(0, "remote "));
+
+      expect(ytext.toString()).toBe(`remote ${note}more\n`);
+      expect(editor.state.doc.toString()).toBe(`remote ${note}more\n`);
+
+      live.destroy();
+      ydoc.destroy();
+    });
+  });
+
   it("requests a save after applying a remote Y.Text change", async () => {
     const ydoc = new Y.Doc();
     const ytext = ydoc.getText("contents");
@@ -286,7 +370,7 @@ describe("LiveEdit", () => {
     };
     bind.doc = doc;
     const editor = makeEditor("hello\n");
-    // LiveEdit reads `state.doc` and calls `dispatch`, which the stand-in provides.
+    // LiveEdit reads `dom`, `state.doc` and calls `dispatch`, which the stand-in provides.
     const live = new LiveEditPluginValue(editor as unknown as EditorView);
 
     // The first sync delivers another device's "select all, delete".

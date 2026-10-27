@@ -5,7 +5,7 @@ import type { ChangeSpec } from "@codemirror/state";
 import { EditorView, ViewPlugin, type PluginValue, type ViewUpdate } from "@codemirror/view";
 import type * as Y from "yjs";
 import type { Document } from "../Document";
-import { ensureDocumentForEditor, requestSaveForEditor } from "./context";
+import { ensureDocumentForEditor, isNoteFragmentEditor, requestSaveForEditor } from "./context";
 import { ySyncAnnotation } from "./annotations";
 import { applyTextToYText } from "../diff";
 import { mergeText } from "../textMerge";
@@ -42,6 +42,8 @@ export class LiveEditPluginValue implements PluginValue {
   private observer: (() => void) | null = null;
   private unsubscribeDestroy: (() => void) | null = null;
   private destroyed = false;
+  /** Edits only part of its note: never binds (see {@link isNoteFragmentEditor}). */
+  private readonly inert: boolean;
   private editorTextAtBind: string | null = null;
   /**
    * Editor text before the first change made while no document was bound
@@ -51,12 +53,13 @@ export class LiveEditPluginValue implements PluginValue {
 
   constructor(editor: EditorView) {
     this.editor = editor;
+    this.inert = isNoteFragmentEditor(editor);
     this.tryBind();
   }
 
   /** Attempt to find this file's Document and attach. Retries until sync is ready. */
   private tryBind(): void {
-    if (this.destroyed || this.doc) return;
+    if (this.destroyed || this.inert || this.doc) return;
     const doc = ensureDocumentForEditor(this.editor);
     if (!doc || doc.isDestroyed()) {
       window.setTimeout(() => this.tryBind(), 500);
@@ -219,7 +222,7 @@ export class LiveEditPluginValue implements PluginValue {
 
   /** Push local editor edits into the shared Y.Text. */
   update(update: ViewUpdate): void {
-    if (this.destroyed) return;
+    if (this.destroyed || this.inert) return;
     if (!this.doc || this.doc.isDestroyed()) {
       if (update.docChanged) this.unpushedBaseline ??= update.startState?.doc.toString() ?? null;
       if (this.doc) this.detachDoc();
