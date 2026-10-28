@@ -170,6 +170,12 @@ export class BinarySync {
   private ignoredPaths = new Set<string>();
   /** Startup pulls should restore missing files from the moved/persisted index. */
   private pullingMissingRemote = false;
+  /**
+   * Paths whose file moved to a text/Canvas/Base path whose new document has
+   * not been published yet. Their entry stays (peers keep the content) but
+   * is neither restored nor deleted until the move is published.
+   */
+  private movingAway = new Set<string>();
 
   /** Background upload queue (latest job per path wins). */
   private uploadQueue: UploadJob[] = [];
@@ -357,6 +363,41 @@ export class BinarySync {
     });
   }
 
+  /**
+   * The file at `path` moved to a path another document type owns (a text
+   * note, Canvas or Base) that is not published yet. Until it is, the entry
+   * keeps the content reachable for peers and for this device after a
+   * restart, so it is neither restored to disk nor published as deleted.
+   */
+  holdMovedPath(path: string): void {
+    if (this.destroyed) return;
+    this.movingAway.add(path);
+    this.deferredInitialPulls.delete(path);
+    this.liveDeletes.delete(path);
+  }
+
+  /**
+   * The document that `path`'s file moved to is published: drop the entry,
+   * which that document now replaces. A rename is no deletion, so nothing
+   * goes to the trash. If the path is in use again locally, or a peer
+   * replaced the entry meanwhile, reconcile instead so neither is lost.
+   */
+  releaseMovedPath(path: string): void {
+    if (this.destroyed || !this.movingAway.delete(path)) return;
+    const remoteHash = this.binaries.get(path)?.hash ?? null;
+    const base = this.lastSyncedHash.get(path) ?? null;
+    if (getFileByPath(this.plugin.app, path) || (remoteHash !== null && remoteHash !== base)) {
+      void this.reconcile(path);
+      return;
+    }
+    this.indexDoc.transact(() => {
+      this.binaries.delete(path);
+    });
+    this.lastSyncedHash.delete(path);
+    this.pendingDownloads.delete(path);
+    this.localSyncState?.remove(path);
+  }
+
   // --- live triggers ---------------------------------------------------------
 
   /** A local binary file was created or modified. */
@@ -365,6 +406,7 @@ export class BinarySync {
     if (this.ignoredPaths.has(path)) return;
     if (this.writing.has(path)) return;
     this.bumpDiskVersion(path);
+    this.movingAway.delete(path);
     void this.reconcile(path);
   }
 
@@ -375,6 +417,7 @@ export class BinarySync {
     if (this.writing.has(path)) return;
     this.bumpDiskVersion(path);
     this.liveDeletes.add(path);
+    this.movingAway.delete(path);
     this.deferredInitialPulls.delete(path);
     void this.reconcile(path);
   }
@@ -384,14 +427,27 @@ export class BinarySync {
     return this.writing.has(path);
   }
 
-  /** A local binary file was renamed: treat as a delete of old + change of new. */
+  /**
+   * A local binary file was renamed: a delete of the old path plus a change
+   * of the new one. The move is proof the old path was removed here, exactly
+   * like a live delete, so the startup "missing means not pulled yet" rule
+   * must not restore it (it would if the rename landed while the startup
+   * pass was still pulling other files).
+   */
   onLocalRenamed(file: TFile, oldPath: string): void {
-    if (!this.shouldTrack(oldPath) && !this.shouldTrack(file.path)) return;
-    if (this.ignoredPaths.has(oldPath) || this.ignoredPaths.has(file.path)) return;
-    this.bumpDiskVersion(oldPath);
-    this.bumpDiskVersion(file.path);
-    void this.reconcile(oldPath);
-    void this.reconcile(file.path);
+    const trackOld = this.shouldTrack(oldPath) && !this.ignoredPaths.has(oldPath);
+    const trackNew = this.shouldTrack(file.path) && !this.ignoredPaths.has(file.path);
+    if (trackOld) {
+      this.bumpDiskVersion(oldPath);
+      this.liveDeletes.add(oldPath);
+      this.movingAway.delete(oldPath);
+      this.deferredInitialPulls.delete(oldPath);
+      void this.reconcile(oldPath);
+    }
+    if (trackNew) {
+      this.bumpDiskVersion(file.path);
+      void this.reconcile(file.path);
+    }
   }
 
   private onBinariesChanged(event: Y.YMapEvent<BinaryMeta>): void {
@@ -433,6 +489,8 @@ export class BinarySync {
     if (this.destroyed) return;
     if (!this.shouldTrack(path)) return;
     if (this.ignoredPaths.has(path)) return;
+    // Released (and reconciled if still needed) once the move is published.
+    if (this.movingAway.has(path)) return;
     const liveDelete = this.liveDeletes.delete(path);
     const initialPull =
       !liveDelete && (this.pullingMissingRemote || this.deferredInitialPulls.delete(path));
@@ -1088,6 +1146,7 @@ export class BinarySync {
     this.deferredReconciles.clear();
     this.deferredInitialPulls.clear();
     this.pendingDownloads.clear();
+    this.movingAway.clear();
     this.urgentPaths.clear();
     this.refreshUploadStatus();
   }

@@ -6,7 +6,13 @@ Realtime keeps the standard JSON Canvas file shape on disk. Each Canvas gets its
 
 `CanvasBinding` keeps a normalized shadow of the state last shown in the bound Obsidian view. A save or interaction sample compares the current view with that shadow and sends only changed fields through `CanvasDocument.applyCanvasOperations()`. The operation batch runs in one Yjs transaction. A node move therefore changes `x` and `y` without replaying stale text or style fields.
 
-Pointer interactions sample at a fixed interval and publish once more on release. Remote document events coalesce, and snapshot imports wait until a local drag ends. The final save path remains patched as a correctness fallback.
+Pointer interactions sample every 75 ms and publish once more on release, cancellation, blur, hiding, or teardown. Save requests during the gesture share that sampler instead of triggering a full capture per frame. A wrapped `onUnloadFile` flushes pending geometry before Obsidian saves and reuses the view; without that hook, saves retain immediate capture. Non-gesture edits remain immediate. Each capture normalizes once and computes a bounce-back fingerprint only when an imported snapshot needs comparison. Remote document events coalesce, and snapshot imports wait until the final local capture.
+
+Before the first server sync, bindings do not fold view snapshots into the stored CRDT or import its possibly empty value. Once a view has been observed showing this file's startup disk content, its newer unsaved content participates in the startup merge alongside saved disk edits. A reused view that has not shown this file's content is not trusted.
+
+Disk reconciliation carries the known merge base into the tombstone-aware reconciler. Removing a node or edge from that base deletes it even if another client, or this device before a restart, created it. Items added concurrently outside the base remain intact.
+
+Server acknowledgements coalesce fingerprint recording into fixed 250 ms windows; startup recording remains immediate. A content revision guards the asynchronous hash, so recording does not need a second full-tree reconstruction and serialization. A changed revision is retried rather than publishing a stale fingerprint.
 
 ## Remote edits and private APIs
 

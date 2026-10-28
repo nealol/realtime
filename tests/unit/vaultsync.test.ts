@@ -5,7 +5,9 @@ import { join } from "path";
 import * as Y from "yjs";
 import { Platform, TFile } from "obsidian";
 import { RealtimeProvider } from "../../src/sync/RealtimeProvider";
-import { VaultSync, shouldSyncCanvasBinaryPath } from "../../src/VaultSync";
+import { VaultSync, isConflictCopy, shouldSyncCanvasBinaryPath } from "../../src/VaultSync";
+import { storedContentFingerprint } from "../../src/SyncedDoc";
+import type RealtimePlugin from "../../src/main";
 import { getClientToken } from "../../src/sync/clientToken";
 import { sha256Hex, sha256Text } from "../../src/hash";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
@@ -837,6 +839,87 @@ describe("VaultSync index", () => {
       expect([...new Uint8Array(local.vault.binaries.get("old.bin")!)]).toEqual([
         4, 8, 15, 16, 23, 42,
       ]);
+    } finally {
+      sync.destroy();
+    }
+  });
+
+  it("cuts a binary renamed to a note or Canvas over without resurrecting it on restart", async () => {
+    const vault = await harness.createVault(aliceToken, "binary-to-document-rename");
+    const local = makeFakePlugin(harness.authUrl, {
+      sessionToken: aliceToken,
+      activeVaultId: vault.id,
+    });
+    // Private state the assertions read; VaultSync exposes no accessor for it.
+    type Internals = {
+      initialSynced: boolean;
+      files: Y.Map<string>;
+      structured: Y.Map<{ guid: string; kind: string }>;
+      binarySync: {
+        hasPath(path: string): boolean;
+        started: boolean;
+        pullingMissingRemote: boolean;
+      };
+    };
+    // FakeVault keeps emit private; Obsidian fires "rename" itself after moving a file.
+    const vaultEvents = local.vault as unknown as { emit(name: string, ...args: unknown[]): void };
+    const text = "plain text that started life as an attachment\n";
+    const canvas = JSON.stringify({ nodes: [], edges: [] });
+    local.vault.binaries.set("note.txt", new TextEncoder().encode(text).buffer as ArrayBuffer);
+    local.vault.binaries.set("board.dat", new TextEncoder().encode(canvas).buffer as ArrayBuffer);
+    const start = () => {
+      const sync = new VaultSync(local.plugin as unknown as RealtimePlugin);
+      Object.assign(local.plugin, { vaultSync: sync });
+      return { sync, internals: sync as unknown as Internals };
+    };
+    let { sync, internals } = start();
+    try {
+      await waitFor(
+        () =>
+          internals.binarySync.hasPath("note.txt") &&
+          internals.binarySync.hasPath("board.dat") &&
+          local.vault.binaries.has("note.txt"),
+        { timeout: 20_000, label: "binaries published" },
+      );
+
+      local.vault.binaries.delete("note.txt");
+      local.vault.files.set("note.md", text);
+      vaultEvents.emit("rename", new TFile("note.md"), "note.txt");
+      local.vault.binaries.delete("board.dat");
+      local.vault.files.set("board.canvas", canvas);
+      vaultEvents.emit("rename", new TFile("board.canvas"), "board.dat");
+
+      await waitFor(
+        () =>
+          internals.files.has("note.md") &&
+          internals.structured.has("board.canvas") &&
+          !internals.binarySync.hasPath("note.txt") &&
+          !internals.binarySync.hasPath("board.dat"),
+        { timeout: 20_000, label: "renames published" },
+      );
+      await waitFor(async () => (await listNotes(vault.id)).some((n) => n.path === "note.md"), {
+        timeout: 20_000,
+        label: "note readable on the server",
+      });
+      expect((await readNote(vault.id, "note.md")).content).toBe(text);
+      sync.destroy();
+
+      ({ sync, internals } = start());
+      await waitFor(() => internals.initialSynced, { timeout: 20_000, label: "restarted" });
+      // The startup binary pass used to restore the old paths.
+      await waitFor(
+        () => internals.binarySync.started && !internals.binarySync.pullingMissingRemote,
+        { timeout: 20_000, label: "startup binary pass finished" },
+      );
+      expect(local.vault.binaries.has("note.txt")).toBe(false);
+      expect(local.vault.binaries.has("board.dat")).toBe(false);
+      expect(internals.binarySync.hasPath("note.txt")).toBe(false);
+      expect(internals.binarySync.hasPath("board.dat")).toBe(false);
+      expect(local.vault.files.get("note.md")).toBe(text);
+      expect(JSON.parse(local.vault.files.get("board.canvas") ?? "null")).toEqual({
+        nodes: [],
+        edges: [],
+      });
     } finally {
       sync.destroy();
     }
@@ -2415,6 +2498,63 @@ describe("VaultSync index", () => {
       edges: [{ id: "edge-1", fromNode: "node-1", toNode: "node-1" }],
     });
     expect(local.vault.files.has(path)).toBe(false);
+    index.destroy();
+  });
+
+  it("preserves offline disk edits behind a resident baseline, including one landing meanwhile", async () => {
+    const local = makeFakePlugin("http://unused.invalid", {
+      sessionToken: "",
+      activeVaultId: "vault",
+    });
+    const path = "offline.md";
+    const baseline = "acknowledged baseline";
+    // The document loaded its store but has not run its startup reconcile:
+    // its CRDT still holds the acknowledged baseline, the file the offline edit.
+    local.vault.files.set(path, "offline edit");
+    const create = local.vault.create.bind(local.vault);
+    let copiesWritten = 0;
+    local.vault.create = async (target: string, text: string) => {
+      const created = await create(target, text);
+      // The user saves again while the first recovery copy is being written.
+      if (++copiesWritten === 1) local.vault.files.set(path, "edit saved meanwhile");
+      return created;
+    };
+    const acknowledged = await sha256Text(baseline);
+    const storedBaseline = await storedContentFingerprint(0, baseline);
+    const index = new Y.Doc();
+    // reconcileRemoteDelete is private; this drives it over a minimal instance.
+    const sync = Object.create(VaultSync.prototype) as {
+      reconcileRemoteDelete(path: string, kind: "text", identity: string): Promise<void>;
+    };
+    Object.assign(sync, {
+      destroyed: false,
+      plugin: local.plugin,
+      files: index.getMap("files"),
+      structured: index.getMap("structured"),
+      documents: new Map([
+        [path, { content: baseline, guid: "guid", epoch: 0, provider: { hasLocalChanges: false } }],
+      ]),
+      structuredDocuments: new Map(),
+      remoteDeletePreserved: new Set(),
+      remoteDeletesApplying: new Set(),
+      localSyncState: {
+        acknowledgedFingerprint: () => acknowledged,
+        diskFingerprint: () => storedBaseline,
+        remove: () => {},
+      },
+      removeDocument: () => {},
+      removeStructuredDocument: () => {},
+    });
+
+    await sync.reconcileRemoteDelete(path, "text", "guid");
+
+    expect(local.vault.files.has(path)).toBe(false);
+    const preserved = [...local.vault.files]
+      .filter(([candidate]) => isConflictCopy(candidate))
+      .map(([, content]) => content)
+      .sort();
+    // Every unacknowledged version survives; the acknowledged baseline is not copied.
+    expect(preserved).toEqual(["edit saved meanwhile", "offline edit"]);
     index.destroy();
   });
 

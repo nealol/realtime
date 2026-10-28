@@ -99,10 +99,28 @@ export class CanvasDocument extends StructuredDocument {
   // last-writer-wins map reconcile, so a stale full snapshot from a device
   // that hasn't applied a remote delete can't resurrect a tombstoned
   // node/edge. The local clientID is passed so same-device re-add (undo)
-  // clears the tombstone while cross-device stale snapshots are blocked.
-  protected applyValue(value: JsonValue, origin: unknown = DISK_ORIGIN): void {
+  // clears the tombstone while cross-device stale snapshots are blocked, and
+  // the merge base so items the value dropped from it are deleted even when
+  // another client (or this device before a restart) created them.
+  protected applyValue(
+    value: JsonValue,
+    origin: unknown = DISK_ORIGIN,
+    base: JsonValue | null = null,
+  ): void {
     const incoming = isStructuredCanvas(value) ? value : (EMPTY_CANVAS as StructuredCanvas);
-    this.ydoc.transact(() => reconcileCanvas(this.root, incoming, this.ydoc.clientID), origin);
+    const known = base === null ? undefined : parseCanvas(serializeCanvas(base));
+    this.ydoc.transact(
+      () => reconcileCanvas(this.root, incoming, this.ydoc.clientID, known),
+      origin,
+    );
+  }
+
+  protected liveStartupValue(): JsonValue | null {
+    return this.binding.startupLiveValue();
+  }
+
+  protected startupDiskChanged(): void {
+    this.binding.checkStartupViews();
   }
 
   protected onRootChanged(origin?: unknown): void {

@@ -189,7 +189,7 @@ export class LocalSyncState {
     const current = this.get(path);
     const candidate =
       current?.candidate === true && !reconciled && current.candidateFingerprint !== fingerprint;
-    this.paths.set(path, {
+    const next: LocalPathState = {
       kind,
       identity,
       fingerprint,
@@ -199,7 +199,18 @@ export class LocalSyncState {
         : {}),
       ...carriedDiskFingerprint(current, identity),
       ...carriedPublishedFrom(current, identity),
-    });
+    };
+    // Unchanged reconciles run on every poll; an identical write would still
+    // emit a Yjs update and an IndexedDB write.
+    if (
+      current &&
+      (Object.keys(current) as Array<keyof LocalPathState>).every(
+        (key) => current[key] === next[key],
+      ) &&
+      (Object.keys(next) as Array<keyof LocalPathState>).every((key) => current[key] === next[key])
+    )
+      return;
+    this.paths.set(path, next);
   }
 
   /**

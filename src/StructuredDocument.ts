@@ -5,6 +5,7 @@ import { SyncedDoc, type DocumentBootstrapOptions } from "./SyncedDoc";
 import { ensureParentFolder, getFileByPath, isOpenInWorkspace } from "./vaultHelpers";
 import {
   jsonContains,
+  jsonEqual,
   mergeStructuredStartupResult,
   reconcileInto,
   toValue,
@@ -32,8 +33,6 @@ export abstract class StructuredDocument extends SyncedDoc {
   private writeQueued: Promise<boolean> | null = null;
   private writeTimer: number | null = null;
   private startupReconciled = false;
-  /** True only after startup content is durably present on this device. */
-  private startupReady = false;
   private startupReconciling = false;
   private forceBootstrapConflict: boolean;
   private readonly staleLocalFingerprint: string | null;
@@ -42,6 +41,13 @@ export abstract class StructuredDocument extends SyncedDoc {
   private baselineTextAtStartup = "";
   private diskAtStartup: JsonValue | null = null;
   private localChangedAtStartup = false;
+  /**
+   * What the startup local content's edits are measured from: the stored
+   * baseline, or — while the file holds no local edit (it lags the document,
+   * or is an untouched stale copy) — that file content, so a later edit to it
+   * is not read as reverting what the file never had.
+   */
+  private startupLocalBase: JsonValue = {};
   /** True when the on-disk file exists but could not be parsed. */
   private diskParseFailed = false;
   /** Serialized remote version already preserved by the startup reconcile. */
@@ -60,7 +66,10 @@ export abstract class StructuredDocument extends SyncedDoc {
     this.staleLocalFingerprint = opts.staleLocalFingerprint ?? null;
     this.retiredBaselineText = opts.retiredBaseline ?? null;
     this.root = this.ydoc.getMap("root");
-    this.rootObserver = (_events, txn) => this.onRootChanged(txn?.origin);
+    this.rootObserver = (_events, txn) => {
+      this.noteContentChanged();
+      this.onRootChanged(txn?.origin);
+    };
     this.root.observeDeep(this.rootObserver);
   }
 
@@ -117,9 +126,52 @@ export abstract class StructuredDocument extends SyncedDoc {
     this.diskKnownText = diskText;
     // An untouched copy of a file deleted remotely (and since re-created at
     // this path) is not a local change: let the new document replace it.
-    if (stale) this.forceBootstrapConflict = false;
     this.localChangedAtStartup =
       diskText !== null && !stale && !unchangedSinceSync && diskText !== this.baselineTextAtStartup;
+    this.startupLocalBase =
+      disk === null || this.localChangedAtStartup ? this.baselineAtStartup : disk;
+    this.startupDiskChanged();
+  }
+
+  /**
+   * Content of an open view of this file holding edits not yet saved to disk,
+   * taken as the local side of the startup merge. Bindings return it only for
+   * a view seen displaying this file's disk content (see
+   * {@link matchesStartupDisk}), never leftovers of a view reused for another.
+   */
+  protected liveStartupValue(): JsonValue | null {
+    return null;
+  }
+
+  /** The disk content startup will merge changed; bindings may now recognize their view. */
+  protected startupDiskChanged(): void {}
+
+  /**
+   * Whether `value` is this file's disk content as the startup reconcile will
+   * merge it. A live view showing it displays this file, so its later edits
+   * are this file's edits.
+   */
+  matchesStartupDisk(value: JsonValue): boolean {
+    return (
+      !this.startupReconciled && this.diskAtStartup !== null && jsonEqual(value, this.diskAtStartup)
+    );
+  }
+
+  /**
+   * The local side of the startup merge: the file, or an open view's newer
+   * unsaved content. `base` is what its edits are measured from, and
+   * `changed` whether it holds any.
+   */
+  private startupLocal(): { value: JsonValue | null; base: JsonValue; changed: boolean } {
+    const disk = this.diskAtStartup;
+    const live = disk === null ? null : this.liveStartupValue();
+    if (disk === null || live === null || jsonEqual(live, disk)) {
+      return { value: disk, base: this.startupLocalBase, changed: this.localChangedAtStartup };
+    }
+    // The view was seen showing the file and edited since: its edits extend
+    // the file's own local edits, or stand alone when the file holds none.
+    const base = this.localChangedAtStartup ? this.startupLocalBase : disk;
+    return { value: live, base, changed: this.serialize(live) !== this.serialize(base) };
   }
 
   protected async finishStartupReconcile(): Promise<void> {
@@ -130,8 +182,9 @@ export abstract class StructuredDocument extends SyncedDoc {
       if (!this.startupReconciled) {
         const remote = this.value;
         const disk = this.diskAtStartup;
-        if (disk !== null && (this.localChangedAtStartup || this.forceBootstrapConflict)) {
-          let merge = this.startupMerge(disk, remote);
+        const local = this.startupLocal();
+        if (local.value !== null && (local.changed || this.forceBootstrapConflict)) {
+          let merge = this.startupMerge(local.value, remote, local.base);
           if (merge.conflicted) {
             // One recovery copy per remote version: a remote that keeps
             // changing while this retries must not leave a trail of copies.
@@ -150,18 +203,28 @@ export abstract class StructuredDocument extends SyncedDoc {
             }
             const latestDisk = await this.readParsedFromDisk();
             if (this.destroyed) return;
-            if (latestDisk === null || this.serialize(latestDisk) !== this.serialize(disk)) {
+            if (
+              latestDisk === null ||
+              disk === null ||
+              this.serialize(latestDisk) !== this.serialize(disk)
+            ) {
               this.diskAtStartup = latestDisk;
               return;
             }
+            // The open view was edited while the copy was written: retry
+            // with its newer content rather than import the older one.
+            const latestLocal = this.startupLocal().value;
+            if (latestLocal === null || !jsonEqual(latestLocal, local.value)) return;
             // The remote may have moved on while the copy was written. Merge
             // against it now, with no await before applying, rather than
             // applying a merge that would revert those changes.
             const current = this.value;
-            if (this.serialize(current) !== remoteText) merge = this.startupMerge(disk, current);
+            if (this.serialize(current) !== remoteText) {
+              merge = this.startupMerge(local.value, current, local.base);
+            }
           }
           if (this.destroyed) return;
-          this.applyValue(merge.value, DISK_ORIGIN);
+          this.applyValue(merge.value, DISK_ORIGIN, local.base);
         }
         this.startupReconciled = true;
       }
@@ -179,7 +242,7 @@ export abstract class StructuredDocument extends SyncedDoc {
       if (!materialized || this.destroyed) return;
 
       this.startupReady = true;
-      if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
+      await this.recordAcknowledgedContent();
       completed = true;
     } catch (e) {
       console.error(`[Realtime] structured startup reconcile failed for ${this.path}`, e);
@@ -193,16 +256,17 @@ export abstract class StructuredDocument extends SyncedDoc {
     }
   }
 
-  /** The startup merge of local `disk` with `remote`, and whether they conflict. */
+  /** The startup merge of local `disk` (edited from `base`) with `remote`, and whether they conflict. */
   private startupMerge(
     disk: JsonValue,
     remote: JsonValue,
+    base: JsonValue,
   ): { value: JsonValue; conflicted: boolean } {
     return (
       this.mergeWithoutSharedBaseline(disk, remote) ??
       (this.forceBootstrapConflict
         ? { value: disk, conflicted: this.serialize(disk) !== this.serialize(remote) }
-        : mergeStructuredStartupResult(this.baselineAtStartup, disk, remote))
+        : mergeStructuredStartupResult(base, disk, remote))
     );
   }
 
@@ -233,31 +297,6 @@ export abstract class StructuredDocument extends SyncedDoc {
     return null;
   }
 
-  protected async afterChangesSynced(): Promise<void> {
-    if (!this.startupReady || this.destroyed) return;
-    await this.recordAcknowledgedContent(true);
-  }
-
-  private async recordAcknowledgedContent(reconciled = false): Promise<void> {
-    const content = this.serialize(this.value);
-    const fingerprint = await sha256Text(content);
-    if (
-      this.destroyed ||
-      this.provider.hasLocalChanges ||
-      this.serialize(this.value) !== content ||
-      !this.startupReady
-    ) {
-      return;
-    }
-    this.plugin.vaultSync?.noteContentAcknowledged(
-      this.path,
-      this.path.endsWith(".canvas") ? "canvas" : "base",
-      this.guid,
-      fingerprint,
-      reconciled,
-    );
-  }
-
   /**
    * Called by VaultSync when the file changed on disk. Our own writes (and
    * late events for older ones) are recognised by content, not timing; any
@@ -270,6 +309,21 @@ export abstract class StructuredDocument extends SyncedDoc {
     if (disk === null) return;
     if (this.destroyed) return;
     const serialized = this.serialize(disk);
+    if (!this.startupReconciled) {
+      // The startup reconcile has not merged the file yet, and the document
+      // still holds only its stored baseline. A later edit — including a save
+      // by an open, bound view, whose edits the binding does not fold before
+      // startup — replaces what the reconcile will merge instead of being
+      // folded against a stale base.
+      if (!this.localChangedAtStartup && this.diskAtStartup !== null) {
+        this.startupLocalBase = this.diskAtStartup;
+      }
+      this.diskAtStartup = disk;
+      this.diskKnownText = serialized;
+      this.localChangedAtStartup = serialized !== this.serialize(this.startupLocalBase);
+      this.startupDiskChanged();
+      return;
+    }
     if (this.suppressedWhileOpen()) {
       // The live view owns the file while bound, and the binding keeps it in
       // step with the document: its saves are not edits to fold.
@@ -278,15 +332,6 @@ export abstract class StructuredDocument extends SyncedDoc {
       return;
     }
     if (serialized === this.writingTextToDisk) return;
-    if (!this.startupReconciled) {
-      // The startup reconcile has not merged the file yet, and the document
-      // still holds only its stored baseline. A later edit replaces what the
-      // reconcile will merge instead of being folded against a stale base.
-      this.diskAtStartup = disk;
-      this.diskKnownText = serialized;
-      this.localChangedAtStartup = serialized !== this.baselineTextAtStartup;
-      return;
-    }
     if (serialized === this.diskKnownText) return;
     if (serialized === this.serialize(this.value)) {
       this.noteDiskContent(serialized);
@@ -330,7 +375,7 @@ export abstract class StructuredDocument extends SyncedDoc {
         );
         continue;
       }
-      this.applyValue(merge ? merge.value : disk, DISK_ORIGIN);
+      this.applyValue(merge ? merge.value : disk, DISK_ORIGIN, merge ? base : null);
       this.noteDiskContent(diskText);
       return;
     }
@@ -343,11 +388,21 @@ export abstract class StructuredDocument extends SyncedDoc {
     void this.recordStoredDiskContent(this.materializedKind(), text);
   }
 
-  private materializedKind(): "canvas" | "base" {
+  protected materializedKind(): "canvas" | "base" {
     return this.path.endsWith(".canvas") ? "canvas" : "base";
   }
 
-  protected applyValue(value: JsonValue, origin: unknown = DISK_ORIGIN): void {
+  /**
+   * Fold `value` into the document. `base` is the content `value` was merged
+   * from, when known: what it lacks of `base` it deleted deliberately, while
+   * anything absent from both was added concurrently. Plain map reconcile
+   * replaces the whole value and needs no base; Canvas uses it.
+   */
+  protected applyValue(
+    value: JsonValue,
+    origin: unknown = DISK_ORIGIN,
+    _base: JsonValue | null = null,
+  ): void {
     if (this.destroyed) return;
     this.ydoc.transact(() => reconcileInto(this.root, value), origin);
   }
@@ -446,9 +501,7 @@ export abstract class StructuredDocument extends SyncedDoc {
         if (raw === text) {
           this.noteDiskContent(text);
           this.plugin.vaultSync?.noteMaterialized(this.path, this.materializedKind(), this.guid);
-          if (this.startupReady && !this.provider.hasLocalChanges) {
-            await this.recordAcknowledgedContent(true);
-          }
+          await this.recordAcknowledgedContent();
           return true;
         }
         if (this.suppressedWhileOpen()) {
@@ -494,9 +547,7 @@ export abstract class StructuredDocument extends SyncedDoc {
       if (this.destroyed) return false;
       this.noteDiskContent(text);
       this.plugin.vaultSync?.noteMaterialized(this.path, this.materializedKind(), this.guid);
-      if (this.startupReady && !this.provider.hasLocalChanges) {
-        await this.recordAcknowledgedContent(true);
-      }
+      await this.recordAcknowledgedContent();
       return true;
     } catch (e) {
       console.error(`[Realtime] structured writeToDisk failed for ${this.path}`, e);

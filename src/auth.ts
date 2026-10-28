@@ -28,6 +28,20 @@ export interface KnownSession extends MeResponse {
   tokenKey: string;
 }
 
+/**
+ * A token validated by SSO against `serverUrl`, not yet active. Produced by
+ * {@link AuthClient.authenticateAt}; becomes active via
+ * {@link AuthClient.commitSession} only while its attempt is still current.
+ */
+export interface AuthenticatedSession {
+  serverUrl: string;
+  serverId: string;
+  token: string;
+  me: MeResponse;
+  /** SSO attempt that produced this session. */
+  attempt: number;
+}
+
 /** Server identity returned by the public `GET /api/server-info`. */
 export interface ServerInfoResponse {
   serverId: string;
@@ -240,6 +254,8 @@ export class AuthClient {
   /** Rejecter paired with {@link pendingLogin}, so the wait can be cancelled. */
   private pendingReject: ((err: Error) => void) | null = null;
   private pendingTimer: number | null = null;
+  /** Current SSO attempt; bumping it invalidates older attempts and their sessions. */
+  private loginAttempt = 0;
 
   constructor(plugin: RealtimePlugin) {
     this.plugin = plugin;
@@ -330,10 +346,13 @@ export class AuthClient {
   }
 
   /**
-   * Fetch `/api/server-info` and enforce capability compatibility. On a cap
-   * mismatch or missing caps, sets `plugin.lastCompatibilityError` and throws
-   * {@link CompatibilityError}. On success, clears `plugin.lastCompatibilityError`
-   * and returns the full response so callers can read `serverId` as before.
+   * Fetch `/api/server-info` and enforce capability compatibility. Returns the
+   * full response so callers can read `serverId`; throws
+   * {@link CompatibilityError} on a cap mismatch or missing caps.
+   *
+   * Only a check of the ACTIVE server updates `plugin.lastCompatibilityError`
+   * (set on failure, cleared on success). Testing a candidate server during
+   * sign-in or migration must not hide or invent the active server's state.
    *
    * Network/offline errors propagate as normal exceptions (not
    * `CompatibilityError`); callers tolerate them as today.
@@ -342,35 +361,44 @@ export class AuthClient {
     const normalizedBaseUrl = normalizeServerUrl(baseUrl);
     const info = await this.rawServerInfo(normalizedBaseUrl);
     const result = checkServerCaps(info.caps, info.requiredCaps);
+    const active = normalizedBaseUrl === this.baseUrl;
     if (result.ok) {
       this.serverCapsByUrl.set(normalizedBaseUrl, info.caps ?? {});
-      this.plugin.lastCompatibilityError = null;
+      if (active) this.plugin.lastCompatibilityError = null;
       return info;
     }
-    this.plugin.lastCompatibilityError = {
-      reason: result.reason,
-      detail: result.detail,
-      serverVersion: info.version,
-    };
+    if (active) {
+      this.plugin.lastCompatibilityError = {
+        reason: result.reason,
+        detail: result.detail,
+        serverVersion: info.version,
+      };
+    }
     throw new CompatibilityError(result.reason, result.detail, info.version);
   }
 
   /** Ensure the current server id is known and migrate recognized saved sessions. */
   async ensureServerId(): Promise<string> {
+    const baseUrl = this.baseUrl;
     const existing = this.plugin.settings.authServerId;
     const active = this.tokenRecord();
     const sessionsBefore = this.knownSessions();
+    // A sign-out or a server/account switch while a request below is in
+    // flight owns the session state; never rebind credentials it replaced.
+    const superseded = () =>
+      this.baseUrl !== baseUrl || this.tokenRecord()?.token !== active?.token;
     let serverId: string;
     try {
-      ({ serverId } = await this.serverInfoChecked(this.baseUrl));
+      ({ serverId } = await this.serverInfoChecked(baseUrl));
     } catch (e) {
       // Existing installs should still start while offline, but a cap failure
       // means the server explicitly advertised an incompatible protocol.
       if (e instanceof CompatibilityError || !existing) throw e;
       return existing;
     }
+    if (superseded()) return serverId;
 
-    const serverOnlyKey = serverSessionTokenKey(this.baseUrl, serverId);
+    const serverOnlyKey = serverSessionTokenKey(baseUrl, serverId);
     const activeNeedsMigration =
       active !== null &&
       (active.key === LEGACY_TOKEN_KEY ||
@@ -381,7 +409,7 @@ export class AuthClient {
     if (activeNeedsMigration) {
       let me: MeResponse;
       try {
-        me = await this.apiAt<MeResponse>(this.baseUrl, "/api/me", active.token);
+        me = await this.apiAt<MeResponse>(baseUrl, "/api/me", active.token);
       } catch (e) {
         if (!(e instanceof AuthError)) {
           // Do not bind credentials to an unverified server after a transient
@@ -389,18 +417,19 @@ export class AuthClient {
           if (existing) return existing;
           throw e;
         }
+        if (this.baseUrl !== baseUrl) return serverId;
         // A rejected active token is already cleared by the unauthorized
         // helper. Accept the fetched identity so startup can show sign-in.
         this.plugin.settings.authServerId = serverId;
         await this.plugin.saveSettings();
         return serverId;
       }
-
+      if (superseded()) return serverId;
       this.plugin.settings.authServerId = serverId;
-      const destination = sessionTokenKey(this.baseUrl, serverId, me.userId);
+      const destination = sessionTokenKey(baseUrl, serverId, me.userId);
       this.plugin.app.secretStorage.setSecret(destination, active.token);
       this.saveKnownSessions([
-        this.knownSession(me, destination, this.baseUrl, serverId),
+        this.knownSession(me, destination, baseUrl, serverId),
         ...sessionsBefore.filter(
           (session) => session.tokenKey !== active.key && session.tokenKey !== destination,
         ),
@@ -417,9 +446,10 @@ export class AuthClient {
     // A repaired server id can leave multiple saved accounts under the old
     // namespace. Validate and migrate each independently.
     for (const candidate of sessionsBefore) {
+      if (this.baseUrl !== baseUrl) break;
       let sameServer = false;
       try {
-        sameServer = normalizeServerUrl(candidate.serverUrl) === this.baseUrl;
+        sameServer = normalizeServerUrl(candidate.serverUrl) === baseUrl;
       } catch {
         continue;
       }
@@ -430,11 +460,11 @@ export class AuthClient {
       if (!token) continue;
 
       try {
-        const me = await this.apiAt<MeResponse>(this.baseUrl, "/api/me", token);
-        const destination = sessionTokenKey(this.baseUrl, serverId, me.userId);
+        const me = await this.apiAt<MeResponse>(baseUrl, "/api/me", token);
+        const destination = sessionTokenKey(baseUrl, serverId, me.userId);
         this.plugin.app.secretStorage.setSecret(destination, token);
         this.saveKnownSessions([
-          this.knownSession(me, destination, this.baseUrl, serverId),
+          this.knownSession(me, destination, baseUrl, serverId),
           ...this.knownSessions().filter(
             (session) =>
               session.tokenKey !== candidate.tokenKey && session.tokenKey !== destination,
@@ -502,35 +532,79 @@ export class AuthClient {
 
   // --- session ---------------------------------------------------------------
 
-  /** Store a session token, then fetch identity and seed defaults. */
+  /**
+   * Deep-link fallback when no sign-in is waiting (e.g. Obsidian restarted
+   * between opening the browser and the callback): validate the token against
+   * the active server, then commit it. Nothing is stored unless it validates.
+   */
   async setSession(token: string): Promise<MeResponse> {
-    // Resolve the server id first so the token lands under the per-server key.
-    await this.resolveServerId(this.baseUrl);
-    this.setToken(token);
-    await this.plugin.saveSettings();
-
-    const me = await this.me();
-    await this.applySession(token, me);
+    const serverUrl = this.baseUrl;
+    const attempt = this.loginAttempt;
+    const { serverId } = await this.serverInfoChecked(serverUrl);
+    this.assertLoginAttempt(attempt);
+    const me = await this.apiAt<MeResponse>(serverUrl, "/api/me", token);
+    this.assertLoginAttempt(attempt);
+    if (serverUrl !== this.baseUrl) throw new Error("Sign-in cancelled: active server changed.");
+    await this.applySessionAt(serverUrl, serverId, token, me);
     return me;
   }
 
-  async setSessionForServer(baseUrl: string, token: string, me: MeResponse): Promise<void> {
-    const normalized = normalizeServerUrl(baseUrl);
-    this.plugin.settings.authServerUrl = normalized;
-    // Bind the token to this server's stable id before it is written to
-    // SecretStorage (which is shared across local vaults).
-    await this.resolveServerId(normalized);
-    await this.applySession(token, me);
+  /**
+   * Throw unless `session` came from the current SSO attempt. Cancelling,
+   * timing out, unloading, or starting another attempt invalidates it.
+   */
+  assertCurrentLogin(session: AuthenticatedSession): void {
+    this.assertLoginAttempt(session.attempt);
   }
 
-  /** Fetch and store the server's stable id for the given (already-set) server. */
-  private async resolveServerId(baseUrl: string): Promise<void> {
-    const { serverId } = await this.serverInfoChecked(baseUrl);
-    this.plugin.settings.authServerId = serverId;
+  private assertLoginAttempt(attempt: number): void {
+    if (attempt !== this.loginAttempt) {
+      throw new Error("Sign-in was cancelled or replaced by a newer sign-in.");
+    }
   }
 
-  private async applySession(token: string, me: MeResponse): Promise<void> {
-    this.plugin.settings.userId = me.userId;
+  /**
+   * Make a validated SSO session the active one: server URL, server id,
+   * account, token, and (when given) the vault binding are committed together
+   * in one settings save. Rejects a session from a stale attempt.
+   */
+  async commitSession(session: AuthenticatedSession, activeVaultId?: string): Promise<void> {
+    this.assertCurrentLogin(session);
+    await this.applySessionAt(
+      session.serverUrl,
+      session.serverId,
+      session.token,
+      session.me,
+      activeVaultId,
+    );
+  }
+
+  /**
+   * Single commit point for every sign-in path. All inputs were validated
+   * against `serverUrl` (caps + `/api/me`) before this runs, so the active
+   * compatibility state is the committed server's (compatible).
+   *
+   * Vault ids belong to one server: without an explicit `activeVaultId`, a
+   * binding to a different server's vault is dropped rather than carried over.
+   */
+  private async applySessionAt(
+    serverUrl: string,
+    serverId: string,
+    token: string,
+    me: MeResponse,
+    activeVaultId?: string,
+  ): Promise<void> {
+    this.cancelPendingLogin("Sign-in cancelled: the active session changed.");
+    const settings = this.plugin.settings;
+    if (activeVaultId !== undefined) {
+      settings.activeVaultId = activeVaultId;
+    } else if (settings.authServerId && settings.authServerId !== serverId) {
+      settings.activeVaultId = "";
+    }
+    settings.authServerUrl = serverUrl;
+    settings.authServerId = serverId;
+    this.plugin.lastCompatibilityError = null;
+    settings.userId = me.userId;
     this.setToken(token, me.userId);
     this.rememberSession(me, this.tokenKey(me.userId));
     this.applyIdentity(me);
@@ -568,24 +642,24 @@ export class AuthClient {
   }
 
   destroy(): void {
-    if (this.pendingTimer !== null) {
-      window.clearTimeout(this.pendingTimer);
-      this.pendingTimer = null;
-    }
     this.cancelPendingLogin("Sign-in cancelled: plugin unloaded.");
   }
 
-  /** Log out: drop the session and the active vault binding. */
+  /**
+   * Log out: drop the session and the active vault binding locally first, so
+   * nothing can start against them while the server revocation is in flight.
+   */
   async logout(): Promise<void> {
+    this.cancelPendingLogin("Sign-in cancelled: signed out.");
+    const baseUrl = this.baseUrl;
+    const token = this.getToken();
+    this.plugin.settings.activeVaultId = "";
+    await this.clearSession();
     try {
-      if (this.getToken()) {
-        await this.api("/api/logout", { method: "POST", body: {} });
-      }
+      if (token) await this.apiAt(baseUrl, "/api/logout", token, { method: "POST", body: {} });
     } catch (e) {
       console.warn("[Realtime] server logout failed", e);
     }
-    this.plugin.settings.activeVaultId = "";
-    await this.clearSession();
   }
 
   me(): Promise<MeResponse> {
@@ -608,21 +682,13 @@ export class AuthClient {
   // --- login flow ------------------------------------------------------------
 
   /**
-   * Open the browser to the SSO login page and resolve once the auth server
-   * redirects back to `obsidian://realtime-auth?token=…`. The settings tab also
-   * offers a paste-code fallback that calls {@link setSession} directly.
+   * Sign in to `baseUrl` through SSO and make it the active server and account.
+   * A vault binding is retained only when it belongs to the same server.
    */
-  async login(): Promise<MeResponse> {
-    const { token, me } = await this.authenticateAt(this.baseUrl);
-    await this.applySession(token, me);
-    return me;
-  }
-
   async loginToServer(baseUrl: string): Promise<MeResponse> {
-    const normalized = normalizeServerUrl(baseUrl);
-    const { token, me } = await this.authenticateAt(normalized);
-    await this.setSessionForServer(normalized, token, me);
-    return me;
+    const session = await this.authenticateAt(baseUrl);
+    await this.commitSession(session);
+    return session.me;
   }
 
   async validSessionsForServer(baseUrl: string): Promise<KnownSession[]> {
@@ -677,55 +743,75 @@ export class AuthClient {
   async useKnownSession(session: KnownSession): Promise<MeResponse> {
     const token = this.plugin.app.secretStorage.getSecret(session.tokenKey);
     if (!token) throw new AuthError("Saved session not found. Please sign in again.");
-    // Verify compatibility before trusting the saved session's server. A
-    // server upgrade that broke a cap should not let an old session silently
-    // proceed against an incompatible server.
-    await this.serverInfoChecked(session.serverUrl);
-    this.plugin.settings.authServerUrl = session.serverUrl;
-    this.plugin.settings.authServerId = session.serverId;
-    const me = await this.apiAt<MeResponse>(session.serverUrl, "/api/me", token);
-    await this.applySession(token, me);
+    this.cancelPendingLogin("Sign-in cancelled: a saved session was selected.");
+    const attempt = this.loginAttempt;
+    // Verify compatibility and the token before trusting the saved session's
+    // server. A server upgrade that broke a cap, or a revoked token, must not
+    // replace the active session.
+    const serverUrl = normalizeServerUrl(session.serverUrl);
+    const { serverId } = await this.serverInfoChecked(serverUrl);
+    this.assertLoginAttempt(attempt);
+    const me = await this.apiAt<MeResponse>(serverUrl, "/api/me", token);
+    this.assertLoginAttempt(attempt);
+    await this.applySessionAt(serverUrl, serverId, token, me);
     return me;
   }
 
-  async authenticateAt(baseUrl: string): Promise<{ token: string; me: MeResponse }> {
-    const normalized = normalizeServerUrl(baseUrl);
+  /**
+   * Open the browser to `baseUrl`'s SSO page and resolve once the token from
+   * the `obsidian://realtime-auth?token=…` deep link (or the paste-code
+   * fallback) validates against that server. Changes no active session,
+   * server, or vault state: commit the result with {@link commitSession}.
+   *
+   * Starting another attempt, aborting `signal`, the 5 minute timeout, or
+   * unloading cancels this attempt, before or after it resolves.
+   */
+  async authenticateAt(baseUrl: string, signal?: AbortSignal): Promise<AuthenticatedSession> {
+    const serverUrl = normalizeServerUrl(baseUrl);
+    signal?.throwIfAborted();
+    this.cancelPendingLogin("Sign-in cancelled: a newer sign-in started.");
+    const attempt = this.loginAttempt;
+    signal?.addEventListener(
+      "abort",
+      () => {
+        if (attempt === this.loginAttempt) this.cancelPendingLogin("Sign-in cancelled.");
+      },
+      { once: true },
+    );
     // Verify compatibility before opening the SSO browser flow — a cap
     // mismatch should hard-block before the user is sent to the browser.
-    await this.serverInfoChecked(normalized);
-    // Record which server this SSO attempt targets. Pointing it at a different
-    // server cancels any earlier in-flight login (see beginSetupFor). Must run
-    // before we install the new resolver below so we don't cancel ourselves.
-    this.beginSetupFor(normalized);
+    const { serverId } = await this.serverInfoChecked(serverUrl);
+    signal?.throwIfAborted();
+    this.assertLoginAttempt(attempt);
     const redirect = encodeURIComponent("obsidian://realtime-auth");
-    window.open(`${normalized}/auth/login?redirect=${redirect}`);
-    return new Promise<{ token: string; me: MeResponse }>((resolve, reject) => {
+    window.open(`${serverUrl}/auth/login?redirect=${redirect}`);
+    return new Promise<AuthenticatedSession>((resolve, reject) => {
       this.pendingReject = reject;
-      this.pendingLogin = (token: string) => {
+      this.pendingLogin = async (token: string) => {
         this.pendingLogin = null;
-        this.pendingReject = null;
-        if (this.pendingTimer !== null) {
-          window.clearTimeout(this.pendingTimer);
-          this.pendingTimer = null;
-        }
-        const validation = this.apiAt<MeResponse>(normalized, "/api/me", token).then(async (me) => {
-          await this.setSessionForServer(normalized, token, me);
-          resolve({ token, me });
+        try {
+          const me = await this.apiAt<MeResponse>(serverUrl, "/api/me", token);
+          this.assertLoginAttempt(attempt);
+          resolve({ serverUrl, serverId, token, me, attempt });
           return me;
-        });
-        validation.catch(reject);
-        return validation;
+        } catch (e) {
+          reject(e);
+          throw e;
+        } finally {
+          if (attempt === this.loginAttempt) {
+            this.pendingReject = null;
+            if (this.pendingTimer !== null) {
+              window.clearTimeout(this.pendingTimer);
+              this.pendingTimer = null;
+            }
+          }
+        }
       };
       // Abandon the wait after 5 minutes so the promise can't leak forever.
-      // Guard on identity so a stale timer can't reject a newer attempt.
+      // Guard on the attempt so a stale timer can't cancel a newer attempt.
       this.pendingTimer = window.setTimeout(
         () => {
-          if (this.pendingReject === reject) {
-            this.pendingLogin = null;
-            this.pendingReject = null;
-            this.pendingTimer = null;
-            reject(new Error("Login timed out."));
-          }
+          if (attempt === this.loginAttempt) this.cancelPendingLogin("Login timed out.");
         },
         5 * 60 * 1000,
       );
@@ -733,22 +819,12 @@ export class AuthClient {
   }
 
   /**
-   * Record the server an SSO attempt targets in the dedicated
-   * `pendingSetupServerUrl` setting (used for nothing else). If that value
-   * changes, any in-flight SSO login is cancelled — switching servers mid-setup
-   * must not let a stale login resolve against the wrong server.
+   * Invalidate the current SSO attempt: reject its wait if still pending, and
+   * make any session it already produced (or is validating) uncommittable.
    */
-  private beginSetupFor(baseUrl: string): void {
-    if (this.plugin.settings.pendingSetupServerUrl !== baseUrl) {
-      this.cancelPendingLogin("Sign-in cancelled: setup server changed.");
-      this.plugin.settings.pendingSetupServerUrl = baseUrl;
-      void this.plugin.saveSettings();
-    }
-  }
-
-  /** Reject and clear any in-flight SSO login wait. */
   private cancelPendingLogin(reason: string): void {
     const reject = this.pendingReject;
+    this.loginAttempt++;
     this.pendingLogin = null;
     this.pendingReject = null;
     if (this.pendingTimer !== null) {
@@ -758,30 +834,38 @@ export class AuthClient {
     reject?.(new Error(reason));
   }
 
-  /** Called by the registered protocol handler in main.ts. */
-  handleProtocol(params: Record<string, string>): Promise<MeResponse | void> {
+  /**
+   * Called by the registered protocol handler in main.ts. A token for an
+   * in-flight sign-in is handed to that flow, which owns committing it and
+   * restarting sync; resolves `null` then. Otherwise (e.g. Obsidian restarted
+   * after opening the browser) the token is validated and committed for the
+   * active server, and the new identity is returned.
+   */
+  async handleProtocol(params: Record<string, string>): Promise<MeResponse | null> {
     const token = params.token;
-    if (!token) return Promise.resolve();
-    return this.completeWithToken(token);
+    if (!token) return null;
+    if (this.pendingLogin) {
+      await this.pendingLogin(token);
+      return null;
+    }
+    // Only a fresh plugin instance may accept an orphaned post-restart link.
+    // Late or duplicate callbacks from a staged/cancelled flow never commit.
+    if (this.loginAttempt !== 0) return null;
+    return this.setSession(token);
   }
 
   /**
    * Paste-code fallback for when the `obsidian://` deep link doesn't fire:
-   * feed the token shown in the browser straight into the pending login.
+   * feed the token shown in the browser to the in-flight sign-in, whose caller
+   * reports the outcome. Returns false when no sign-in is waiting for a code.
    */
-  submitPastedCode(token: string): void {
+  submitPastedCode(token: string): boolean {
     const trimmed = token.trim();
-    if (!trimmed) return;
-    void this.completeWithToken(trimmed);
-  }
-
-  private completeWithToken(token: string): Promise<MeResponse | void> {
-    if (this.pendingLogin) {
-      return this.pendingLogin(token);
-    } else {
-      // No awaiting promise (e.g. app restarted between open and callback).
-      return this.setSession(token);
-    }
+    if (!trimmed || !this.pendingLogin) return false;
+    this.pendingLogin(trimmed).catch(() => {
+      // The awaiting authenticateAt caller surfaces the failure.
+    });
+    return true;
   }
 
   private rememberSession(

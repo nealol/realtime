@@ -92,7 +92,7 @@ export function readCanvasPresence(value: unknown): CanvasPresenceState | null {
   return state as unknown as CanvasPresenceState;
 }
 
-function isCanvasPresenceNode(value: unknown): boolean {
+function isCanvasPresenceNode(value: unknown): value is CanvasPresenceNode {
   if (!value || typeof value !== "object") return false;
   const node = value as Record<string, unknown>;
   return (
@@ -101,6 +101,49 @@ function isCanvasPresenceNode(value: unknown): boolean {
       (key) => typeof node[key] === "number" && Number.isFinite(node[key]),
     )
   );
+}
+
+export interface CanvasPresenceNode {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Read one node's geometry from Obsidian's live `canvas.nodes` map without
+ * serializing the whole Canvas through `getData()`. Returns the geometry when
+ * the live node is valid, `null` when the live map has no such node (getData
+ * would not list it either), and `undefined` when this Canvas shape cannot
+ * answer reliably — callers then fall back to `getData()`.
+ */
+export function liveCanvasNodeGeometry(
+  canvas: unknown,
+  id: string,
+): CanvasPresenceNode | null | undefined {
+  if (!canvas || typeof canvas !== "object" || !("nodes" in canvas)) return undefined;
+  const nodes = canvas.nodes;
+  if (!(nodes instanceof Map)) return undefined;
+  const node: unknown = nodes.get(id);
+  if (node === undefined) return null;
+  if (!isCanvasPresenceNode(node) || node.id !== id) return undefined;
+  const { x, y, width, height } = node;
+  return { id, x, y, width, height };
+}
+
+/**
+ * True when an awareness change event touches no client other than `localId`.
+ * Unrecognized event shapes count as remote, so callers err toward rendering.
+ */
+function localOnlyChange(
+  changes: { added?: unknown; updated?: unknown; removed?: unknown },
+  localId: number,
+): boolean {
+  for (const ids of [changes.added, changes.updated, changes.removed]) {
+    if (!Array.isArray(ids) || ids.some((id) => id !== localId)) return false;
+  }
+  return true;
 }
 
 // ---------- canvas viewport adapter ----------
@@ -506,25 +549,40 @@ export function mountCanvasCursorOverlay(
   };
 
   const lastSequences = new Map<number, number>();
-  const canvasNodes = () => {
-    const canvas = getCanvas() as { getData?: () => unknown } | null;
-    const data = canvas?.getData?.() as { nodes?: unknown[] } | undefined;
-    const result = new Map<
-      string,
-      { id: string; x: number; y: number; width: number; height: number }
-    >();
+  const canvasNodes = (canvas: unknown) => {
+    const data = (canvas as { getData?: () => unknown } | null)?.getData?.() as
+      | { nodes?: unknown[] }
+      | undefined;
+    const result = new Map<string, CanvasPresenceNode>();
     for (const node of data?.nodes ?? []) {
       if (isCanvasPresenceNode(node)) {
-        const value = node as { id: string; x: number; y: number; width: number; height: number };
-        result.set(value.id, value);
+        // Geometry only: spreading full node data would let a node's own
+        // `color` field override the collaborator color of its presence box.
+        const { id, x, y, width, height } = node as CanvasPresenceNode;
+        result.set(id, { id, x, y, width, height });
       }
     }
     return result;
   };
+  /**
+   * Per-render node geometry lookup. Prefers the live node map and serializes
+   * the Canvas through getData() at most once, only when a remote entry needs
+   * local geometry this Canvas shape cannot provide live.
+   */
+  const nodeLookup = () => {
+    const canvas = getCanvas();
+    let snapshot: Map<string, CanvasPresenceNode> | null = null;
+    return (id: string): CanvasPresenceNode | undefined => {
+      const live = liveCanvasNodeGeometry(canvas, id);
+      if (live !== undefined) return live ?? undefined;
+      snapshot ??= canvasNodes(canvas);
+      return snapshot.get(id);
+    };
+  };
 
   const collectPresence = () => {
     const localId = awareness.doc.clientID;
-    const nodes = canvasNodes();
+    const nodeGeometry = nodeLookup();
     const entries: Array<{
       key: string;
       name: string;
@@ -548,7 +606,7 @@ export function mountCanvasCursorOverlay(
       const color = user?.color ?? "#30bced";
       const interaction = new Map(presence.interaction?.nodes.map((node) => [node.id, node]));
       for (const id of presence.selectedNodeIds ?? []) {
-        const node = interaction.get(id) ?? nodes.get(id);
+        const node = interaction.get(id) ?? nodeGeometry(id);
         if (node)
           entries.push({
             key: `${clientId}:selection:${id}`,
@@ -568,7 +626,7 @@ export function mountCanvasCursorOverlay(
         });
       }
       if (presence.editingNodeId) {
-        const node = nodes.get(presence.editingNodeId);
+        const node = nodeGeometry(presence.editingNodeId);
         if (node)
           entries.push({
             key: `${clientId}:editing:${node.id}`,
@@ -595,9 +653,15 @@ export function mountCanvasCursorOverlay(
     });
   };
 
+  /** Local `canvasPresence` as of the last render; see {@link awarenessListener}. */
+  let renderedLocalPresence: unknown;
+  let renderedNodeBoxes = false;
+
   const render = () => {
+    renderedLocalPresence = awareness.getLocalState()?.canvasPresence;
     const markers = collectMarkers();
     const presence = collectPresence();
+    renderedNodeBoxes = presence.length > 0;
     root.render(
       createElement(
         "div",
@@ -700,16 +764,32 @@ export function mountCanvasCursorOverlay(
     }
     if (!writeCanvasViewport(getCanvas(), presence.viewport)) followedClientId = null;
   };
-  const awarenessListener = () => {
+  /**
+   * Local cursor-only changes cannot affect remote markers. Keep the original
+   * redraw behavior while node boxes exist: hover can accompany local changes
+   * to their geometry, without adding an always-on viewport poll for boxes.
+   */
+  const awarenessListener = (changes?: {
+    added?: unknown;
+    updated?: unknown;
+    removed?: unknown;
+  }) => {
     applyFollowedViewport();
+    if (
+      changes &&
+      localOnlyChange(changes, awareness.doc.clientID) &&
+      awareness.getLocalState()?.canvasPresence === renderedLocalPresence &&
+      !renderedNodeBoxes
+    )
+      return;
     render();
   };
   awareness.on("change", awarenessListener);
   render();
 
   // Viewport watcher: re-render remote markers when the local pan/zoom moves.
-  // Obsidian's Canvas sets `viewportChanged` + `requestFrame` internally but
-  // emits no public event, so we poll on rAF only while remote markers exist.
+  // Obsidian emits no public viewport-change event, so poll on rAF only while
+  // remote cursors exist, as before.
   let viewRaf: number | null = null;
   let viewRunning = false;
   let lastSig = "";

@@ -1,11 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import * as Y from "yjs";
-import { makeEngine, makeRelay, newSnapStore } from "../support/crsqliteHarness";
+import { makeEngine, makeRelay, newSnapStore, type SnapStore } from "../support/crsqliteHarness";
 import { _resetSqliteForTests, readAllChanges } from "../../src/pluginDb/crsqlite";
 import { RealtimeSqlAPI } from "../../src/pluginDb/api";
 import { MAX_BATCH_ROWS, SYNC_FORMAT } from "../../src/pluginDb/types";
 import { CompatibilityError } from "../../src/caps";
 import { waitFor } from "../support/util";
+import type { MigrateFn, SyncedPluginDatabase } from "../../src/pluginDb/SyncedPluginDatabase";
 
 vi.mock("../../src/pluginDb/obsidianDeps", () => ({
   buildEngineDeps: vi.fn(),
@@ -130,6 +131,147 @@ describe("SyncedPluginDatabase", () => {
     } finally {
       await a3.close();
     }
+  });
+
+  describe("indexes, views and triggers across snapshot restore", () => {
+    const tasksWithObjects =
+      (calls: number[] = []): MigrateFn =>
+      async (tx, from) => {
+        calls.push(from);
+        if (from < 1) {
+          await tx.exec(`CREATE TABLE tasks (id PRIMARY KEY NOT NULL, title, done)`);
+          await tx.exec(`SELECT crsql_as_crr('tasks')`);
+          await tx.exec(`CREATE TABLE task_log (id PRIMARY KEY NOT NULL, task)`);
+          await tx.exec(`SELECT crsql_as_crr('task_log')`);
+          await tx.exec(`CREATE INDEX tasks_done ON tasks (done)`);
+          await tx.exec(`CREATE VIEW open_tasks AS SELECT id, title FROM tasks WHERE done = 0`);
+          await tx.exec(
+            `CREATE TRIGGER log_task AFTER INSERT ON tasks BEGIN
+               INSERT INTO task_log (id, task) VALUES (lower(hex(randomblob(8))), new.id);
+             END`,
+          );
+        }
+      };
+
+    const openTitles = async (db: SyncedPluginDatabase) =>
+      (await db.query<{ title: string }>(`SELECT title FROM open_tasks ORDER BY id`)).map(
+        (r) => r.title,
+      );
+    const loggedTasks = async (db: SyncedPluginDatabase) =>
+      (await db.query<{ task: string }>(`SELECT task FROM task_log ORDER BY task`)).map(
+        (r) => r.task,
+      );
+    const userObjects = async (db: SyncedPluginDatabase) =>
+      (
+        await db.debugExecute(
+          `SELECT name FROM sqlite_master WHERE name IN ('tasks_done', 'tasks_title', 'open_tasks', 'log_task') ORDER BY name`,
+        )
+      ).map((r) => r.name);
+
+    async function seed(snap: SnapStore, calls: number[]) {
+      const first = makeEngine({ doc: new Y.Doc(), snap, migrate: tasksWithObjects(calls) });
+      await first.start();
+      await first.whenLive();
+      await first.exec(`INSERT INTO tasks (id, title, done) VALUES (?, ?, ?)`, ["a", "open", 0]);
+      await first.exec(`INSERT INTO tasks (id, title, done) VALUES (?, ?, ?)`, ["b", "done", 1]);
+      await first.close();
+    }
+
+    it("keeps them on a same-version reopen without re-firing triggers for restored rows", async () => {
+      const snap = newSnapStore();
+      const calls: number[] = [];
+      await seed(snap, calls);
+
+      const second = makeEngine({ doc: new Y.Doc(), snap, migrate: tasksWithObjects(calls) });
+      try {
+        await second.start();
+        await second.whenLive();
+        expect(calls).toEqual([0]); // the reopen restored, it did not migrate
+        expect(await userObjects(second)).toEqual(["log_task", "open_tasks", "tasks_done"]);
+        expect(await openTitles(second)).toEqual(["open"]);
+        const plan = await second.query<{ detail: string }>(
+          `EXPLAIN QUERY PLAN SELECT id FROM tasks WHERE done = 1`,
+        );
+        expect(plan.some((r) => r.detail.includes("tasks_done"))).toBe(true);
+        // The restored history already holds each insert's log row.
+        expect(await loggedTasks(second)).toEqual(["a", "b"]);
+
+        await second.exec(`INSERT INTO tasks (id, title, done) VALUES (?, ?, ?)`, ["c", "new", 0]);
+        expect(await loggedTasks(second)).toEqual(["a", "b", "c"]);
+      } finally {
+        await second.close();
+      }
+
+      // A snapshot written by a restored engine keeps them too.
+      const third = makeEngine({ doc: new Y.Doc(), snap, migrate: tasksWithObjects(calls) });
+      try {
+        await third.start();
+        await third.whenLive();
+        expect(await openTitles(third)).toEqual(["open", "new"]);
+        expect(await loggedTasks(third)).toEqual(["a", "b", "c"]);
+      } finally {
+        await third.close();
+      }
+    });
+
+    it("rebuilds them from migrate when restoring a snapshot that predates them", async () => {
+      const snap = newSnapStore();
+      await seed(snap, []);
+      const legacy = JSON.parse(snap.text!);
+      delete legacy.objects;
+      snap.text = JSON.stringify(legacy);
+
+      const reopened = makeEngine({ doc: new Y.Doc(), snap, migrate: tasksWithObjects() });
+      try {
+        await reopened.start();
+        await reopened.whenLive();
+        expect(await userObjects(reopened)).toEqual(["log_task", "open_tasks", "tasks_done"]);
+        expect(await openTitles(reopened)).toEqual(["open"]);
+        expect(await loggedTasks(reopened)).toEqual(["a", "b"]);
+        await reopened.exec(`INSERT INTO tasks (id, title, done) VALUES (?, ?, ?)`, [
+          "c",
+          "new",
+          0,
+        ]);
+        expect(await loggedTasks(reopened)).toEqual(["a", "b", "c"]);
+      } finally {
+        await reopened.close();
+      }
+    });
+
+    it("rebuilds them alongside an upgrade migration for a snapshot that predates them", async () => {
+      const snap = newSnapStore();
+      await seed(snap, []);
+      const legacy = JSON.parse(snap.text!);
+      delete legacy.objects;
+      snap.text = JSON.stringify(legacy);
+
+      const v1 = tasksWithObjects();
+      const upgraded = makeEngine({
+        doc: new Y.Doc(),
+        snap,
+        schemaVersion: 2,
+        migrate: async (tx, from) => {
+          await v1(tx, from);
+          if (from < 2) await tx.exec(`CREATE INDEX tasks_title ON tasks (title)`);
+        },
+      });
+      try {
+        await upgraded.start();
+        await upgraded.whenLive();
+        expect(upgraded.state).toBe("live");
+        expect(await userObjects(upgraded)).toEqual([
+          "log_task",
+          "open_tasks",
+          "tasks_done",
+          "tasks_title",
+        ]);
+        expect(await openTitles(upgraded)).toEqual(["open"]);
+        expect(await loggedTasks(upgraded)).toEqual(["a", "b"]);
+      } finally {
+        await upgraded.close();
+      }
+    });
   });
 
   it("buffers batches from a newer schema and reports needs-migration", async () => {

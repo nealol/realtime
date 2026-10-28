@@ -242,7 +242,8 @@ function isRecord(value: unknown): value is Record<string, JsonValue> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function jsonEqual(left: JsonValue, right: JsonValue): boolean {
+/** Deep JSON equality that ignores record key order. */
+export function jsonEqual(left: JsonValue, right: JsonValue): boolean {
   if (left === right) return true;
   if (Array.isArray(left) || Array.isArray(right)) {
     if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import type RealtimePlugin from "../../src/main";
 
 interface RequestOptions {
@@ -64,7 +64,6 @@ function makeAuth(opts: { serverId?: string; userId?: string; token?: string } =
     activeVaultId: "vault-a",
     clientName: "Test Client",
     clientNameCustomized: false,
-    pendingSetupServerUrl: "",
   };
   const plugin = {
     settings,
@@ -74,7 +73,7 @@ function makeAuth(opts: { serverId?: string; userId?: string; token?: string } =
         setSecret: (key: string, value: string) => secrets.set(key, value),
       },
     },
-    lastCompatibilityError: null,
+    lastCompatibilityError: null as RealtimePlugin["lastCompatibilityError"],
     saveSettings: vi.fn(async () => {}),
     updateLocalAwareness: vi.fn(),
   };
@@ -283,4 +282,232 @@ describe("AuthClient session reliability", () => {
       expect(auth.isLoggedIn).toBe(true);
     },
   );
+});
+
+describe("AuthClient transactional sign-in", () => {
+  const NEW_URL = "https://new.example.test";
+  const BROKEN_URL = "https://broken.example.test";
+
+  /** Old server knows only `active-token`; the candidate knows only `new-token`. */
+  function routeServers(opts: RequestOptions): MockResponse {
+    const url = new URL(opts.url);
+    if (url.pathname === "/api/server-info") {
+      if (url.origin === SERVER_URL) return serverInfo("server-old");
+      if (url.origin === NEW_URL) return serverInfo("server-new");
+      if (url.origin === BROKEN_URL) {
+        return response(200, { serverId: "server-broken", caps: { ...CAPS, restApi: "999" } });
+      }
+    }
+    if (url.pathname === "/api/me") {
+      if (url.origin === SERVER_URL && bearer(opts) === "active-token") {
+        return response(200, me("user-a"));
+      }
+      if (url.origin === NEW_URL && bearer(opts) === "new-token") {
+        return response(200, me("user-b"));
+      }
+      return response(401);
+    }
+    throw new Error(`unexpected request ${opts.url}`);
+  }
+
+  function signedIn() {
+    const harness = makeAuth({ serverId: "server-old", userId: "user-a", token: "active-token" });
+    http.handler.mockImplementation(async (opts) => routeServers(opts));
+    const activeKey = tokenKey(harness.auth, "user-a");
+    const before = { ...harness.settings };
+    const expectActiveUnchanged = () => {
+      expect(harness.settings).toEqual(before);
+      expect(harness.secrets.get(activeKey)).toBe("active-token");
+      expect(harness.auth.isLoggedIn).toBe(true);
+    };
+    return { ...harness, activeKey, expectActiveUnchanged };
+  }
+
+  let opened: MockInstance<typeof window.open>;
+  beforeEach(() => {
+    opened = vi.spyOn(window, "open").mockImplementation(() => null);
+  });
+  afterEach(() => {
+    opened.mockRestore();
+  });
+
+  /** Resolves once an SSO attempt opened the browser and awaits its token. */
+  async function ssoOpened(times = 1): Promise<void> {
+    await vi.waitFor(() => expect(opened.mock.calls.length).toBeGreaterThanOrEqual(times));
+  }
+
+  it("validates a candidate server without touching the active session until committed", async () => {
+    const { auth, settings, secrets, activeKey, expectActiveUnchanged } = signedIn();
+
+    const pending = auth.authenticateAt(NEW_URL);
+    await ssoOpened();
+    // The deep link hands the token to the waiting flow instead of signing in.
+    await expect(auth.handleProtocol({ token: "new-token" })).resolves.toBeNull();
+    const session = await pending;
+
+    expect(session).toMatchObject({
+      serverUrl: NEW_URL,
+      serverId: "server-new",
+      token: "new-token",
+    });
+    expectActiveUnchanged();
+
+    await auth.commitSession(session, "vault-new");
+
+    expect(settings).toMatchObject({
+      authServerUrl: NEW_URL,
+      authServerId: "server-new",
+      userId: "user-b",
+      userDisplayName: "USER-B",
+      activeVaultId: "vault-new",
+    });
+    expect(secrets.get(tokenKey(auth, "user-b"))).toBe("new-token");
+    expect(auth.isLoggedIn).toBe(true);
+    // The previous server's session stays saved for switching back.
+    expect(secrets.get(activeKey)).toBe("active-token");
+  });
+
+  it("refuses to commit a session whose sign-in was cancelled afterwards", async () => {
+    const { auth, expectActiveUnchanged } = signedIn();
+    const cancel = new AbortController();
+
+    const pending = auth.authenticateAt(NEW_URL, cancel.signal);
+    await ssoOpened();
+    await auth.handleProtocol({ token: "new-token" });
+    const session = await pending;
+    cancel.abort();
+
+    await expect(auth.commitSession(session, "vault-new")).rejects.toBeInstanceOf(Error);
+    expectActiveUnchanged();
+  });
+
+  it("refuses to commit a session superseded by a newer sign-in", async () => {
+    const { auth, expectActiveUnchanged } = signedIn();
+
+    const first = auth.authenticateAt(NEW_URL);
+    await ssoOpened();
+    await auth.handleProtocol({ token: "new-token" });
+    const stale = await first;
+    const second = auth.authenticateAt(NEW_URL);
+    await ssoOpened(2);
+
+    await expect(auth.commitSession(stale, "vault-new")).rejects.toBeInstanceOf(Error);
+    auth.destroy();
+    await expect(second).rejects.toBeInstanceOf(Error);
+    expectActiveUnchanged();
+  });
+
+  it("cancelling before the token arrives keeps a late deep link from replacing the session", async () => {
+    const { auth, expectActiveUnchanged } = signedIn();
+    const cancel = new AbortController();
+
+    const pending = auth.authenticateAt(NEW_URL, cancel.signal);
+    await ssoOpened();
+    cancel.abort();
+    await expect(pending).rejects.toBeInstanceOf(Error);
+
+    // A callback from the cancelled flow is ignored, not treated as a new login.
+    await expect(auth.handleProtocol({ token: "new-token" })).resolves.toBeNull();
+    expect(auth.submitPastedCode("new-token")).toBe(false);
+    expectActiveUnchanged();
+  });
+
+  it("ignores a cancelled flow's late token even when it is valid on the active server", async () => {
+    const { auth, expectActiveUnchanged } = signedIn();
+    http.handler.mockImplementation(async (opts) => {
+      if (opts.url === `${SERVER_URL}/api/me` && bearer(opts) === "late-token") {
+        return response(200, me("user-c"));
+      }
+      return routeServers(opts);
+    });
+    const cancel = new AbortController();
+    const pending = auth.authenticateAt(SERVER_URL, cancel.signal);
+    await ssoOpened();
+    cancel.abort();
+    await expect(pending).rejects.toBeInstanceOf(Error);
+
+    await expect(auth.handleProtocol({ token: "late-token" })).resolves.toBeNull();
+    expectActiveUnchanged();
+  });
+
+  it("does not let an older capability preflight supersede a newer sign-in", async () => {
+    const { auth, settings } = signedIn();
+    const preflight = Promise.withResolvers<MockResponse>();
+    let checks = 0;
+    http.handler.mockImplementation(async (opts) => {
+      if (opts.url === `${NEW_URL}/api/server-info` && checks++ === 0) return preflight.promise;
+      return routeServers(opts);
+    });
+    const older = auth.authenticateAt(NEW_URL);
+    const rejectedOlder = expect(older).rejects.toBeInstanceOf(Error);
+    const newer = auth.authenticateAt(NEW_URL);
+    await ssoOpened();
+    preflight.resolve(serverInfo("server-new"));
+    await rejectedOlder;
+    await auth.handleProtocol({ token: "new-token" });
+    await auth.commitSession(await newer, "vault-new");
+
+    expect(settings.authServerUrl).toBe(NEW_URL);
+    expect(settings.userId).toBe("user-b");
+    expect(settings.activeVaultId).toBe("vault-new");
+  });
+
+  it("does not commit an orphaned callback whose validation outlives unload", async () => {
+    const { auth, expectActiveUnchanged } = signedIn();
+    const preflight = Promise.withResolvers<MockResponse>();
+    http.handler.mockImplementation(async (opts) => {
+      if (opts.url === `${SERVER_URL}/api/server-info`) return preflight.promise;
+      return routeServers(opts);
+    });
+    const pending = auth.handleProtocol({ token: "active-token" });
+    const rejected = expect(pending).rejects.toBeInstanceOf(Error);
+    auth.destroy();
+    preflight.resolve(serverInfo("server-old"));
+    await rejected;
+
+    expectActiveUnchanged();
+  });
+
+  it("cancels a staged sign-in while token validation is still pending", async () => {
+    const { auth, expectActiveUnchanged } = signedIn();
+    const validation = Promise.withResolvers<MockResponse>();
+    let validating = false;
+    http.handler.mockImplementation(async (opts) => {
+      if (opts.url === `${NEW_URL}/api/me`) {
+        validating = true;
+        return validation.promise;
+      }
+      return routeServers(opts);
+    });
+    const cancel = new AbortController();
+    const pending = auth.authenticateAt(NEW_URL, cancel.signal);
+    const rejected = expect(pending).rejects.toBeInstanceOf(Error);
+    await ssoOpened();
+    const callback = auth.handleProtocol({ token: "new-token" });
+    const rejectedCallback = expect(callback).rejects.toBeInstanceOf(Error);
+    await vi.waitFor(() => expect(validating).toBe(true));
+    cancel.abort();
+    await rejected;
+    expectActiveUnchanged();
+    validation.resolve(response(200, me("user-b")));
+    await rejectedCallback;
+    expectActiveUnchanged();
+  });
+
+  it("checking candidate servers leaves the active compatibility state alone", async () => {
+    const { auth, plugin } = signedIn();
+    const activeFailure = { reason: "server-incompatible" as const, detail: "active is broken" };
+    plugin.lastCompatibilityError = activeFailure;
+
+    await auth.validSessionsForServer(NEW_URL);
+    expect(plugin.lastCompatibilityError).toEqual(activeFailure);
+
+    plugin.lastCompatibilityError = null;
+    await expect(auth.authenticateAt(BROKEN_URL)).rejects.toBeInstanceOf(CompatibilityError);
+    expect(plugin.lastCompatibilityError).toBeNull();
+    expect(opened).not.toHaveBeenCalled();
+
+    await expect(auth.serverInfoChecked(BROKEN_URL)).rejects.toBeInstanceOf(CompatibilityError);
+    expect(plugin.lastCompatibilityError).toBeNull();
+  });
 });

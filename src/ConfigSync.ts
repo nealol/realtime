@@ -182,6 +182,14 @@ export class ConfigSync {
   private hashCache = new Map<string, HashCacheEntry>();
   private chains = new Map<string, Promise<boolean>>();
   private writing = new Set<string>();
+  /**
+   * Remote hash per path whose download failed and has not materialized yet.
+   * A missing local file there is an unfinished pull, not a local delete, so
+   * the delete-propagation branch stays off for that version until it lands.
+   */
+  private pendingDownloads = new Map<string, string>();
+  /** One outstanding blob-failure retry per path; poll/focus passes never stack more. */
+  private retryTimers = new Map<string, number>();
   private pollTimer: number | null = null;
   private started = false;
   private paused = false;
@@ -328,6 +336,7 @@ export class ConfigSync {
       this.localSyncState?.beginCandidate(path, "config", local.hash, local.hash);
     }
     const remote = this.configFiles.get(path) ?? null;
+    if (this.pendingDownloads.get(path) !== remote?.hash) this.pendingDownloads.delete(path);
     const base = this.lastSyncedHash.get(path) ?? null;
     const localState = this.localSyncState?.get(path);
 
@@ -345,7 +354,7 @@ export class ConfigSync {
       } catch (e) {
         if (this.destroyed) return false;
         console.error(`[Realtime] config blob download failed for ${path}`, e);
-        window.setTimeout(() => void this.reconcile(path), RETRY_MS);
+        this.scheduleRetry(path);
         return false;
       }
       if (!this.canApply(generation)) {
@@ -360,8 +369,14 @@ export class ConfigSync {
         void this.reconcile(path);
         return false;
       }
-      await this.materializeDownload(path, remote, remoteBytes, local.hash, generation);
-      return this.canApply(generation);
+      const written = await this.materializeDownload(
+        path,
+        remote,
+        remoteBytes,
+        local.hash,
+        generation,
+      );
+      return written && this.canApply(generation);
     }
     if (local && !remote && base !== null && base !== local.hash) {
       const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
@@ -387,12 +402,13 @@ export class ConfigSync {
         : undefined;
     const ownBase = this.localSyncState ? ownPublishParent !== undefined : undefined;
     const action = decideConfigReconcile(local, remote, base, {
-      initialPull: this.initialPull,
+      initialPull: this.initialPull || this.pendingDownloads.has(path),
       canMerge: path.endsWith(".json"),
       replacedHash: localState?.kind === "config" ? localState.replacedIdentity : undefined,
       ownBase,
     });
     if (action === "none") {
+      this.pendingDownloads.delete(path);
       if (remote?.hash) {
         this.lastSyncedHash.set(path, remote.hash);
         this.localSyncState?.markSynced(path, "config", remote.hash, remote.hash);
@@ -402,7 +418,8 @@ export class ConfigSync {
     if (action === "upload" && local) {
       await this.upload(path, local, remote?.hash ?? null, generation);
     } else if (action === "download" && remote) {
-      await this.download(path, remote, local?.hash ?? null, generation);
+      const written = await this.download(path, remote, local?.hash ?? null, generation);
+      if (!written) return false;
     } else if (action === "deleteLocal") await this.deleteLocal(path, generation);
     else if (action === "deleteRemote") this.publishDelete(path, generation);
     else if (action === "merge" && local && remote) {
@@ -431,7 +448,12 @@ export class ConfigSync {
     }
     for (const file of listed.files) paths.push(file);
     for (const child of listed.folders) {
+      // Skip folders that can hold no syncable file: hard-excluded, outside
+      // every category, or in a disabled category. Files are still filtered
+      // individually by `syncableCategory`.
       if (this.isHardExcluded(child)) continue;
+      const category = categoryForVaultPath(`${child}/`, this.configRoot);
+      if (category === null || !this.enabledCategories.has(category)) continue;
       if (!(await this.walk(child, paths))) return false;
     }
     return true;
@@ -533,22 +555,33 @@ export class ConfigSync {
     dbg("config uploaded+published", path, finalMeta.hash, finalMeta.size);
   }
 
+  /** Resolves true once the remote version is on disk; false leaves the path pending. */
   private async download(
     path: string,
     meta: ConfigMeta,
     expectedLocalHash?: string | null,
     generation = this.pauseGeneration,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let bytes: ArrayBuffer;
     try {
       bytes = await this.plugin.auth.getBlob(this.vaultId, path, meta.hash);
     } catch (e) {
-      if (this.destroyed) return;
+      if (this.destroyed) return false;
       console.error(`[Realtime] config blob download failed for ${path}`, e);
-      window.setTimeout(() => void this.reconcile(path), RETRY_MS);
-      return;
+      this.pendingDownloads.set(path, meta.hash);
+      this.scheduleRetry(path);
+      return false;
     }
-    await this.materializeDownload(path, meta, bytes, expectedLocalHash, generation);
+    return this.materializeDownload(path, meta, bytes, expectedLocalHash, generation);
+  }
+
+  private scheduleRetry(path: string): void {
+    if (this.destroyed || this.retryTimers.has(path)) return;
+    const timer = window.setTimeout(() => {
+      this.retryTimers.delete(path);
+      void this.reconcile(path);
+    }, RETRY_MS);
+    this.retryTimers.set(path, timer);
   }
 
   private async materializeDownload(
@@ -557,10 +590,10 @@ export class ConfigSync {
     bytes: ArrayBuffer,
     expectedLocalHash?: string | null,
     generation = this.pauseGeneration,
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (!this.canApply(generation)) {
       if (!this.destroyed) void this.reconcile(path);
-      return;
+      return false;
     }
     const currentLocal = await this.localInfo(path);
     if (
@@ -569,21 +602,23 @@ export class ConfigSync {
       (expectedLocalHash !== undefined && (currentLocal?.hash ?? null) !== expectedLocalHash)
     ) {
       void this.reconcile(path);
-      return;
+      return false;
     }
     this.writing.add(path);
     try {
       await this.ensureParentFolders(path);
       if (!this.canApply(generation)) {
         void this.reconcile(path);
-        return;
+        return false;
       }
       await this.plugin.app.vault.adapter.writeBinary(path, bytes);
       this.hashCache.delete(path);
       this.lastSyncedHash.set(path, meta.hash);
       this.localSyncState?.markSynced(path, "config", meta.hash, meta.hash, true);
+      this.pendingDownloads.delete(path);
       this.noteDownloaded(path);
       dbg("config downloaded", path, meta.hash, bytes.byteLength);
+      return true;
     } finally {
       window.setTimeout(() => this.writing.delete(path), 0);
     }
@@ -611,7 +646,7 @@ export class ConfigSync {
     } catch (e) {
       if (this.destroyed) return;
       console.error(`[Realtime] config blob download failed for ${path}`, e);
-      window.setTimeout(() => void this.reconcile(path), RETRY_MS);
+      this.scheduleRetry(path);
       return;
     }
     const localBytes = await this.plugin.app.vault.adapter.readBinary(path);
@@ -849,6 +884,8 @@ export class ConfigSync {
       window.clearTimeout(this.reloadNoticeTimer);
       this.reloadNoticeTimer = null;
     }
+    for (const timer of this.retryTimers.values()) window.clearTimeout(timer);
+    this.retryTimers.clear();
     this.chains.clear();
   }
 }

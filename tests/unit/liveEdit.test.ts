@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import * as Y from "yjs";
-import type { EditorView, ViewUpdate } from "@codemirror/view";
+import { EditorState, type TransactionSpec } from "@codemirror/state";
+import { EditorView, type ViewUpdate } from "@codemirror/view";
 import type * as EditorContext from "../../src/editor/context";
 
 const bind = vi.hoisted(() => ({ doc: null as any, requestSave: vi.fn() }));
@@ -11,7 +12,7 @@ vi.mock("../../src/editor/context", async (importOriginal) => ({
   requestSaveForEditor: bind.requestSave,
 }));
 
-import { LiveEditPluginValue } from "../../src/editor/LiveEdit";
+import { LiveEditPluginValue, liveEdit } from "../../src/editor/LiveEdit";
 
 /** `owner` is the editorInfoField value: Obsidian's MarkdownView, embed, … */
 function makeEditor(text: string, owner: object | null = null) {
@@ -496,5 +497,123 @@ describe("LiveEdit", () => {
     expect(editor.state.doc.toString()).toBe("shared text + typed");
     live.destroy();
     ydoc.destroy();
+  });
+
+  describe("incremental edits from a synchronized baseline", () => {
+    function sharedText(initial: string) {
+      const ydoc = new Y.Doc();
+      const ytext = ydoc.getText("contents");
+      ytext.insert(0, initial);
+      bind.doc = {
+        path: "note.md",
+        ytext,
+        isCreator: false,
+        hasSyncedOnce: true,
+        isProviderOnline: true,
+        bindEditor: () => {},
+        unbindEditor: () => {},
+        whenReady: () => Promise.resolve(),
+        isReady: () => true,
+        isDestroyed: () => false,
+        onDestroy: () => () => {},
+      };
+      return { ydoc, ytext };
+    }
+
+    it("keeps multiple editors synchronized through multi-range edits and remote changes", async () => {
+      const { ydoc, ytext } = sharedText("first\nmiddle 😀\nlast");
+      const a = new EditorView({ doc: ytext.toString(), extensions: [liveEdit] });
+      const b = new EditorView({ doc: ytext.toString(), extensions: [liveEdit] });
+      try {
+        await Promise.resolve();
+        a.dispatch({
+          changes: [
+            { from: 0, to: 5, insert: "FIRST!" },
+            { from: 16, to: 20, insert: "end" },
+          ],
+        });
+        b.dispatch({ changes: { from: 7, insert: "remote " } });
+        a.dispatch({ changes: { from: a.state.doc.length, insert: "\nmore" } });
+        const expected = "FIRST!\nremote middle 😀\nend\nmore";
+        expect(ytext.toString()).toBe(expected);
+        expect(a.state.doc.toString()).toBe(expected);
+        expect(b.state.doc.toString()).toBe(expected);
+      } finally {
+        a.destroy();
+        b.destroy();
+        ydoc.destroy();
+      }
+    });
+
+    it("does not duplicate a remote edit bundled with local typing", async () => {
+      const { ydoc, ytext } = sharedText("abc");
+      const editor = {
+        dom: document.createElement("div"),
+        state: EditorState.create({ doc: "abc" }),
+        dispatch(spec: TransactionSpec) {
+          this.state = this.state.update(spec).state;
+        },
+      };
+      const live = new LiveEditPluginValue(editor as unknown as EditorView);
+      try {
+        await Promise.resolve();
+        const startState = editor.state;
+        ytext.insert(0, "remote ");
+        const local = editor.state.update({
+          changes: { from: editor.state.doc.length, insert: "!" },
+        });
+        editor.state = local.state;
+        live.update({
+          docChanged: true,
+          startState,
+          state: local.state,
+          changes: startState.changes({ from: 0, insert: "remote " }).compose(local.changes),
+        } as ViewUpdate);
+        expect(ytext.toString()).toBe("remote abc!");
+        expect(editor.state.doc.toString()).toBe("remote abc!");
+      } finally {
+        live.destroy();
+        ydoc.destroy();
+      }
+    });
+
+    it("reconciles edits made inside a transaction whose shared changes are not observed yet", async () => {
+      const { ydoc, ytext } = sharedText("abc");
+      const editor = new EditorView({ doc: "abc", extensions: [liveEdit] });
+      try {
+        await Promise.resolve();
+        ydoc.transact(() => {
+          ytext.delete(0, 3);
+          ytext.insert(0, "xyz");
+          editor.dispatch({ changes: { from: 3, insert: "!" } });
+        });
+        expect(ytext.toString()).toBe("abc!");
+        expect(editor.state.doc.toString()).toBe("abc!");
+        editor.dispatch({ changes: { from: 0, insert: "next " } });
+        expect(ytext.toString()).toBe("next abc!");
+      } finally {
+        editor.destroy();
+        ydoc.destroy();
+      }
+    });
+
+    it("preserves emoji when a replacement changes only one surrogate code unit", async () => {
+      const { ydoc, ytext } = sharedText("x😀y");
+      const editor = new EditorView({ doc: "x😀y", extensions: [liveEdit] });
+      const peer = new Y.Doc();
+      try {
+        await Promise.resolve();
+        editor.dispatch({ changes: { from: 2, to: 3, insert: "\ude03" } });
+        editor.dispatch({ changes: { from: 4, insert: "!" } });
+        Y.applyUpdate(peer, Y.encodeStateAsUpdate(ydoc));
+        expect(editor.state.doc.toString()).toBe("x😃y!");
+        expect(ytext.toString()).toBe("x😃y!");
+        expect(peer.getText("contents").toString()).toBe("x😃y!");
+      } finally {
+        editor.destroy();
+        peer.destroy();
+        ydoc.destroy();
+      }
+    });
   });
 });

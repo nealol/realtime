@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type * as Y from "yjs";
 import { LocalSyncState } from "../../src/localSyncState";
 import { freshGuid } from "../support/util";
 
@@ -26,6 +27,63 @@ describe("LocalSyncState", () => {
         kind: "text",
         identity: "guid-1",
         fingerprint: "local-hash",
+        candidate: false,
+      });
+    } finally {
+      local.destroy();
+    }
+  });
+
+  it("writes nothing when markSynced repeats the recorded state", async () => {
+    const local = await state();
+    // The private persisted doc: its update stream is what an unchanged write costs.
+    const internals = local as unknown as { doc: Y.Doc };
+    let updates = 0;
+    internals.doc.on("update", () => (updates += 1));
+    const synced = (path: string, identity: string, fingerprint: string) => {
+      const before = updates;
+      local.markSynced(path, "config", identity, fingerprint);
+      return updates - before;
+    };
+    try {
+      // Legacy presence marker: upgraded once, then stable.
+      local.mark("legacy.json", "config");
+      expect(synced("legacy.json", "h1", "h1")).toBe(1);
+      expect(synced("legacy.json", "h1", "h1")).toBe(0);
+
+      // Own publish: the first sync drops `replacedIdentity` and keeps
+      // `publishedFrom`; repeating it changes nothing.
+      local.markPublished("own.json", "config", "h2", "h1");
+      expect(synced("own.json", "h2", "h2")).toBe(1);
+      expect(synced("own.json", "h2", "h2")).toBe(0);
+      expect(local.get("own.json")).toEqual({
+        kind: "config",
+        identity: "h2",
+        fingerprint: "h2",
+        candidate: false,
+        publishedFrom: "h1",
+      });
+
+      // A carried disk fingerprint is part of the unchanged state.
+      local.markDisk("own.json", "config", "h2", "disk");
+      expect(synced("own.json", "h2", "h2")).toBe(0);
+      expect(local.diskFingerprint("own.json", "h2")).toBe("disk");
+
+      // An unresolved candidate stays one without rewriting.
+      local.beginCandidate("pending.json", "config", null, "local");
+      expect(synced("pending.json", "h3", "h3")).toBe(1);
+      expect(synced("pending.json", "h3", "h3")).toBe(0);
+      expect(local.get("pending.json")).toMatchObject({
+        candidate: true,
+        candidateFingerprint: "local",
+      });
+
+      // A new identity still rewrites and drops identity-scoped fields.
+      expect(synced("own.json", "h4", "h4")).toBe(1);
+      expect(local.get("own.json")).toEqual({
+        kind: "config",
+        identity: "h4",
+        fingerprint: "h4",
         candidate: false,
       });
     } finally {

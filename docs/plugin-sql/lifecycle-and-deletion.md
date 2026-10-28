@@ -25,13 +25,19 @@ Always `close()` what you `open()`, e.g. in `onunload()`.
 The database lives in WASM memory and is mirrored to a local snapshot at:
 
 ```
-.obsidian/plugins/realtime/plugin-dbs/<pluginId>/<name>.snap
+.obsidian/plugins/realtime/plugin-dbs/server-<server>/vault-<vault>/<pluginId>/<name>.snap
 ```
 
 Snapshots are written on a short debounce after writes and on `close()`, using an
 atomic temp-write + replace. The snapshot stores the full `crsql_changes` dump —
 not plain user rows — so cr-sqlite's site ids, column clocks and tombstones
 survive a restart. This is why reopening never resurrects a deleted row.
+
+User-defined indexes, views, and triggers are stored alongside the table schema.
+They are recreated after the historical CRR changes are restored, so restoring
+a snapshot does not fire user triggers again. Older snapshots without these
+definitions recover them by running `migrate(tx, 0)` on a temporary database and
+copying the missing definitions, without discarding unpublished local changes.
 
 You never manage snapshots directly; the engine handles them. If a snapshot is
 corrupt, the engine discards it and bootstraps from the server (see below).

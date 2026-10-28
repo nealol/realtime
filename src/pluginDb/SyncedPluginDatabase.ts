@@ -19,7 +19,13 @@ import {
   base64ToBytes,
 } from "./crsqlite";
 import { PluginDbSync, type PluginDbDocHandle } from "./PluginDbSync";
-import { captureSnapshot, parseSnapshot, serializeSnapshot, restoreSnapshot } from "./snapshot";
+import {
+  captureSnapshot,
+  listSchemaObjects,
+  parseSnapshot,
+  serializeSnapshot,
+  restoreSnapshot,
+} from "./snapshot";
 import type {
   Batch,
   ChangeRow,
@@ -309,6 +315,7 @@ export class SyncedPluginDatabase {
       if (snap.schemaVersion < this.schemaVersion) {
         await this.runMigrate(snap.schemaVersion);
       }
+      if (snap.objects === undefined) await this.recoverSchemaObjects();
       return true;
     } catch (e) {
       console.warn(`[Realtime] snapshot restore failed for ${this.docId}; bootstrapping`, e);
@@ -316,6 +323,41 @@ export class SyncedPluginDatabase {
       await this.opts.deleteSnapshot().catch(() => {});
       await this.resetDb();
       return false;
+    }
+  }
+
+  /**
+   * Snapshots written before indexes, views and triggers were captured restore
+   * only tables and rows, and a same-version reopen never re-runs `migrate`.
+   * Rebuild the missing objects from what `migrate(0)` creates on a scratch
+   * database. The restored rows are already in place, so recreated triggers do
+   * not fire for them. Best effort: the data is intact without these objects,
+   * and failing the restore would discard the snapshot's unpublished edits.
+   */
+  private async recoverSchemaObjects(): Promise<void> {
+    const db = this.db!;
+    let scratch: DB | null = null;
+    try {
+      scratch = await openMemoryDb(this.sqlite!);
+      await this.runMigrateOn(scratch, 0);
+      const present = new Set(
+        (await listSchemaObjects(db)).map((o) => `${o.type}:${o.name.toLowerCase()}`),
+      );
+      for (const object of await listSchemaObjects(scratch)) {
+        if (present.has(`${object.type}:${object.name.toLowerCase()}`)) continue;
+        try {
+          await db.exec(object.sql);
+        } catch (e) {
+          console.warn(
+            `[Realtime] could not recreate ${object.type} ${object.name} for ${this.docId}`,
+            e,
+          );
+        }
+      }
+    } catch (e) {
+      console.warn(`[Realtime] could not recover indexes/views/triggers for ${this.docId}`, e);
+    } finally {
+      await scratch?.close().catch(() => {});
     }
   }
 

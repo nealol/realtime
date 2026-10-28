@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from "vitest";
+import { TFile } from "obsidian";
 import * as Y from "yjs";
 import { RealtimeProvider } from "../../src/sync/RealtimeProvider";
 import { BinarySync, type BinaryMeta } from "../../src/BinarySync";
@@ -1030,6 +1031,72 @@ describe("BinarySync", () => {
     } finally {
       bs.destroy();
       indexDoc.destroy();
+    }
+  });
+
+  it("deletes the source of a move made while the startup pass is still pulling", async () => {
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const moved = bytes([3, 1, 4, 1, 5]);
+    const slow = bytes([2, 7, 1, 8]);
+    const movedHash = await sha256Hex(moved);
+    const slowHash = await sha256Hex(slow);
+    const localState = new LocalSyncState(`binary-move-startup:${freshGuid()}`);
+    await localState.whenSynced;
+    // old.png was materialized on an earlier run; slow.png is new remotely.
+    localState.markSynced("old.png", "binary", movedHash, movedHash);
+    vault.binaries.set("old.png", moved);
+    const indexDoc = new Y.Doc();
+    const binaries = indexDoc.getMap<BinaryMeta>("binaries");
+    binaries.set("old.png", { hash: movedHash, size: 5 });
+    binaries.set("slow.png", { hash: slowHash, size: 4 });
+    const slowDownload = Promise.withResolvers<void>();
+    let slowStarted = false;
+    plugin.auth.getBlob = async (_vault: string, path: string) => {
+      if (path !== "slow.png") return moved;
+      slowStarted = true;
+      await slowDownload.promise;
+      return slow;
+    };
+    const trashed: Array<{ path: string }> = [];
+    const vaultSyncStub = {
+      isTextSyncBusy: () => false,
+      recordTrash: (entry: { path: string }) => trashed.push(entry),
+    };
+    // BinarySync only calls the two members above on its VaultSync.
+    const bs = new BinarySync(
+      plugin as unknown as RealtimePlugin,
+      vaultSyncStub as unknown as VaultSync,
+      indexDoc,
+      localState,
+    );
+    try {
+      bs.seedBaseline();
+      const startup = bs.reconcileAll(["old.png"]);
+      await waitFor(() => slowStarted, { label: "startup pull in flight" });
+
+      vault.binaries.delete("old.png");
+      vault.binaries.set("new.png", moved);
+      bs.onLocalRenamed(new TFile("new.png"), "old.png");
+
+      await waitFor(() => !binaries.has("old.png") && binaries.get("new.png")?.hash === movedHash, {
+        label: "move published",
+      });
+      slowDownload.resolve();
+      await startup;
+      await waitFor(() => vault.binaries.has("slow.png"), { label: "startup pull finished" });
+
+      expect(vault.binaries.has("old.png")).toBe(false);
+      expect(asArray(vault.binaries.get("new.png"))).toEqual([3, 1, 4, 1, 5]);
+      expect(binaries.has("old.png")).toBe(false);
+      expect(trashed.map((entry) => entry.path)).toEqual(["old.png"]);
+    } finally {
+      slowDownload.resolve();
+      bs.destroy();
+      indexDoc.destroy();
+      localState.destroy();
     }
   });
 });

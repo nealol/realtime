@@ -16,6 +16,7 @@ import { IndexeddbPersistence, clearDocument } from "y-indexeddb";
 import type RealtimePlugin from "../main";
 import { getClientToken } from "../sync/clientToken";
 import { createMuxSocket } from "../sync/mux";
+import { compatibilityGateFor } from "../sync/compatibilityGate";
 import { epochPersistenceName, epochStoreBaseName, getDocumentEpoch } from "../documentEpoch";
 import { CRSQLITE_WASM_DATA_URL } from "./wasmBinary";
 import type { PluginDbDocHandle } from "./PluginDbSync";
@@ -113,11 +114,12 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
   // Pin the epoch: after an epoch change this handle holds retired-epoch
   // state and must be replaced, never reconnected.
   const epoch = getDocumentEpoch(plugin, docId);
+  const connectionGate = compatibilityGateFor(plugin);
   const provider = new RealtimeProvider(
     docId,
     doc,
     () => getClientToken(plugin, docId, undefined, epoch),
-    { connect: false, socketFactory: createMuxSocket },
+    { connect: false, socketFactory: createMuxSocket, connectionGate },
   );
   // A database has no viewers to show presence to.
   provider.awareness.setLocalState(null);
@@ -147,7 +149,7 @@ function makeDocHandle(plugin: RealtimePlugin, docId: string): PluginDbDocHandle
   const connectAfterCapabilityCheck = async (): Promise<void> => {
     if (destroyed) return;
     try {
-      await plugin.auth.serverInfoChecked(plugin.settings.authServerUrl);
+      await connectionGate.ensure();
       if (destroyed) return;
       void provider.connect();
       await firstSyncedOrTimeout(provider, 3000);

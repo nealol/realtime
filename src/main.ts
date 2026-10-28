@@ -7,7 +7,7 @@ import { VaultSync, isConflictCopy } from "./VaultSync";
 import type { UploadStatus } from "./BinarySync";
 import { matchesAnyGlob, parseGlobs } from "./glob";
 import type { SyncedDoc } from "./SyncedDoc";
-import { AuthClient, AuthError, normalizeServerUrl } from "./auth";
+import { AuthClient, AuthError, normalizeServerUrl, type AuthenticatedSession } from "./auth";
 
 import { PLUGIN_NAME } from "./brand";
 import { liveEdit } from "./editor/LiveEdit";
@@ -53,10 +53,11 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   auth!: AuthClient;
   vaultSync: VaultSync | null = null;
   /**
-   * Last compatibility-gating failure from `Auth.serverInfoChecked`, or `null`
-   * when the last check passed (or the server was lenient/old). Non-persisted:
-   * updated by auth on every server-info fetch, read by the settings banner.
-   * Not saved to settings — it reflects the live server, not user config.
+   * Last compatibility-gating failure of the ACTIVE server from
+   * `Auth.serverInfoChecked`, or `null` when its last check passed. Checks of
+   * candidate servers (sign-in, migration) never change it. Non-persisted:
+   * read by the settings banner and sync gates; it reflects the live server,
+   * not user config.
    */
   lastCompatibilityError: {
     reason: "server-incompatible" | "client-too-old";
@@ -96,6 +97,14 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   private epochRestartPending = false;
   private epochRestartRunning = false;
   private unloading = false;
+  /**
+   * Sync lifecycle generation. Every stop (unload, logout, reload, vault or
+   * server switch, epoch restart) bumps it; an asynchronous start only
+   * constructs sync while the generation it began under is still current.
+   */
+  private lifecycleGeneration = 0;
+  /** Transitions (logout, vault/server switch) running with sync held stopped. */
+  private lifecycleHolds = 0;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -125,7 +134,10 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     this.registerObsidianProtocolHandler("realtime-auth", (params) => {
       void (async () => {
         try {
-          await this.auth.handleProtocol(params as Record<string, string>);
+          // A token for an in-flight sign-in (setup, server migration) is
+          // handed to that flow, which commits it and restarts sync itself.
+          const me = await this.auth.handleProtocol(params as Record<string, string>);
+          if (!me) return;
           new Notice(`${PLUGIN_NAME}: signed in.`);
           await this.onLoggedIn();
         } catch (e) {
@@ -304,8 +316,33 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
 
   // --- Sync lifecycle --------------------------------------------------------
 
-  /** Start syncing only when enabled, signed in, and bound to a vault. */
-  private async maybeStartSync(): Promise<void> {
+  /** Whether a lifecycle step begun at `generation` may still act. */
+  private isCurrentLifecycle(generation: number): boolean {
+    return !this.unloading && this.lifecycleHolds === 0 && generation === this.lifecycleGeneration;
+  }
+
+  /**
+   * Stop sync and keep any start from beginning or resuming until `body`
+   * settles, so a transition's intermediate state (half-cleared session, a
+   * vault being wiped or rebound) is never synced. Callers restart afterwards.
+   */
+  private async withSyncStopped<T>(body: () => Promise<T>): Promise<T> {
+    this.stopSync();
+    this.lifecycleHolds++;
+    try {
+      return await body();
+    } finally {
+      this.lifecycleHolds--;
+    }
+  }
+
+  /**
+   * Start syncing only when enabled, signed in, and bound to a vault. A
+   * transition that stops sync while this awaits (unload, logout, reload, …)
+   * supersedes it: it then neither constructs sync nor reports status.
+   */
+  private async maybeStartSync(generation = this.lifecycleGeneration): Promise<void> {
+    if (!this.isCurrentLifecycle(generation)) return;
     if (!this.settings.enabled) {
       this.setStatus("offline");
       return;
@@ -320,6 +357,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     try {
       await this.auth.ensureServerId();
     } catch (error) {
+      if (!this.isCurrentLifecycle(generation)) return;
       if (error instanceof CompatibilityError) {
         this.setStatus("offline");
         return;
@@ -328,17 +366,26 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
       // VaultSync independently gates every provider connection on a
       // successful server-info capability check.
     }
+    if (!this.isCurrentLifecycle(generation)) return;
     // Validate the session; a 401 clears it. Other (network) errors are
     // tolerated so we can still start and let the providers retry.
     try {
       await this.auth.me();
     } catch (e) {
+      if (!this.isCurrentLifecycle(generation)) return;
       if (e instanceof AuthError) {
         this.setStatus("signin");
         return;
       }
     }
-    if (!this.settings.activeVaultId) {
+    if (!this.isCurrentLifecycle(generation)) return;
+    // Preconditions can change without a lifecycle transition while the
+    // checks above await (e.g. a rejected session cleared by another request).
+    if (!this.settings.enabled) {
+      this.setStatus("offline");
+      return;
+    }
+    if (!this.auth.isLoggedIn || !this.settings.activeVaultId) {
       this.setStatus("signin");
       return;
     }
@@ -346,7 +393,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   }
 
   private startSync(): void {
-    if (this.vaultSync) return;
+    if (this.vaultSync || this.unloading) return;
     if (!this.settings.activeVaultId) {
       this.setStatus("signin");
       return;
@@ -357,11 +404,14 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
     this.updateLocalAwareness();
   }
 
-  private stopSync(): void {
+  /** Stop sync and supersede every pending start; returns the new generation. */
+  private stopSync(): number {
+    const generation = ++this.lifecycleGeneration;
     this.vaultSync?.destroy();
     this.vaultSync = null;
     this.uploadStatus = "idle";
     this.setStatus("offline");
+    return generation;
   }
 
   /**
@@ -427,8 +477,7 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
         try {
           // Plugin databases keep their own documents and epochs, so their
           // handles stay open across a vault index restart.
-          this.stopSync();
-          await this.maybeStartSync();
+          await this.maybeStartSync(this.stopSync());
           new Notice(`${PLUGIN_NAME}: document history was compacted; sync reconnected.`);
         } catch (error) {
           console.error(`[${PLUGIN_NAME}] restart after an epoch change failed`, error);
@@ -460,27 +509,55 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   }
 
   async reloadSync(): Promise<void> {
-    this.stopSync();
+    const generation = this.stopSync();
     await this.sqlApi.reconcileLifecycle();
-    await this.maybeStartSync();
+    await this.maybeStartSync(generation);
   }
 
   // --- Auth / onboarding -----------------------------------------------------
 
-  /** Called after a successful login; prompts onboarding when no vault is set. */
+  /**
+   * Called after a session is committed: restarts sync for the new session,
+   * or leaves it stopped (status "sign in") until a vault is chosen.
+   */
   async onLoggedIn(): Promise<void> {
-    if (!this.settings.activeVaultId) {
-      this.setStatus("signin");
-    } else {
-      await this.reloadSync();
-    }
+    await this.reloadSync();
   }
 
   async logout(): Promise<void> {
-    this.stopSync();
-    await this.sqlApi.resetForLifecycle();
-    await this.auth.logout();
+    await this.withSyncStopped(async () => {
+      await this.sqlApi.resetForLifecycle();
+      await this.auth.logout();
+    });
     this.setStatus("signin");
+  }
+
+  /**
+   * Move this vault to another server: commit the validated SSO session and
+   * the matching remote vault together, then restart sync once against them.
+   * A stale (cancelled or superseded) session leaves everything untouched.
+   */
+  private async switchServer(session: AuthenticatedSession, vaultId: string): Promise<void> {
+    this.auth.assertCurrentLogin(session);
+    await this.withSyncStopped(() => this.auth.commitSession(session, vaultId));
+    await this.reloadSync();
+  }
+
+  /**
+   * Server migration: sign in to `serverUrl` through SSO and switch to it only
+   * if it has a remote vault named like this local vault. Until then nothing
+   * active changes — a failure or `signal` abort leaves the current server,
+   * account, vault binding, and running sync as they were.
+   */
+  async migrateToServer(serverUrl: string, signal: AbortSignal): Promise<void> {
+    const session = await this.auth.authenticateAt(serverUrl, signal);
+    const vaultName = this.app.vault.getName();
+    const vaults = await this.auth.listVaultsAt(session.serverUrl, session.token);
+    const match = vaults.find((vault) => vault.name === vaultName);
+    if (!match) {
+      throw new Error(`No remote vault named "${vaultName}" was found on that server.`);
+    }
+    await this.switchServer(session, match.id);
   }
 
   private async openRealtimeLink(params: Record<string, string>): Promise<void> {
@@ -691,10 +768,11 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   /** Create a new server vault from the current local files and start syncing it. */
   async createAndActivateVault(name: string): Promise<void> {
     const vault = await this.auth.createVault(name);
-    this.stopSync();
-    await this.sqlApi.resetForLifecycle();
-    this.settings.activeVaultId = vault.id;
-    await this.saveSettings();
+    await this.withSyncStopped(async () => {
+      await this.sqlApi.resetForLifecycle();
+      this.settings.activeVaultId = vault.id;
+      await this.saveSettings();
+    });
     // runInitialSync seeds the empty remote index from the local Markdown files.
     await this.reloadSync();
   }
@@ -708,11 +786,12 @@ export default class RealtimePlugin extends Plugin implements RealtimePluginApi 
   async adoptVault(vaultId: string, name: string): Promise<void> {
     if (vaultId === this.settings.activeVaultId && this.vaultSync) return;
 
-    this.stopSync();
-    await this.sqlApi.resetForLifecycle();
-    await this.wipeLocalSyncedFiles();
-    this.settings.activeVaultId = vaultId;
-    await this.saveSettings();
+    await this.withSyncStopped(async () => {
+      await this.sqlApi.resetForLifecycle();
+      await this.wipeLocalSyncedFiles();
+      this.settings.activeVaultId = vaultId;
+      await this.saveSettings();
+    });
     await this.reloadSync();
     new Notice(`${PLUGIN_NAME}: adopting "${name}"…`);
   }
@@ -859,9 +938,6 @@ function sanitizeSettings(raw: unknown): RealtimeSettings {
 
   settings.authServerUrl = sanitizeUrl(data.authServerUrl, defaults.authServerUrl);
   settings.authServerId = typeof data.authServerId === "string" ? data.authServerId.trim() : "";
-  settings.pendingSetupServerUrl = data.pendingSetupServerUrl
-    ? sanitizeUrl(data.pendingSetupServerUrl, "")
-    : "";
   settings.userId = typeof data.userId === "string" ? data.userId : "";
   settings.userDisplayName = typeof data.userDisplayName === "string" ? data.userDisplayName : "";
   settings.userEmail = typeof data.userEmail === "string" ? data.userEmail : "";

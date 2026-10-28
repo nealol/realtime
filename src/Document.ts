@@ -56,8 +56,6 @@ export class Document extends SyncedDoc {
   private localChangedAtStartup = false;
   /** Guards the one-time startup merge so reconnects don't re-run it. */
   private startupReconciled = false;
-  /** True only after startup content is durably present on this device. */
-  private startupReady = false;
   private startupReconciling = false;
   private forceBootstrapConflict: boolean;
   private readonly staleLocalFingerprint: string | null;
@@ -94,6 +92,10 @@ export class Document extends SyncedDoc {
 
   protected serializeRecoveryContent(): string {
     return this.content;
+  }
+
+  protected materializedKind(): "text" {
+    return "text";
   }
 
   bindEditor(): void {
@@ -286,7 +288,7 @@ export class Document extends SyncedDoc {
       if (!materialized || this.destroyed) return;
 
       this.startupReady = true;
-      if (!this.provider.hasLocalChanges) await this.recordAcknowledgedContent(true);
+      await this.recordAcknowledgedContent();
       completed = true;
     } catch (e) {
       console.error(`[Realtime] startup reconcile failed for ${this.path}`, e);
@@ -298,31 +300,6 @@ export class Document extends SyncedDoc {
         window.setTimeout(() => void this.finishStartupReconcile(), DISK_WRITE_RETRY_MS);
       }
     }
-  }
-
-  protected async afterChangesSynced(): Promise<void> {
-    if (!this.startupReady || this.destroyed) return;
-    await this.recordAcknowledgedContent(true);
-  }
-
-  private async recordAcknowledgedContent(reconciled = false): Promise<void> {
-    const content = this.content;
-    const fingerprint = await sha256Text(content);
-    if (
-      this.destroyed ||
-      this.provider.hasLocalChanges ||
-      this.content !== content ||
-      !this.startupReady
-    ) {
-      return;
-    }
-    this.plugin.vaultSync?.noteContentAcknowledged(
-      this.path,
-      "text",
-      this.guid,
-      fingerprint,
-      reconciled,
-    );
   }
 
   private applyText(text: string): void {
@@ -380,6 +357,7 @@ export class Document extends SyncedDoc {
   }
 
   private onYTextChanged(): void {
+    this.noteContentChanged();
     if (this.destroyed) return;
     if (!this.startupBaselineCaptured || !this.startupReady) return;
     // Note text-sync activity so the binary upload queue can defer large
@@ -589,9 +567,7 @@ export class Document extends SyncedDoc {
         if (current === text) {
           this.noteDiskContent(text);
           this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
-          if (this.startupReady && !this.provider.hasLocalChanges) {
-            await this.recordAcknowledgedContent(true);
-          }
+          await this.recordAcknowledgedContent();
           return true;
         }
         if (this.hasBoundEditor || this.isOpenInEditableMarkdown()) {
@@ -651,9 +627,7 @@ export class Document extends SyncedDoc {
       if (this.destroyed) return false;
       this.noteDiskContent(text);
       this.plugin.vaultSync?.noteMaterialized(this.path, "text", this.guid);
-      if (this.startupReady && !this.provider.hasLocalChanges) {
-        await this.recordAcknowledgedContent(true);
-      }
+      await this.recordAcknowledgedContent();
       return true;
     } catch (e) {
       console.error(`[Realtime] writeToDisk failed for ${this.path}`, e);

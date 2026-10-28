@@ -13,12 +13,17 @@ import { TFile, TAbstractFile, Notice, Platform, type EventRef } from "obsidian"
 import type RealtimePlugin from "./main";
 import { getClientToken } from "./sync/clientToken";
 import { createMuxSocket } from "./sync/mux";
+import { compatibilityGateFor } from "./sync/compatibilityGate";
 import { epochPersistenceName, epochStoreBaseName, getDocumentEpoch } from "./documentEpoch";
 import { Document } from "./Document";
 import { CanvasDocument } from "./CanvasDocument";
 import { BaseDocument } from "./BaseDocument";
 import type { StructuredDocument } from "./StructuredDocument";
-import type { DocumentBootstrapOptions, SyncedDoc } from "./SyncedDoc";
+import {
+  storedContentFingerprint,
+  type DocumentBootstrapOptions,
+  type SyncedDoc,
+} from "./SyncedDoc";
 import { BinarySync, type BinaryMeta } from "./BinarySync";
 import { ConfigSync, type ConfigMeta } from "./ConfigSync";
 import { categoryForConfigPath, enabledConfigCategories } from "./configCategories";
@@ -187,6 +192,11 @@ export class VaultSync {
   private remoteDeletesApplying = new Set<string>();
   /** Old path → new path for remote renames being applied to the vault. */
   private remoteRenamesApplying = new Map<string, string>();
+  /**
+   * Unpublished document path → the tracked binary path its file was renamed
+   * from. The binary entry is replaced only once that document is published.
+   */
+  private binaryRenameSources = new Map<string, string>();
   /** Last explicit user/local activity per path; used for mobile LRU eviction. */
   private mobileLastUsedAt = new Map<string, number>();
   private mobileTrimTimer: number | null = null;
@@ -241,6 +251,7 @@ export class VaultSync {
       {
         connect: false,
         socketFactory: createMuxSocket,
+        connectionGate: compatibilityGateFor(plugin),
         // Only mobile evicts documents and reloads them on invalidation; the
         // server otherwise sends one per write anywhere in the vault.
         ...(Platform?.isMobile ? {} : { socketParams: { invalidations: "0" } }),
@@ -331,9 +342,14 @@ export class VaultSync {
     if (!this.mobileSuspended) void this.connectIndexAfterCompatibilityCheck();
   }
 
+  /**
+   * Verify the server's capability contract afresh, then open the index. The
+   * verification is shared with every document provider (see
+   * {@link compatibilityGateFor}), which waits for it before connecting.
+   */
   private async connectIndexAfterCompatibilityCheck(): Promise<void> {
     try {
-      await this.plugin.auth.serverInfoChecked(this.plugin.settings.authServerUrl);
+      await compatibilityGateFor(this.plugin).verify();
       if (this.destroyed || this.mobileSuspended) return;
       this.scheduleMobileWorkingSetTrim();
       await this.indexProvider.connect();
@@ -465,6 +481,22 @@ export class VaultSync {
       void this.connectIndexAfterCompatibilityCheck();
     }
     if (Platform?.isMobile) return;
+    void this.reconnectDocumentsWhenCompatible();
+  }
+
+  /**
+   * Wake document providers only once the server is verified compatible. The
+   * shared gate answers from its remembered result, so this periodic nudge
+   * costs at most one server-info request per verification, not one per
+   * document; while the server is known incompatible nothing is woken.
+   */
+  private async reconnectDocumentsWhenCompatible(): Promise<void> {
+    try {
+      await compatibilityGateFor(this.plugin).ensure();
+    } catch {
+      return;
+    }
+    if (this.destroyed || this.mobileSuspended) return;
     for (const doc of this.documents.values()) doc.ensureConnected();
     for (const doc of this.structuredDocuments.values()) doc.ensureConnected();
     this.pumpDocQueue();
@@ -905,7 +937,9 @@ export class VaultSync {
       const renamedFrom = this.bootstrapLog.renamedFrom(path);
       if (
         renamedFrom !== null &&
-        (this.files.has(renamedFrom) || this.structured.has(renamedFrom))
+        (this.files.has(renamedFrom) ||
+          this.structured.has(renamedFrom) ||
+          this.binarySync.hasPath(renamedFrom))
       ) {
         continue;
       }
@@ -1413,28 +1447,19 @@ export class VaultSync {
         return;
       }
       if (file instanceof TFile && !this.remoteDeletePreserved.has(path)) {
-        const textDocument = this.documents.get(path);
-        const structuredDocument = this.structuredDocuments.get(path);
-        const content =
-          kind === "text" && textDocument
-            ? textDocument.content
-            : kind === "canvas" && structuredDocument instanceof CanvasDocument
-              ? structuredDocument.canvasText()
-              : kind === "base" && structuredDocument instanceof BaseDocument
-                ? structuredDocument.baseData()
-                : await this.plugin.app.vault.read(file);
-        if (this.destroyed || wasReintroduced()) return;
-        const fingerprint = await sha256Text(content);
-        if (this.destroyed || wasReintroduced()) return;
-        const acknowledged = deletedIdentity
-          ? this.localSyncState.acknowledgedFingerprint(path, deletedIdentity)
-          : null;
-        if (fingerprint !== acknowledged) {
-          const preservedPath = await preserveTextConflict(this.plugin, path, content, "local");
-          if (this.destroyed || wasReintroduced()) return;
+        const preservedPaths = await this.preserveUnacknowledgedVersions(
+          path,
+          kind,
+          deletedIdentity,
+          wasReintroduced,
+        );
+        if (preservedPaths === null) return;
+        if (preservedPaths.length > 0) {
           this.remoteDeletePreserved.add(path);
+          const copies = preservedPaths.map((preserved) => `"${preserved}"`).join(", ");
           new Notice(
-            `Realtime: "${path}" was deleted remotely; preserved your local version as "${preservedPath}".`,
+            `Realtime: "${path}" was deleted remotely; preserved your local ` +
+              `${preservedPaths.length === 1 ? "version" : "versions"} as ${copies}.`,
           );
         }
       }
@@ -1466,6 +1491,86 @@ export class VaultSync {
         window.setTimeout(() => void this.handleRemoteDelete(path, kind, deletedIdentity), 2_000);
       }
     }
+  }
+
+  /**
+   * Before a remote delete removes `path`, copy aside every distinct local
+   * version the server never acknowledged for the deleted identity: the
+   * resident document's content (which can hold unsaved editor edits) and
+   * the file on disk. They can differ: before a document's startup reconcile
+   * its CRDT holds only the acknowledged baseline while the file holds edits
+   * made offline. A version equal to the acknowledged content is not copied,
+   * nor is a file that merely lags its resident document. Both sources are
+   * re-checked after each (awaited) copy, so an edit that lands meanwhile is
+   * preserved too. Resolves the copies' paths, or null when the delete no
+   * longer applies.
+   */
+  private async preserveUnacknowledgedVersions(
+    path: string,
+    kind: "text" | StructuredKind,
+    deletedIdentity: string | null,
+    wasReintroduced: () => boolean,
+  ): Promise<string[] | null> {
+    const handled = new Set<string>();
+    const acknowledged = deletedIdentity
+      ? this.localSyncState.acknowledgedFingerprint(path, deletedIdentity)
+      : null;
+    if (acknowledged) handled.add(acknowledged);
+    const preservedPaths: string[] = [];
+    const aborted = () => this.destroyed || wasReintroduced();
+    for (;;) {
+      let pending: string | null = null;
+      const resident = this.residentContent(path, kind);
+      if (resident !== null) {
+        const fingerprint = await sha256Text(resident.content);
+        if (aborted()) return null;
+        if (!handled.has(fingerprint)) pending = resident.content;
+      }
+      const file = this.plugin.app.vault.getAbstractFileByPath(path);
+      if (pending === null && file instanceof TFile) {
+        const disk = await this.plugin.app.vault.read(file);
+        if (aborted()) return null;
+        const fingerprint = await sha256Text(disk);
+        if (aborted()) return null;
+        if (!handled.has(fingerprint)) {
+          // The resident document's store already holds this file's content:
+          // the file only lags it (e.g. an interrupted write), and the
+          // document's own content is what gets preserved.
+          const lagging =
+            resident !== null &&
+            resident.guid === deletedIdentity &&
+            this.localSyncState.diskFingerprint(path, resident.guid) ===
+              (await storedContentFingerprint(resident.epoch, disk));
+          if (aborted()) return null;
+          if (lagging) handled.add(fingerprint);
+          else pending = disk;
+        }
+      }
+      if (pending === null) return preservedPaths;
+      handled.add(await sha256Text(pending));
+      const preservedPath = await preserveTextConflict(this.plugin, path, pending, "local");
+      if (aborted()) return null;
+      preservedPaths.push(preservedPath);
+    }
+  }
+
+  /** Content of the resident document of `kind` at `path`, if one is loaded. */
+  private residentContent(
+    path: string,
+    kind: "text" | StructuredKind,
+  ): { content: string; guid: string; epoch: number } | null {
+    if (kind === "text") {
+      const doc = this.documents.get(path);
+      return doc ? { content: doc.content, guid: doc.guid, epoch: doc.epoch } : null;
+    }
+    const doc = this.structuredDocuments.get(path);
+    if (kind === "canvas" && doc instanceof CanvasDocument) {
+      return { content: doc.canvasText(), guid: doc.guid, epoch: doc.epoch };
+    }
+    if (kind === "base" && doc instanceof BaseDocument) {
+      return { content: doc.baseData(), guid: doc.guid, epoch: doc.epoch };
+    }
+    return null;
   }
 
   /**
@@ -1943,6 +2048,10 @@ export class VaultSync {
 
   /** Publish the user's deletion of the file at `path`. */
   private applyLocalDeletion(path: string): void {
+    // A binary moved here and deleted before its new document was published:
+    // the net effect is deleting the binary.
+    const binarySource = this.takeBinaryRenameSource(path);
+    if (binarySource) this.binarySync.onLocalDeleted(binarySource);
     this.localSyncState.remove(path);
     this.bumpPathVersion(path);
     const clearLocalStore = this.deletedStoreDisposable(path);
@@ -1988,6 +2097,14 @@ export class VaultSync {
     void this.handleLocalRename(file, oldPath);
   }
 
+  /** Hand over the binary a still-unpublished document at `path` was renamed from. */
+  private takeBinaryRenameSource(path: string): string | null {
+    const source = this.binaryRenameSources.get(path);
+    if (source === undefined) return null;
+    this.binaryRenameSources.delete(path);
+    return source;
+  }
+
   private async handleLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
     if (this.destroyed || !this.initialSynced || !(file instanceof TFile)) return;
     const newPath = file.path;
@@ -2003,17 +2120,27 @@ export class VaultSync {
     const oldStructured = isStructuredMeta(oldStructuredMeta)
       ? oldStructuredMeta
       : this.structuredDocuments.get(oldPath);
+    // A tracked binary renamed to a note/Canvas/Base, possibly through further
+    // renames before the new document was published.
+    const binarySource =
+      this.takeBinaryRenameSource(oldPath) ??
+      (!wasTracked && !wasStructuredTracked && this.binarySync.hasPath(oldPath) ? oldPath : null);
     this.removeDocument(oldPath);
     this.removeStructuredDocument(oldPath);
 
     const kind = this.classify(file);
     const oldLocalState = this.localSyncState.get(oldPath);
-    if (kind === "text") {
-      this.localSyncState.move(oldPath, newPath, "text");
+    const structuredKind =
+      kind === "structured" ? this.structuredKindForExtension(file.extension) : null;
+    const documentKind = kind === "text" ? "text" : structuredKind;
+    if (documentKind) {
+      // A binary's baseline stays on its old path until the new document is
+      // published and replaces the binary entry; the new path then starts as
+      // an independent candidate (begun below, with its document's guid).
+      const keepBinaryBaseline = binarySource !== null && oldLocalState?.kind === "binary";
+      if (!keepBinaryBaseline) this.localSyncState.move(oldPath, newPath, documentKind);
     } else if (kind === "structured") {
-      const structuredKind = this.structuredKindForExtension(file.extension);
-      if (structuredKind) this.localSyncState.move(oldPath, newPath, structuredKind);
-      else this.localSyncState.remove(oldPath);
+      this.localSyncState.remove(oldPath);
     } else if (kind === "binary") {
       // Keep a binary baseline on the old path until BinarySync publishes the
       // delete. The new path is an independent first-write candidate.
@@ -2023,14 +2150,30 @@ export class VaultSync {
       // the process stops before BinarySync publishes the delete.
       if (oldLocalState?.kind !== "binary") this.localSyncState.remove(oldPath);
     }
+    if (documentKind && binarySource !== null) {
+      // Peers (and this device after a restart) keep the binary until the
+      // new document is durable on the server; publishing it replaces the
+      // binary entry in the same index transaction.
+      this.binarySync.holdMovedPath(binarySource);
+      this.binaryRenameSources.set(newPath, binarySource);
+    }
+    const releaseBinarySource = () => {
+      if (binarySource === null) return;
+      if (this.binaryRenameSources.get(newPath) === binarySource) {
+        this.binaryRenameSources.delete(newPath);
+      }
+      this.binarySync.releaseMovedPath(binarySource);
+    };
     if (kind === "text") {
       const finalGuid = guid ?? newGuid();
+      if (binarySource !== null) this.localSyncState.beginCandidate(newPath, "text", finalGuid);
       const doc = this.ensureDocument(newPath, finalGuid, !wasTracked);
       const publish = () => {
         this.indexDoc.transact(() => {
           if (wasTracked) this.files.delete(oldPath);
           if (wasStructuredTracked) this.structured.delete(oldPath);
           this.files.set(newPath, finalGuid);
+          releaseBinarySource();
         });
         this.registerFile(newPath, finalGuid);
       };
@@ -2045,17 +2188,11 @@ export class VaultSync {
       }
       publish();
     } else if (kind === "structured") {
-      const structuredKind = this.structuredKindForExtension(file.extension);
-      if (!structuredKind) {
-        if (wasTracked || wasStructuredTracked) {
-          this.indexDoc.transact(() => {
-            if (wasTracked) this.files.delete(oldPath);
-            if (wasStructuredTracked) this.structured.delete(oldPath);
-          });
-        }
-        return;
-      }
+      if (!structuredKind) return;
       const finalGuid = oldStructured?.guid ?? newGuid();
+      if (binarySource !== null) {
+        this.localSyncState.beginCandidate(newPath, structuredKind, finalGuid);
+      }
       const doc = this.ensureStructuredDocument(
         newPath,
         finalGuid,
@@ -2067,6 +2204,7 @@ export class VaultSync {
           if (wasTracked) this.files.delete(oldPath);
           if (wasStructuredTracked) this.structured.delete(oldPath);
           this.structured.set(newPath, { guid: finalGuid, kind: structuredKind });
+          releaseBinarySource();
         });
         this.registerFile(newPath, finalGuid);
       };
@@ -2090,8 +2228,9 @@ export class VaultSync {
           if (wasStructuredTracked) this.structured.delete(oldPath);
         });
       }
-      // Reconcile both old (now gone) and new paths on the binary side.
-      this.binarySync.onLocalRenamed(file, oldPath);
+      // Reconcile both old (now gone) and new paths on the binary side. A
+      // binary that went through a note path before this keeps its identity.
+      this.binarySync.onLocalRenamed(file, binarySource ?? oldPath);
     } else {
       if (wasTracked || wasStructuredTracked) {
         this.indexDoc.transact(() => {
@@ -2100,7 +2239,7 @@ export class VaultSync {
         });
       }
       // Renamed to an ignored path: ensure any old binary entry is dropped.
-      this.binarySync.onLocalDeleted(oldPath);
+      this.binarySync.onLocalDeleted(binarySource ?? oldPath);
     }
   }
 
@@ -2174,8 +2313,14 @@ export class VaultSync {
               this.applyLocalDeletion(step.path);
               break;
             case "rename":
-              // A rename from a path the index never tracked is just a new file.
-              if (this.files.has(step.from) || this.structured.has(step.from)) {
+              // A rename from a path the index never tracked is just a new
+              // file. A tracked binary's old path must be released (or
+              // deleted) too, or the startup pull would restore it.
+              if (
+                this.files.has(step.from) ||
+                this.structured.has(step.from) ||
+                this.binarySync.hasPath(step.from)
+              ) {
                 await this.handleLocalRename(step.file, step.from);
               } else {
                 await this.handleLocalCreate(step.file);

@@ -7,6 +7,7 @@ import { DocumentEpochPendingError, clientTokenExpired, type ClientToken } from 
 import { handleEpochProposal } from "../documentEpoch";
 import { createAwareness } from "./awareness";
 import { HttpError } from "../httpError";
+import type { ConnectionGate } from "./compatibilityGate";
 
 const MESSAGE_SYNC = 0;
 const MESSAGE_AWARENESS = 1;
@@ -105,6 +106,13 @@ export interface RealtimeProviderOptions {
   onReadOnlyUpdate?: (update: Uint8Array) => void;
   /** Extra query parameters for the document socket URL. */
   socketParams?: Record<string, string>;
+  /**
+   * Prerequisite for contacting the server at all: awaited before every token
+   * mint, and re-checked before every socket attempt (a cached token is reused
+   * across attempts). Invalidated when an established connection drops, since
+   * the server may have been replaced (e.g. upgraded) before the reconnect.
+   */
+  connectionGate?: ConnectionGate;
 }
 
 type TokenSource = () => Promise<ClientToken>;
@@ -143,6 +151,7 @@ export class RealtimeProvider {
   private readonly socketFactory: SyncSocketFactory;
   private readonly onReadOnlyUpdate?: (update: Uint8Array) => void;
   private readonly socketParams: Record<string, string>;
+  private readonly connectionGate: ConnectionGate | null;
   private socket: SyncSocket | null = null;
   private connectTask: Promise<void> | null = null;
   private connectTaskLifecycle = -1;
@@ -152,6 +161,8 @@ export class RealtimeProvider {
   private destroyed = false;
   private retries = 0;
   private tokenFailures = 0;
+  /** Connection-gate refusals in a row, for backoff. */
+  private gateFailures = 0;
   /** The server refused the current attempt's token; it will never open this document. */
   private tokenRejected = false;
   /** Tokens refused in a row, so a server that refuses every token is not hammered. */
@@ -220,6 +231,7 @@ export class RealtimeProvider {
     this.socketFactory = options.socketFactory ?? defaultSocketFactory;
     this.onReadOnlyUpdate = options.onReadOnlyUpdate;
     this.socketParams = options.socketParams ?? {};
+    this.connectionGate = options.connectionGate ?? null;
     this.document.on("update", this.documentUpdateListener);
     this.awareness.on("update", this.awarenessUpdateListener);
     if (options.connect !== false) void this.connect();
@@ -328,6 +340,24 @@ export class RealtimeProvider {
   private async runConnectLoop(lifecycle: number): Promise<void> {
     this.setStatus(SYNC_STATUS_CONNECTING);
     while (this.canContinue(lifecycle) && this.status !== SYNC_STATUS_CONNECTED) {
+      if (this.connectionGate) {
+        try {
+          await this.connectionGate.ensure();
+          this.gateFailures = 0;
+        } catch (error) {
+          if (!this.canContinue(lifecycle)) return;
+          // No token, no socket: the server has not proved it speaks this
+          // client's protocol. The gate rate-limits its own checks, so this
+          // sleep only bounds how often the loop asks it again.
+          this.setStatus(SYNC_STATUS_ERROR);
+          this.lastConnectionError = error instanceof Error ? error.message : String(error);
+          const delay = Math.min(MAX_TOKEN_RETRY_MS, TOKEN_RETRY_MS * 2 ** this.gateFailures);
+          this.gateFailures += 1;
+          await this.sleep(delay, lifecycle);
+          continue;
+        }
+        if (!this.canContinue(lifecycle)) return;
+      }
       let token: ClientToken;
       try {
         token = await this.ensureClientToken();
@@ -356,7 +386,14 @@ export class RealtimeProvider {
       }
       if (!this.canContinue(lifecycle)) return;
 
+      let gateClosed = false;
       for (let attempt = 0; attempt < SOCKET_RETRIES_PER_TOKEN; attempt += 1) {
+        // The gate may have closed while the token was minted or between
+        // attempts; the outer loop then waits for it to verify again.
+        if (this.connectionGate && !this.connectionGate.isOpen()) {
+          gateClosed = true;
+          break;
+        }
         this.tokenRejected = false;
         const connected = await this.attemptConnection(token, lifecycle);
         if (!this.canContinue(lifecycle) || connected) {
@@ -374,6 +411,7 @@ export class RealtimeProvider {
         await this.sleep(this.reconnectDelay(), lifecycle);
         if (!this.canContinue(lifecycle)) return;
       }
+      if (gateClosed) continue;
       this.clientToken = null;
       if (this.tokenRejected) {
         this.tokenRejections += 1;
@@ -465,6 +503,10 @@ export class RealtimeProvider {
     };
     socket.onmessage = (event) => {
       if (!this.isCurrentSocket(socket, lifecycle)) return;
+      if (this.connectionGate?.blocksTraffic()) {
+        this.failSocket(socket, lifecycle, "server is incompatible");
+        return;
+      }
       try {
         this.receiveMessage(toUint8Array(event.data));
         this.clearResponseTimeout();
@@ -503,6 +545,11 @@ export class RealtimeProvider {
 
   private failSocket(socket: SyncSocket, lifecycle: number, reason: string): void {
     if (this.socket !== socket) return;
+    if (this.status === SYNC_STATUS_CONNECTED && !this.connectionGate?.blocksTraffic()) {
+      // An established connection was lost: the server may come back as a
+      // different (upgraded) release, so verify it before reconnecting.
+      this.connectionGate?.invalidate();
+    }
     this.lastConnectionError = reason;
     this.socket = null;
     // The acknowledgement can only travel on this socket. A reconnect learns
@@ -553,6 +600,14 @@ export class RealtimeProvider {
   private send(message: Uint8Array): boolean {
     const socket = this.socket;
     if (!socket || socket.readyState !== SOCKET_OPEN) return false;
+    if (this.connectionGate?.blocksTraffic()) {
+      // Never write to a server known to be incompatible. Dropping the socket
+      // (rather than just this message) sends the provider back to its gated
+      // reconnect loop; the handshake after recovery exchanges state vectors,
+      // so every update withheld here is sent and acknowledged then.
+      this.failSocket(socket, this.lifecycle, "server is incompatible");
+      return false;
+    }
     socket.send(message);
     return true;
   }

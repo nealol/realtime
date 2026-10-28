@@ -82,6 +82,15 @@ function uniqueCanvasOrder(order: readonly string[], items: Record<string, JsonV
  * the same id by two devices resolves to last-writer-wins on the tombstone
  * value, so at most one device can undo — acceptable for a rare race.
  *
+ * **Deletions.** An item missing from `incoming` is deleted only when the
+ * snapshot deliberately dropped it. With a `base` — the shared value the
+ * snapshot was derived from (the content a startup or disk merge measured
+ * local changes against) — that is exactly the items `base` holds: anything
+ * else was added concurrently and never seen by the snapshot's author, so it
+ * stays. Without a base the intent is unknown, and only items this client
+ * created may be deleted; after a restart or a peer import every older item
+ * is foreign, which is why callers that know their base must pass it.
+ *
  * `nodeOrder` / `edgeOrder` are reconciled generically (arrays of ids); the
  * tombstone maps are managed here and left untouched by the generic path.
  */
@@ -89,6 +98,7 @@ export function reconcileCanvas(
   root: Y.Map<any>,
   incoming: StructuredCanvas,
   clientID: number,
+  base?: StructuredCanvas,
 ): void {
   const nodes = ensureMap(root, "nodes");
   const edges = ensureMap(root, "edges");
@@ -96,8 +106,8 @@ export function reconcileCanvas(
   const deletedEdgeIds = ensureMap(root, "deletedEdgeIds");
 
   const options: ReconcileOptions = {};
-  reconcileCanvasItems(nodes, incoming.nodes, deletedNodeIds, options, clientID);
-  reconcileCanvasItems(edges, incoming.edges, deletedEdgeIds, options, clientID);
+  reconcileCanvasItems(nodes, incoming.nodes, deletedNodeIds, options, clientID, base?.nodes);
+  reconcileCanvasItems(edges, incoming.edges, deletedEdgeIds, options, clientID, base?.edges);
 
   reconcileInto(ensureArray(root, "nodeOrder"), incoming.nodeOrder, options);
   reconcileInto(ensureArray(root, "edgeOrder"), incoming.edgeOrder, options);
@@ -109,14 +119,21 @@ function reconcileCanvasItems(
   tombstones: Y.Map<number>,
   options: ReconcileOptions,
   clientID: number,
+  known: Record<string, JsonValue> | undefined,
 ): void {
   for (const id of Array.from(itemsMap.keys())) {
     if (!(id in incoming)) {
-      const originClient = (itemsMap as { _map?: Map<string, { id?: { client?: number } }> })._map?.get(id)?.id
-        ?.client;
-      // A stale snapshot must not tombstone items created by another client —
-      // those concurrent remote nodes would be permanently un-resurrectable.
-      if (originClient !== undefined && originClient !== clientID) continue;
+      if (known) {
+        // Not in the snapshot's base: a concurrent addition, not a deletion.
+        if (!(id in known)) continue;
+      } else {
+        const originClient = (
+          itemsMap as { _map?: Map<string, { id?: { client?: number } }> }
+        )._map?.get(id)?.id?.client;
+        // A stale snapshot must not tombstone items created by another client —
+        // those concurrent remote nodes would be permanently un-resurrectable.
+        if (originClient !== undefined && originClient !== clientID) continue;
+      }
       // Stamp the tombstone with this device's clientID so a later same-device
       // re-add (undo) can clear it, while a cross-device stale snapshot cannot.
       tombstones.set(id, clientID);

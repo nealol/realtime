@@ -447,12 +447,16 @@ describe("ConfigSync with versions missed while away", () => {
   };
 
   /** One device's config sync over an in-memory adapter and blob store. */
-  async function device(onDisk: ArrayBuffer, blobs: Map<string, ArrayBuffer>) {
+  async function device(
+    onDisk: ArrayBuffer | null,
+    blobs: Map<string, ArrayBuffer>,
+    sharedIndex?: Y.Doc,
+  ) {
     const { plugin } = makeFakePlugin("https://sync.example.com", {
       sessionToken: "token",
       activeVaultId: "vault",
     });
-    const disk = new Map([[path, onDisk]]);
+    const disk = new Map<string, ArrayBuffer>(onDisk ? [[path, onDisk]] : []);
     Object.assign(plugin.app.vault, {
       configDir: ".obsidian",
       adapter: {
@@ -473,7 +477,11 @@ describe("ConfigSync with versions missed while away", () => {
       },
     });
     Object.assign(plugin.auth, {
-      getBlob: async (_vault: string, _path: string | null, hash: string) => blobs.get(hash),
+      getBlob: async (_vault: string, _path: string | null, hash: string) => {
+        const blob = blobs.get(hash);
+        if (!blob) throw new HttpError("blob not found", 404);
+        return blob;
+      },
       blobExists: async (_vault: string, _path: string, hash: string) => blobs.has(hash),
       putBlob: async (_vault: string, _path: string, hash: string, data: ArrayBuffer) => {
         blobs.set(hash, data);
@@ -481,22 +489,137 @@ describe("ConfigSync with versions missed while away", () => {
     });
     const localState = new LocalSyncState(`config-missed:${freshGuid()}`);
     await localState.whenSynced;
-    const indexDoc = new Y.Doc();
+    const indexDoc = sharedIndex ?? new Y.Doc();
     // The fake implements the slice of the plugin ConfigSync uses.
     const realtime = plugin as unknown as RealtimePlugin;
     const sync = new ConfigSync(realtime, indexDoc, localState);
     return {
       disk,
+      auth: plugin.auth,
       localState,
       configFiles: indexDoc.getMap<ConfigMeta>("configFiles"),
       sync,
       destroy: () => {
         sync.destroy();
-        indexDoc.destroy();
+        if (!sharedIndex) indexDoc.destroy();
         localState.destroy();
       },
     };
   }
+
+  it("restores a missing synced settings file after a transient download failure", async () => {
+    const v1 = json({ a: 1 });
+    const h1 = await sha256Hex(v1);
+    const blobs = new Map([[h1, v1]]);
+    const shared = new Y.Doc();
+    shared.getMap<ConfigMeta>("configFiles").set(path, {
+      hash: h1,
+      size: v1.byteLength,
+      mtime: 1,
+      prev: null,
+    });
+    const healthy = await device(v1, blobs, shared);
+    const missing = await device(null, blobs, shared);
+    try {
+      for (const peer of [healthy, missing]) {
+        peer.localState.markSynced(path, "config", h1, h1);
+        peer.sync.seedBaseline();
+      }
+      const getBlob = missing.auth.getBlob;
+      let failures = 0;
+      missing.auth.getBlob = async (...args: Parameters<typeof getBlob>) => {
+        if (failures === 0) {
+          failures += 1;
+          throw new Error("network unavailable");
+        }
+        return getBlob(...args);
+      };
+      healthy.sync.start(new Set(["mainSettings"]));
+      missing.sync.start(new Set(["mainSettings"]));
+      await waitFor(() => failures === 1, { label: "first download failed" });
+      // The 2s retry runs after the startup pass finished; it must download,
+      // not read the still-missing file as a local delete.
+      await waitFor(() => missing.disk.has(path) || !missing.configFiles.has(path), {
+        label: "retry reconciled",
+      });
+      expect(failures).toBe(1);
+      expect(missing.configFiles.get(path)?.hash).toBe(h1);
+      expect(new TextDecoder().decode(missing.disk.get(path))).toBe(new TextDecoder().decode(v1));
+      expect(new TextDecoder().decode(healthy.disk.get(path))).toBe(new TextDecoder().decode(v1));
+    } finally {
+      healthy.destroy();
+      missing.destroy();
+      shared.destroy();
+    }
+  });
+
+  it("propagates a real delete after an independently restored pending download", async () => {
+    const v1 = json({ a: 1 });
+    const h1 = await sha256Hex(v1);
+    const missing = await device(null, new Map([[h1, v1]]));
+    try {
+      missing.configFiles.set(path, { hash: h1, size: v1.byteLength, mtime: 1 });
+      missing.localState.markSynced(path, "config", h1, h1);
+      missing.sync.seedBaseline();
+      missing.auth.getBlob = async () => {
+        throw new Error("network unavailable");
+      };
+      // Exercise startup directly without installing poll/focus timers.
+      const startup = missing.sync as unknown as {
+        started: boolean;
+        enabledCategories: Set<"mainSettings">;
+        runInitialPull: () => Promise<void>;
+      };
+      startup.started = true;
+      startup.enabledCategories = new Set(["mainSettings"]);
+      await startup.runInitialPull();
+
+      // Another writer materializes the exact remote bytes before our retry.
+      missing.disk.set(path, v1);
+      await startup.runInitialPull();
+      expect(missing.configFiles.get(path)?.hash).toBe(h1);
+
+      missing.disk.delete(path);
+      await missing.sync.reconcileAll();
+      expect(missing.configFiles.has(path)).toBe(false);
+    } finally {
+      missing.destroy();
+    }
+  });
+
+  it("keeps one retry per path and never deletes while a download keeps failing", async () => {
+    const remoteMeta = { hash: "remote-hash", size: 1, mtime: 1 };
+    const missing = await device(null, new Map());
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      missing.configFiles.set(path, remoteMeta);
+      missing.localState.markSynced(path, "config", remoteMeta.hash, remoteMeta.hash);
+      missing.sync.seedBaseline();
+      let attempts = 0;
+      missing.auth.getBlob = async () => {
+        attempts += 1;
+        throw new Error("network unavailable");
+      };
+      // Drive full passes directly, without start()'s poll/focus timers.
+      const lifecycle = missing.sync as unknown as {
+        started: boolean;
+        enabledCategories: Set<"mainSettings">;
+        runInitialPull: () => Promise<void>;
+      };
+      lifecycle.started = true;
+      lifecycle.enabledCategories = new Set(["mainSettings"]);
+      for (let i = 0; i < 3; i++) await lifecycle.runInitialPull();
+      expect(attempts).toBe(3);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(attempts).toBe(4);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(attempts).toBe(5);
+      expect(missing.configFiles.get(path)).toEqual(remoteMeta);
+    } finally {
+      missing.destroy();
+      vi.useRealTimers();
+    }
+  });
 
   it("downloads a settings file changed twice elsewhere instead of reverting the first change", async () => {
     const [v1, v2, v3] = [json({ a: 1, b: 1 }), json({ a: 2, b: 1 }), json({ a: 2, b: 2 })];
@@ -546,6 +669,112 @@ describe("ConfigSync with versions missed while away", () => {
       expect(JSON.parse(new TextDecoder().decode(racer.disk.get(path)))).toEqual({ a: 7, b: 9 });
     } finally {
       racer.destroy();
+    }
+  });
+});
+
+describe("ConfigSync warm reconcile", () => {
+  it("skips disabled config folders and rewrites no unchanged local state", async () => {
+    const { plugin } = makeFakePlugin("https://sync.example.com", {
+      sessionToken: "token",
+      activeVaultId: "vault",
+    });
+    const bytes = (text: string) => {
+      const encoded = new TextEncoder().encode(text);
+      return encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength);
+    };
+    const synced = [
+      ".obsidian/app.json",
+      ".obsidian/snippets/wide.css",
+      ".obsidian/themes/Minimal/theme.css",
+    ];
+    const disk = new Map<string, ArrayBuffer>(
+      [...synced, ".obsidian/plugins/dataview/data.json", ".obsidian/cache/state.json"].map(
+        (path) => [path, bytes(path)],
+      ),
+    );
+    const listed: string[] = [];
+    Object.assign(plugin.app.vault, {
+      configDir: ".obsidian",
+      adapter: {
+        exists: async (p: string) => disk.has(p),
+        stat: async (p: string) => {
+          const stored = disk.get(p);
+          return stored ? { mtime: 1, ctime: 1, size: stored.byteLength, type: "file" } : null;
+        },
+        readBinary: async (p: string) => disk.get(p),
+        list: async (folder: string) => {
+          listed.push(folder);
+          const files: string[] = [];
+          const folders = new Set<string>();
+          for (const path of disk.keys()) {
+            if (!path.startsWith(`${folder}/`)) continue;
+            const rest = path.slice(folder.length + 1).split("/");
+            if (rest.length === 1) files.push(path);
+            else folders.add(`${folder}/${rest[0]}`);
+          }
+          return { files, folders: [...folders] };
+        },
+      },
+    });
+    const indexDoc = new Y.Doc();
+    const configFiles = indexDoc.getMap<ConfigMeta>("configFiles");
+    // The remote profile already holds exactly these files, including one in
+    // the disabled plugin category that must stay untouched.
+    for (const path of [...synced, ".obsidian/plugins/dataview/data.json"]) {
+      const data = disk.get(path)!;
+      configFiles.set(path, { hash: await sha256Hex(data), size: data.byteLength, mtime: 1 });
+    }
+    const remoteBefore = configFiles.toJSON();
+    const localState = new LocalSyncState(`config-warm:${freshGuid()}`);
+    await localState.whenSynced;
+    const sync = new ConfigSync(plugin as unknown as RealtimePlugin, indexDoc, localState);
+    // The private persisted doc: its update stream is what an unchanged reconcile costs.
+    const internals = localState as unknown as { doc: Y.Doc };
+    try {
+      sync.seedBaseline();
+      const lifecycle = sync as unknown as {
+        started: boolean;
+        enabledCategories: Set<string>;
+        runInitialPull: () => Promise<void>;
+      };
+      lifecycle.started = true;
+      lifecycle.enabledCategories = new Set(["mainSettings", "themesAndSnippets"]);
+      await lifecycle.runInitialPull();
+      // First pass adopts matching local files as synced.
+      for (const path of synced) {
+        expect(localState.get(path), path).toMatchObject({ kind: "config", candidate: false });
+      }
+      expect(localState.has(".obsidian/plugins/dataview/data.json")).toBe(false);
+
+      let updates = 0;
+      internals.doc.on("update", () => (updates += 1));
+      listed.length = 0;
+      expect(await sync.reconcileAll()).toBe(true);
+      expect(await sync.reconcileAll()).toBe(true);
+      expect(updates).toBe(0);
+      expect(new Set(listed)).toEqual(
+        new Set([
+          ".obsidian",
+          ".obsidian/snippets",
+          ".obsidian/themes",
+          ".obsidian/themes/Minimal",
+        ]),
+      );
+      expect(configFiles.toJSON()).toEqual(remoteBefore);
+
+      // Enabling the plugin category walks its folders again.
+      listed.length = 0;
+      lifecycle.enabledCategories.add("installedCommunityPlugins");
+      expect(await sync.reconcileAll()).toBe(true);
+      expect(listed).toEqual(
+        expect.arrayContaining([".obsidian/plugins", ".obsidian/plugins/dataview"]),
+      );
+      expect(listed).not.toContain(".obsidian/cache");
+    } finally {
+      sync.destroy();
+      indexDoc.destroy();
+      localState.destroy();
     }
   });
 });

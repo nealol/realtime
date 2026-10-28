@@ -19,8 +19,6 @@ export function dbg(...args: unknown[]): void {
 /** Truncate long strings for readable logs, showing length. */
 export function snip(s: string | null, n = 60): string {
   if (s === null) return "<null>";
-  const oneLine = s.replace(/\n/g, "⏎");
-  return oneLine.length <= n
-    ? `"${oneLine}"(${s.length})`
-    : `"${oneLine.slice(0, n)}…"(${s.length})`;
+  const oneLine = s.slice(0, n).replace(/\n/g, "⏎");
+  return s.length <= n ? `"${oneLine}"(${s.length})` : `"${oneLine}…"(${s.length})`;
 }

@@ -10,11 +10,19 @@ import {
   SYNC_STATUS_OFFLINE,
 } from "./sync/RealtimeProvider";
 import { createMuxSocket } from "./sync/mux";
+import { compatibilityGateFor } from "./sync/compatibilityGate";
 import { epochPersistenceName, epochStoreBaseName, getDocumentEpoch } from "./documentEpoch";
 import { updateTextConflict } from "./conflictRecovery";
 import { sha256Text } from "./hash";
 import { registerPresenceOwner, type PresenceOwner } from "./presenceOwners";
 import type { MaterializedKind } from "./localSyncState";
+
+/**
+ * How long an acknowledgement waits before its content is fingerprinted. A
+ * burst of acknowledgements (continuous typing) is recorded once per window;
+ * later ones never push the deadline back, so recording cannot starve.
+ */
+const ACKNOWLEDGE_DELAY_MS = 250;
 
 /**
  * Fingerprint recording that a document's local store contains `text`.
@@ -57,6 +65,8 @@ export abstract class SyncedDoc implements PresenceOwner {
 
   protected readonly plugin: RealtimePlugin;
   protected destroyed = false;
+  /** True only after startup content is durably present on this device. */
+  protected startupReady = false;
   protected readonly persistence: IndexeddbPersistence;
 
   private readyPromise: Promise<void>;
@@ -82,6 +92,11 @@ export abstract class SyncedDoc implements PresenceOwner {
   private presenceUser: Record<string, unknown> | null = null;
   /** Open views of this document; presence is published only while one exists. */
   private presenceHolds = 0;
+  /** Bumped by every content change; see {@link noteContentChanged}. */
+  private contentRevision = 0;
+  /** Fingerprint of the content at `revision`, hashed once per revision. */
+  private contentFingerprint: { revision: number; fingerprint: Promise<string> } | null = null;
+  private acknowledgeTimer: number | null = null;
 
   protected constructor(
     plugin: RealtimePlugin,
@@ -114,6 +129,7 @@ export abstract class SyncedDoc implements PresenceOwner {
         connect: false,
         socketFactory: createMuxSocket,
         onReadOnlyUpdate: () => void this.preserveReadOnlyRecovery(),
+        connectionGate: compatibilityGateFor(plugin),
       },
     );
     this.awareness = this.provider.awareness;
@@ -154,7 +170,7 @@ export abstract class SyncedDoc implements PresenceOwner {
     };
     this.provider.on("synced", this.syncedListener);
     this.localChangesListener = (hasLocalChanges) => {
-      if (!hasLocalChanges && !this.destroyed) void this.afterChangesSynced();
+      if (!hasLocalChanges) this.scheduleAcknowledgedContent();
     };
     this.provider.on(SYNC_EVENT_LOCAL_CHANGES, this.localChangesListener);
 
@@ -360,7 +376,66 @@ export abstract class SyncedDoc implements PresenceOwner {
 
   protected abstract afterPersistenceSynced(): Promise<void> | void;
   protected abstract finishStartupReconcile(): Promise<void>;
-  protected afterChangesSynced(): Promise<void> | void {}
+  /** The kind of file this document materializes as. */
+  protected abstract materializedKind(): MaterializedKind;
+
+  /** Subclasses call this from their content observers for every content change. */
+  protected noteContentChanged(): void {
+    this.contentRevision += 1;
+  }
+
+  /**
+   * Record, after {@link ACKNOWLEDGE_DELAY_MS}, that the server holds the
+   * current content. Requests made while one is pending join it.
+   */
+  private scheduleAcknowledgedContent(): void {
+    if (this.destroyed || !this.startupReady || this.acknowledgeTimer !== null) return;
+    this.acknowledgeTimer = window.setTimeout(() => {
+      this.acknowledgeTimer = null;
+      this.recordAcknowledgedContent().catch((error: unknown) => {
+        console.warn(`[Realtime] could not record acknowledged content for ${this.path}`, error);
+      });
+    }, ACKNOWLEDGE_DELAY_MS);
+  }
+
+  /**
+   * Record that the server holds this document's current content, when it is
+   * ready and holds no unacknowledged local change. Content that changes
+   * while it is being fingerprinted is not recorded; a later record retries.
+   */
+  protected async recordAcknowledgedContent(): Promise<void> {
+    if (this.destroyed || !this.startupReady || this.provider.hasLocalChanges) return;
+    const revision = this.contentRevision;
+    let entry = this.contentFingerprint;
+    if (!entry || entry.revision !== revision) {
+      entry = { revision, fingerprint: sha256Text(this.serializeRecoveryContent()) };
+      this.contentFingerprint = entry;
+    }
+    let fingerprint: string;
+    try {
+      fingerprint = await entry.fingerprint;
+    } catch (error) {
+      if (this.contentFingerprint === entry) this.contentFingerprint = null;
+      throw error;
+    }
+    if (this.destroyed || !this.startupReady || this.provider.hasLocalChanges) return;
+    if (this.contentRevision !== revision) {
+      // The hash describes content the document no longer holds. A remote
+      // change raises no new acknowledgement, so retry on our own.
+      this.scheduleAcknowledgedContent();
+      return;
+    }
+    // Reconciled: this content is what the document settled on, not a
+    // pending local candidate.
+    this.plugin.vaultSync?.noteContentAcknowledged(
+      this.path,
+      this.materializedKind(),
+      this.guid,
+      fingerprint,
+      true,
+    );
+  }
+
   protected abstract serializeRecoveryContent(): string;
   protected abstract destroySubclass(): void;
 
@@ -402,6 +477,10 @@ export abstract class SyncedDoc implements PresenceOwner {
     if (this.destroyed) return;
     this.destroyed = true;
     this.destroySubclass();
+    if (this.acknowledgeTimer !== null) {
+      window.clearTimeout(this.acknowledgeTimer);
+      this.acknowledgeTimer = null;
+    }
     this.provider.off("synced", this.syncedListener);
     this.provider.off(SYNC_EVENT_LOCAL_CHANGES, this.localChangesListener);
     this.provider.destroy();

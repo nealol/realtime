@@ -1,7 +1,7 @@
 // Binds an Obsidian (CodeMirror 6) editor to a Yjs Y.Text, in both directions.
 // Adapted from y-codemirror.next (MIT, © Kevin Jahns) and the Relay plugin.
 
-import type { ChangeSpec } from "@codemirror/state";
+import type { ChangeSpec, Text } from "@codemirror/state";
 import { EditorView, ViewPlugin, type PluginValue, type ViewUpdate } from "@codemirror/view";
 import type * as Y from "yjs";
 import type { Document } from "../Document";
@@ -9,7 +9,7 @@ import { ensureDocumentForEditor, isNoteFragmentEditor, requestSaveForEditor } f
 import { ySyncAnnotation } from "./annotations";
 import { applyTextToYText } from "../diff";
 import { mergeText } from "../textMerge";
-import { dbg, snip } from "../debug";
+import { dbg, dbgEnabled, snip } from "../debug";
 
 /**
  * Decide whether a local editor change may be materialized into the shared
@@ -39,7 +39,7 @@ export class LiveEditPluginValue implements PluginValue {
   private editor: EditorView;
   private doc: Document | null = null;
   private ytext: Y.Text | null = null;
-  private observer: (() => void) | null = null;
+  private observer: ((event: Y.YTextEvent, transaction: Y.Transaction) => void) | null = null;
   private unsubscribeDestroy: (() => void) | null = null;
   private destroyed = false;
   /** Edits only part of its note: never binds (see {@link isNoteFragmentEditor}). */
@@ -50,6 +50,20 @@ export class LiveEditPluginValue implements PluginValue {
    * (e.g. while one was being rebuilt), so binding still pushes that change.
    */
   private unpushedBaseline: string | null = null;
+  /** Immutable editor snapshot whose contents are known to match Y.Text. */
+  private synchronizedDoc: Text | null = null;
+  private pushingEditorChanges = false;
+  private sharedChangedWhilePushing = false;
+  private sharedTransactionDepth = 0;
+  private readonly beforeSharedTransaction = (transaction: Y.Transaction): void => {
+    // An editor update can occur inside another transaction, before Y.Text
+    // observers run. Empty acknowledgement transactions must not discard a
+    // proven baseline, but forwarding offsets inside any foreign one is unsafe.
+    if (transaction.origin !== this) this.sharedTransactionDepth++;
+  };
+  private readonly afterSharedTransaction = (transaction: Y.Transaction): void => {
+    if (transaction.origin !== this) this.sharedTransactionDepth--;
+  };
 
   constructor(editor: EditorView) {
     this.editor = editor;
@@ -79,9 +93,12 @@ export class LiveEditPluginValue implements PluginValue {
       queueMicrotask(() => this.tryBind());
     });
 
-    const observer = () => this.onYTextChanged();
+    const observer = (_event: Y.YTextEvent, transaction: Y.Transaction) =>
+      this.onYTextChanged(transaction);
     this.observer = observer;
     this.ytext.observe(observer);
+    this.ytext.doc?.on("beforeTransaction", this.beforeSharedTransaction);
+    this.ytext.doc?.on("afterTransaction", this.afterSharedTransaction);
 
     // Reconcile only after initial sync, so we never act on an empty,
     // not-yet-synced shared document.
@@ -107,7 +124,10 @@ export class LiveEditPluginValue implements PluginValue {
     const ytext = this.ytext;
     const shared = ytext.toString();
     const current = this.editor.state.doc.toString();
-    if (shared === current) return;
+    if (shared === current) {
+      this.synchronizedDoc = this.editor.state.doc;
+      return;
+    }
 
     // The user typed while the document was still loading its local
     // persistence / first server sync (possibly a whole offline session).
@@ -119,7 +139,8 @@ export class LiveEditPluginValue implements PluginValue {
       // ...unless a server sync that could deliver this content is still pending
       // (see {@link shouldPushEditorToShared}); seeding it now would duplicate.
       if (!this.mayPushToShared()) {
-        dbg("reconcile push DEFERRED (pre-sync empty shared)", this.doc?.path, snip(current));
+        if (dbgEnabled())
+          dbg("reconcile push DEFERRED (pre-sync empty shared)", this.doc?.path, snip(current));
         return;
       }
       const merge = mergeText(base, current, shared);
@@ -173,15 +194,22 @@ export class LiveEditPluginValue implements PluginValue {
     this.unsubscribeDestroy?.();
     this.unsubscribeDestroy = null;
     if (this.observer && this.ytext) this.ytext.unobserve(this.observer);
+    this.ytext?.doc?.off("beforeTransaction", this.beforeSharedTransaction);
+    this.ytext?.doc?.off("afterTransaction", this.afterSharedTransaction);
     if (this.doc) this.doc.unbindEditor();
     this.observer = null;
     this.ytext = null;
     this.doc = null;
     this.editorTextAtBind = null;
+    this.synchronizedDoc = null;
+    this.sharedTransactionDepth = 0;
   }
 
   /** Apply a remote Yjs change to the editor. */
-  private onYTextChanged(): void {
+  private onYTextChanged(transaction: Y.Transaction): void {
+    if (this.pushingEditorChanges && transaction.origin === this) return;
+    this.synchronizedDoc = null;
+    if (this.pushingEditorChanges) this.sharedChangedWhilePushing = true;
     if (!this.ytext || this.destroyed) return;
     // Initial sync still streams into Y.Text before isReady(); applying it
     // would clobber text typed during that window. reconcileOnAttach runs
@@ -195,8 +223,12 @@ export class LiveEditPluginValue implements PluginValue {
 
   private applyTextToEditor(target: string): void {
     const current = this.editor.state.doc.toString();
-    if (current === target) return;
-    dbg("applyTextToEditor", this.doc?.path, "editor", snip(current), "->ytext", snip(target));
+    if (current === target) {
+      this.synchronizedDoc = this.editor.state.doc;
+      return;
+    }
+    if (dbgEnabled())
+      dbg("applyTextToEditor", this.doc?.path, "editor", snip(current), "->ytext", snip(target));
 
     // Minimal prefix/suffix diff so we don't disturb the local selection.
     let start = 0;
@@ -218,6 +250,8 @@ export class LiveEditPluginValue implements PluginValue {
       annotations: [ySyncAnnotation.of(this.editor)],
     });
     requestSaveForEditor(this.editor);
+    // A transaction filter may have transformed the remote replacement.
+    if (this.editor.state.doc.toString() === target) this.synchronizedDoc = this.editor.state.doc;
   }
 
   /** Push local editor edits into the shared Y.Text. */
@@ -232,35 +266,90 @@ export class LiveEditPluginValue implements PluginValue {
     if (!this.ytext || !update.docChanged) return;
     if (this.doc && !this.doc.isReady()) return;
 
-    // Self-healing reconcile: make ytext match the editor's *current* text via a
-    // minimal prefix/suffix diff, instead of mapping CodeMirror change offsets
-    // onto ytext positions. Offset-mapping silently corrupts (and duplicates
-    // characters) the moment ytext and the editor drift apart — e.g. when a
-    // single ViewUpdate bundles an applied-remote change with a user keystroke.
-    // This approach can't drift: it is idempotent for the remote changes we
-    // ourselves applied (ytext already equals the editor, so it no-ops), which
-    // is also why it needs no annotation filter.
-    const target = update.state.doc.toString();
-    if (this.ytext.toString() === target) return;
-
-    // Hardening against the mobile-reopen duplication: never seed a pre-existing
-    // buffer into an empty, not-yet-synced shared doc (the server may already
-    // hold this content). See {@link shouldPushEditorToShared}.
+    // Only forward offsets from a proven shared baseline. Remote changes,
+    // combined remote/local ViewUpdates and rebinds invalidate that baseline
+    // and retain the self-healing full-text reconcile.
+    const incremental = this.canApplyEditorChanges(update);
+    let target: string | undefined;
+    if (!incremental) {
+      target = update.state.doc.toString();
+      if (this.ytext.toString() === target) {
+        this.synchronizedDoc = update.state.doc;
+        return;
+      }
+    }
     if (!this.mayPushToShared()) {
-      dbg("local push DEFERRED (pre-sync empty shared)", this.doc.path, "->editor", snip(target));
+      if (dbgEnabled())
+        dbg(
+          "local push DEFERRED (pre-sync empty shared)",
+          this.doc.path,
+          "->editor",
+          snip(target ?? update.state.doc.toString()),
+        );
       return;
     }
-    dbg(
-      "local push",
-      this.doc?.path,
-      "ytext",
-      snip(this.ytext.toString()),
-      "->editor",
-      snip(target),
-    );
-    this.ytext.doc?.transact(() => {
-      applyTextToYText(this.ytext!, target);
-    }, this);
+    if (dbgEnabled())
+      dbg(
+        "local push",
+        this.doc.path,
+        "ytext",
+        snip(this.ytext.toString()),
+        "->editor",
+        snip(target ?? update.state.doc.toString()),
+      );
+    this.synchronizedDoc = null;
+    this.pushingEditorChanges = true;
+    this.sharedChangedWhilePushing = false;
+    try {
+      this.ytext.doc?.transact(() => {
+        if (incremental) {
+          update.changes.iterChanges((from, to, at, _end, inserted) => {
+            if (to > from) this.ytext!.delete(at, to - from);
+            if (inserted.length) this.ytext!.insert(at, inserted.toString());
+          });
+        } else {
+          applyTextToYText(this.ytext!, target!);
+        }
+      }, this);
+    } finally {
+      this.pushingEditorChanges = false;
+    }
+    if (
+      !this.sharedChangedWhilePushing &&
+      this.ytext.doc &&
+      (incremental || this.ytext.toString() === target)
+    ) {
+      this.synchronizedDoc = update.state.doc;
+    }
+  }
+
+  private canApplyEditorChanges(update: ViewUpdate): boolean {
+    const before = update.startState?.doc;
+    if (
+      !before ||
+      this.sharedTransactionDepth !== 0 ||
+      before !== this.synchronizedDoc ||
+      !update.changes ||
+      this.ytext?.length !== before.length
+    )
+      return false;
+    // Yjs must never delete half of a stored surrogate pair. The full-text
+    // fallback expands such replacements to cover both UTF-16 code units.
+    const splitsSurrogate = (at: number): boolean => {
+      if (at === 0 || at === before.length) return false;
+      const pair = before.sliceString(at - 1, at + 1);
+      return (
+        pair.charCodeAt(0) >= 0xd800 &&
+        pair.charCodeAt(0) <= 0xdbff &&
+        pair.charCodeAt(1) >= 0xdc00 &&
+        pair.charCodeAt(1) <= 0xdfff
+      );
+    };
+    let safe = true;
+    update.changes.iterChangedRanges((from, to) => {
+      if (splitsSurrogate(from) || splitsSurrogate(to)) safe = false;
+    });
+    return safe;
   }
 
   destroy(): void {

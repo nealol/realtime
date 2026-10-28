@@ -1,8 +1,26 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { Awareness } from "y-protocols/awareness";
-import { CanvasBinding, canvasAttachmentPaths } from "../../src/editor/CanvasBinding";
-import { makeLiveCanvasFixture } from "../support/canvasHarness";
+import {
+  CANVAS_LOCAL_ORIGIN,
+  CanvasBinding,
+  canvasAttachmentPaths,
+} from "../../src/editor/CanvasBinding";
+import type { CanvasDocument } from "../../src/CanvasDocument";
+import type RealtimePlugin from "../../src/main";
+import { reconcileCanvas, serializeCanvas } from "../../src/structured/canvas";
+import { applyCanvasOperations, type CanvasOperation } from "../../src/structured/canvasOperations";
+import { toValue } from "../../src/structured/reconcile";
+import { makeLiveCanvasFixture, normalizedCanvas } from "../support/canvasHarness";
+
+/**
+ * Test boundary: the binding reads only `app.workspace` from the plugin and
+ * the startup/readiness methods the fixture document provides.
+ */
+function bindFixture(workspace: unknown, doc: object): CanvasBinding {
+  const plugin = { app: { workspace } } as unknown as RealtimePlugin;
+  return new CanvasBinding(plugin, doc as unknown as CanvasDocument);
+}
 
 function makeOperationalDoc(data: unknown) {
   let current = data;
@@ -18,6 +36,49 @@ function makeOperationalDoc(data: unknown) {
     reconcileFromCanvasData: vi.fn(),
   };
 }
+
+interface CanvasFile {
+  nodes: Array<Record<string, unknown>>;
+  edges: Array<Record<string, unknown>>;
+}
+
+/**
+ * A Yjs-backed document mirroring CanvasDocument's capture/apply surface, so
+ * tests observe the CRDT value and its local transactions, not call wiring.
+ */
+function makeCrdtDoc(initial: unknown) {
+  const ydoc = new Y.Doc();
+  const root = ydoc.getMap("root");
+  const value = (): CanvasFile => JSON.parse(serializeCanvas(toValue(root)));
+  ydoc.transact(() => reconcileCanvas(root, normalizedCanvas(initial), ydoc.clientID));
+  /** The CRDT value after every local transaction that changed it. */
+  const localStates: CanvasFile[] = [];
+  ydoc.on("afterTransaction", (transaction: Y.Transaction) => {
+    if (transaction.origin === CANVAS_LOCAL_ORIGIN && transaction.changed.size) {
+      localStates.push(value());
+    }
+  });
+  return {
+    path: "Board.canvas",
+    awareness: new Awareness(new Y.Doc()),
+    isReady: () => true,
+    canvasData: value,
+    applyCanvasOperations: (operations: readonly CanvasOperation[], origin: unknown) =>
+      ydoc.transact(() => applyCanvasOperations(root, operations, ydoc.clientID), origin),
+    reconcileFromCanvasData: (data: unknown, origin: unknown) =>
+      ydoc.transact(
+        () => reconcileCanvas(root, normalizedCanvas(data ?? {}), ydoc.clientID),
+        origin,
+      ),
+    /** A peer's edit arriving through sync. */
+    applyPeer: (data: unknown) =>
+      ydoc.transact(() => reconcileCanvas(root, normalizedCanvas(data), ydoc.clientID), "peer"),
+    value,
+    localStates,
+  };
+}
+
+const node = (x: number, text = "A") => ({ id: "a", type: "text", text, x, y: 0 });
 
 describe("CanvasBinding startup", () => {
   it("falls back safely when Canvas data APIs move to the view", () => {
@@ -216,6 +277,8 @@ describe("CanvasBinding startup", () => {
       path: "Board.canvas",
       awareness,
       isReady: () => ready,
+      // The view's content is not this file's disk content.
+      matchesStartupDisk: () => false,
       canvasData: () => ({ nodes: [], edges: [] }),
       reconcileFromCanvasData: vi.fn(),
     };
@@ -230,6 +293,7 @@ describe("CanvasBinding startup", () => {
 
     expect(originalRequestSave).toHaveBeenCalledTimes(1);
     expect(doc.reconcileFromCanvasData).not.toHaveBeenCalled();
+    expect(binding.startupLiveValue()).toBeNull();
 
     ready = true;
     binding.applyRemote();
@@ -239,6 +303,82 @@ describe("CanvasBinding startup", () => {
 
     binding.destroy();
     awareness.destroy();
+  });
+
+  it("reports unsaved pre-startup edits only from a view seen showing this file", () => {
+    const disk = { nodes: [{ id: "a", type: "text", text: "disk" }], edges: [] };
+    const edited = {
+      nodes: [
+        { id: "a", type: "text", text: "disk" },
+        { id: "b", type: "text", text: "unsaved" },
+      ],
+      edges: [],
+    };
+    const fixture = makeLiveCanvasFixture("Board.canvas", disk);
+    let diskKnown = false;
+    const doc = {
+      path: "Board.canvas",
+      awareness: new Awareness(new Y.Doc()),
+      isReady: () => false,
+      matchesStartupDisk: (value: unknown) =>
+        diskKnown && JSON.stringify(value) === JSON.stringify(normalizedCanvas(disk)),
+      canvasData: () => ({ nodes: [], edges: [] }),
+      applyCanvasOperations: vi.fn(),
+      reconcileFromCanvasData: vi.fn(),
+    };
+    const binding = bindFixture(fixture.workspace, doc);
+    binding.tryBind();
+
+    // The view was bound before the startup disk read finished, then edited.
+    fixture.setData(edited);
+    fixture.canvas.requestSave();
+    expect(binding.startupLiveValue()).toBeNull();
+
+    // Once the disk is known, the content the view showed when bound matches it.
+    diskKnown = true;
+    binding.checkStartupViews();
+    expect(binding.startupLiveValue()).toEqual(normalizedCanvas(edited));
+    expect(doc.applyCanvasOperations).not.toHaveBeenCalled();
+    expect(doc.reconcileFromCanvasData).not.toHaveBeenCalled();
+    expect(fixture.canvas.importData).not.toHaveBeenCalled();
+
+    // Obsidian reuses the view for another file: its content is not ours.
+    fixture.reuseFor("Other.canvas", disk);
+    expect(binding.startupLiveValue()).toBeNull();
+
+    binding.destroy();
+    doc.awareness.destroy();
+  });
+
+  it("never reports a reused view's leftover content as a pre-startup edit", () => {
+    const disk = { nodes: [{ id: "a", type: "text", text: "this file" }], edges: [] };
+    const leftover = { nodes: [{ id: "x", type: "text", text: "previous file" }], edges: [] };
+    const fixture = makeLiveCanvasFixture("Board.canvas", leftover);
+    const doc = {
+      path: "Board.canvas",
+      awareness: new Awareness(new Y.Doc()),
+      isReady: () => false,
+      matchesStartupDisk: (value: unknown) =>
+        JSON.stringify(value) === JSON.stringify(normalizedCanvas(disk)),
+      canvasData: () => ({ nodes: [], edges: [] }),
+      reconcileFromCanvasData: vi.fn(),
+    };
+    const binding = bindFixture(fixture.workspace, doc);
+    binding.tryBind();
+    fixture.canvas.requestSave();
+    expect(binding.startupLiveValue()).toBeNull();
+
+    // The view loads this file; a gesture then starts from its disk content.
+    fixture.setData(disk);
+    fixture.host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    const moved = { nodes: [{ id: "a", type: "text", text: "this file", x: 40 }], edges: [] };
+    fixture.setData(moved);
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    expect(binding.startupLiveValue()).toEqual(normalizedCanvas(moved));
+    expect(doc.reconcileFromCanvasData).not.toHaveBeenCalled();
+
+    binding.destroy();
+    doc.awareness.destroy();
   });
 });
 
@@ -520,5 +660,294 @@ describe("CanvasBinding interaction scheduling", () => {
     }
     expect(vi.getTimerCount()).toBe(0);
     vi.useRealTimers();
+  });
+});
+
+describe("CanvasBinding gesture capture", () => {
+  const cleanups: Array<() => void> = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    for (const cleanup of cleanups.splice(0)) cleanup();
+    vi.useRealTimers();
+  });
+
+  function bindCrdt(initial: unknown, { unloadHook = true } = {}) {
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    const doc = makeCrdtDoc(initial);
+    // TextFileView.onUnloadFile saves what the view shows to the file.
+    const unloadSaves: unknown[] = [];
+    const onUnloadFile = vi.fn(async () => {
+      unloadSaves.push(fixture.data());
+    });
+    if (unloadHook) fixture.view.onUnloadFile = onUnloadFile;
+    const binding = bindFixture(fixture.workspace, doc);
+    binding.tryBind();
+    let tornDown = false;
+    const teardown = () => {
+      if (tornDown) return;
+      tornDown = true;
+      binding.destroy();
+      doc.awareness.destroy();
+    };
+    cleanups.push(teardown);
+    // Obsidian updates the view, then requests a save for the edit.
+    const edit = (next: unknown) => {
+      fixture.setData(next);
+      fixture.canvas.requestSave();
+    };
+    const press = () =>
+      fixture.host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    const release = () => window.dispatchEvent(new PointerEvent("pointerup"));
+    // FileView.loadFile: unload the current file, then show the next one.
+    const openInView = async (path: string, data: unknown) => {
+      await fixture.view.onUnloadFile?.(fixture.view.file);
+      fixture.reuseFor(path, data);
+    };
+    return {
+      fixture,
+      doc,
+      binding,
+      edit,
+      press,
+      release,
+      teardown,
+      openInView,
+      onUnloadFile,
+      unloadSaves,
+    };
+  }
+
+  it("coalesces per-move save requests during a drag and keeps the final geometry", () => {
+    const { doc, edit, press, release } = bindCrdt({ nodes: [node(0)], edges: [] });
+
+    press();
+    edit({ nodes: [node(1)], edges: [] });
+    // A move's save request alone does not fold the whole board in.
+    expect(doc.value().nodes[0]).toMatchObject({ x: 0 });
+    for (let x = 2; x <= 300; x++) {
+      vi.advanceTimersByTime(1);
+      edit({ nodes: [node(x)], edges: [] });
+    }
+    // The interaction sampler bounds durable updates over the 300ms gesture.
+    expect(doc.localStates.length).toBeGreaterThan(0);
+    expect(doc.localStates.length).toBeLessThanOrEqual(300 / 75 + 1);
+    const sampled = doc.localStates.map((state) => state.nodes[0]?.x as number);
+    expect(sampled).toEqual([...sampled].sort((a, b) => a - b));
+
+    edit({ nodes: [node(301)], edges: [] });
+    release();
+    expect(doc.value()).toEqual({ nodes: [node(301)], edges: [] });
+    expect(doc.localStates[doc.localStates.length - 1]).toEqual({
+      nodes: [node(301)],
+      edges: [],
+    });
+  });
+
+  const finishers: Array<[string, () => void]> = [
+    ["pointer release", () => window.dispatchEvent(new PointerEvent("pointerup"))],
+    ["pointer cancel", () => window.dispatchEvent(new PointerEvent("pointercancel"))],
+    ["window blur", () => window.dispatchEvent(new Event("blur"))],
+    [
+      "hidden document",
+      () => {
+        Object.defineProperty(document, "hidden", { configurable: true, value: true });
+        try {
+          document.dispatchEvent(new Event("visibilitychange"));
+        } finally {
+          Reflect.deleteProperty(document, "hidden");
+        }
+      },
+    ],
+  ];
+
+  it.each(finishers)("folds the latest geometry when a %s ends the gesture", (_name, finish) => {
+    const { doc, edit, press } = bindCrdt({ nodes: [node(0)], edges: [] });
+
+    press();
+    edit({ nodes: [node(42)], edges: [] });
+    expect(doc.value().nodes[0]).toMatchObject({ x: 0 });
+    finish();
+    expect(doc.value()).toEqual({ nodes: [node(42)], edges: [] });
+
+    // Once the gesture ended, edits fold in as soon as they are saved.
+    edit({ nodes: [node(43)], edges: [] });
+    expect(doc.value()).toEqual({ nodes: [node(43)], edges: [] });
+  });
+
+  it("folds edits made outside a gesture immediately", () => {
+    const { doc, edit } = bindCrdt({ nodes: [node(0)], edges: [] });
+
+    edit({ nodes: [node(0, "typed")], edges: [] });
+    expect(doc.value()).toEqual({ nodes: [node(0, "typed")], edges: [] });
+    edit({ nodes: [node(0, "typed"), { id: "b", type: "text", text: "B" }], edges: [] });
+    expect(doc.value()).toEqual({
+      nodes: [node(0, "typed"), { id: "b", type: "text", text: "B" }],
+      edges: [],
+    });
+    expect(doc.localStates).toHaveLength(2);
+  });
+
+  it("keeps a drag's latest geometry when the binding is torn down mid-gesture", () => {
+    const { doc, edit, press, release, teardown } = bindCrdt({ nodes: [node(0)], edges: [] });
+
+    press();
+    edit({ nodes: [node(77)], edges: [] });
+    teardown();
+    expect(doc.value()).toEqual({ nodes: [node(77)], edges: [] });
+
+    // Nothing reaches the CRDT once unbound.
+    edit({ nodes: [node(99)], edges: [] });
+    vi.advanceTimersByTime(500);
+    release();
+    expect(doc.value()).toEqual({ nodes: [node(77)], edges: [] });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("flushes a gesture's pending geometry before Obsidian reuses the view", async () => {
+    const { doc, edit, press, openInView, unloadSaves } = bindCrdt({
+      nodes: [node(0)],
+      edges: [],
+    });
+
+    press();
+    edit({ nodes: [node(5)], edges: [] });
+    expect(doc.value().nodes[0]).toMatchObject({ x: 0 });
+    await openInView("Other.canvas", { nodes: [node(0, "other file")], edges: [] });
+    expect(doc.value()).toEqual({ nodes: [node(5)], edges: [] });
+    // Obsidian's own unload save still ran on this file's content.
+    expect(unloadSaves).toEqual([{ nodes: [node(5)], edges: [] }]);
+
+    // What the reused view shows next never reaches this document.
+    edit({ nodes: [node(9, "other file")], edges: [] });
+    vi.advanceTimersByTime(500);
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    expect(doc.value()).toEqual({ nodes: [node(5)], edges: [] });
+  });
+
+  it("captures every gesture save when the view has no unload hook", () => {
+    const { doc, edit, press, release } = bindCrdt(
+      { nodes: [node(0)], edges: [] },
+      { unloadHook: false },
+    );
+
+    press();
+    edit({ nodes: [node(5)], edges: [] });
+    expect(doc.value()).toEqual({ nodes: [node(5)], edges: [] });
+    edit({ nodes: [node(6)], edges: [] });
+    expect(doc.value()).toEqual({ nodes: [node(6)], edges: [] });
+    release();
+    expect(doc.value()).toEqual({ nodes: [node(6)], edges: [] });
+  });
+
+  it("hands the view's unload hook back on teardown", async () => {
+    const { fixture, doc, edit, press, teardown, openInView, onUnloadFile, unloadSaves } = bindCrdt(
+      { nodes: [node(0)], edges: [] },
+    );
+
+    teardown();
+    expect(fixture.view.onUnloadFile).toBe(onUnloadFile);
+    press();
+    edit({ nodes: [node(5)], edges: [] });
+    await openInView("Other.canvas", { nodes: [node(0, "other file")], edges: [] });
+    expect(unloadSaves).toEqual([{ nodes: [node(5)], edges: [] }]);
+    expect(doc.value()).toEqual({ nodes: [node(0)], edges: [] });
+  });
+
+  it("ignores the bounce-back of a remote import but folds later local edits", () => {
+    const { fixture, doc, binding, edit, press, release } = bindCrdt({
+      nodes: [node(0)],
+      edges: [],
+    });
+
+    doc.applyPeer({ nodes: [node(0, "peer")], edges: [] });
+    binding.applyRemote();
+    expect(fixture.data()).toEqual({ nodes: [node(0, "peer")], edges: [] });
+
+    // Obsidian's debounced save for the import fires after it completed.
+    fixture.canvas.requestSave();
+    // A gesture that has not moved anything yet samples the same content.
+    press();
+    vi.advanceTimersByTime(150);
+    expect(doc.localStates).toEqual([]);
+    expect(doc.value()).toEqual({ nodes: [node(0, "peer")], edges: [] });
+
+    edit({ nodes: [node(25, "peer")], edges: [] });
+    vi.advanceTimersByTime(75);
+    expect(doc.value()).toEqual({ nodes: [node(25, "peer")], edges: [] });
+    edit({ nodes: [node(30, "peer")], edges: [] });
+    release();
+    expect(doc.value()).toEqual({ nodes: [node(30, "peer")], edges: [] });
+
+    // Outside the gesture, a further local edit folds in immediately.
+    edit({ nodes: [node(30, "local")], edges: [] });
+    expect(doc.value()).toEqual({ nodes: [node(30, "local")], edges: [] });
+    expect(doc.localStates.map((state) => state.nodes[0])).toEqual([
+      node(25, "peer"),
+      node(30, "peer"),
+      node(30, "local"),
+    ]);
+  });
+});
+
+describe("CanvasBinding presence publishing", () => {
+  const initial = {
+    nodes: [{ id: "a", type: "text", text: "A", x: 1, y: 2, width: 30, height: 40 }],
+    edges: [{ id: "e", fromNode: "a", toNode: "a" }],
+  };
+
+  function startDrag(liveCanvas: Record<string, unknown>) {
+    const fixture = makeLiveCanvasFixture("Board.canvas", initial);
+    Object.assign(fixture.canvas, liveCanvas);
+    const doc = makeOperationalDoc(initial);
+    const binding = new CanvasBinding(
+      { app: { workspace: fixture.workspace } } as never,
+      doc as never,
+    );
+    binding.tryBind();
+    fixture.canvas.getData.mockClear();
+    fixture.host.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+    const presence = doc.awareness.getLocalState()?.canvasPresence;
+    const getDataCalls = fixture.canvas.getData.mock.calls.length;
+    window.dispatchEvent(new PointerEvent("pointerup"));
+    binding.destroy();
+    doc.awareness.destroy();
+    return { presence, getDataCalls };
+  }
+
+  it("publishes drag geometry from live selected nodes without serializing the Canvas", () => {
+    const node = { id: "a", x: 50, y: 60, width: 70, height: 80 };
+    const edge = { id: "e" };
+    const { presence, getDataCalls } = startDrag({
+      nodes: new Map([["a", node]]),
+      edges: new Map([["e", edge]]),
+      selection: new Set([edge, node]),
+    });
+    expect(presence).toMatchObject({
+      selectedNodeIds: ["a"],
+      interaction: { kind: "drag", nodes: [{ id: "a", x: 50, y: 60, width: 70, height: 80 }] },
+    });
+    expect(getDataCalls).toBe(0);
+  });
+
+  it("falls back to Canvas data when live nodes cannot provide geometry", () => {
+    const expected = {
+      selectedNodeIds: ["a"],
+      interaction: { kind: "drag", nodes: [{ id: "a", x: 1, y: 2, width: 30, height: 40 }] },
+    };
+    // Older shape: selection holds ids and there is no live node map.
+    const byId = startDrag({ selection: new Set(["a", "e"]) });
+    expect(byId.presence).toMatchObject(expected);
+    expect(byId.getDataCalls).toBe(1);
+    // Live node map whose node lacks numeric geometry.
+    const partial = startDrag({
+      nodes: new Map([["a", { id: "a" }]]),
+      selection: new Set(["a", "e"]),
+    });
+    expect(partial.presence).toMatchObject(expected);
+    expect(partial.getDataCalls).toBe(1);
   });
 });

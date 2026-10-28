@@ -122,6 +122,10 @@ The status bar shows `Realtime: connecting… / live / error`.
 The plugin and server versions plus the active vault ID are under
 **Settings → Realtime → Technical details** at the bottom of the page.
 
+Server migration commits the account, server, and matching vault together. A
+failed or cancelled migration leaves the existing binding unchanged. Stopping
+sync, signing out, or unloading the plugin invalidates pending sync startup.
+
 ### Mobile lifecycle
 
 On mobile, sending Obsidian to the background disconnects the vault index and
@@ -213,6 +217,28 @@ bun run test:compat # pinned released/current client-server matrix + wire corpus
 bun run test:all   # typecheck + all unit tests + Rust server tests
 ```
 
+## CPU and background work
+
+- Markdown edits use incremental changes only while the editor and shared text
+  have a proven common baseline. Startup, drift, combined remote/local updates,
+  and edits that split a UTF-16 surrogate pair retain full-text reconciliation.
+- Canvas presence reads live selected-node geometry instead of serializing the
+  whole canvas on every pointer move. Unsupported private API shapes retain the
+  snapshot fallback; cursor awareness frequency is unchanged.
+- Canvas saves during a drag share the 75 ms interaction sampler rather than
+  serializing the board on every frame. Release, cancellation, blur, hiding, and
+  file unload flush the final state. Versions without the unload hook retain
+  immediate save capture. Each capture reuses one normalized snapshot.
+- Content acknowledgement fingerprints coalesce into fixed 250 ms windows.
+  Startup recording remains immediate. Content revisions reject stale in-flight
+  hashes and reuse unchanged fingerprints without serializing the document again.
+- Settings reconciliation scans only enabled category folders and does not
+  rewrite unchanged local sync records. Enabled files are still checked for
+  disk changes on the normal poll, focus, and resume paths.
+
+Hashing still processes the full content of each recorded revision. Obsidian's
+own Markdown metadata worker is separate from these optimizations.
+
 ## Bootstrap and conflict recovery
 
 Each device stores its last accepted document GUID or blob hash and content
@@ -231,12 +257,23 @@ partially merged index as settled state.
 - Canvas and Bases merges preserve a full remote copy when both sides changed
   the same value. Binary and settings conflicts also retain the version that
   would otherwise be replaced.
+  Open Canvas and Bases views keep edits made before their first sync; an empty
+  startup document is never imported into the view.
 - Attachment and settings entries record the versions they descend from. A
   device that missed several saves made elsewhere downloads the latest one
   instead of treating it as a conflict or reverting it.
-- When another device deletes a path, an unchanged local file is removed. Local
-  edits first move to a conflicted copy, including when the deletion reached
-  IndexedDB before the previous process stopped.
+- A missing settings file stays pending while its download fails. Retrying a
+  download never publishes a deletion to the shared settings profile.
+- When another device deletes a path, an unchanged local file is removed.
+  Unacknowledged versions on disk and in a resident document first move to
+  conflicted copies. Disk edits survive even when the resident document holds
+  only an older acknowledged baseline, or the deletion reached IndexedDB before
+  the previous process stopped.
+- Moving an attachment during the startup pull removes its old index entry, so
+  the pull cannot restore the source path.
+- Renaming an attachment to Markdown, Canvas, or Base keeps the source entry
+  until the new document can be published, then adds the document and removes
+  the binary entry in one index transaction.
 - Edits to a note this device can only read never reach the server. They are
   kept in one conflicted copy per session, rewritten as the note changes.
 - A server restored from a backup can hold older document epochs than a

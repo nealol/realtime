@@ -270,6 +270,64 @@ describe("Canvas collaboration awareness", () => {
     aw.destroy();
     host.remove();
   });
+
+  it("reads local node geometry live and skips renders for local-only changes", async () => {
+    const aw = makeAwareness();
+    const remoteId = aw.doc.clientID + 1;
+    const states = aw.getStates();
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const liveNode = { id: "a", x: 10, y: 20, width: 100, height: 50 };
+    const canvas = {
+      ...makeCanvasLike(),
+      getData: vi.fn(() => ({
+        nodes: [{ id: "b", type: "text", color: "1", x: 0, y: 0, width: 40, height: 30 }],
+        edges: [],
+      })),
+      // "a" is a live node; "b" lacks live geometry, so it needs the snapshot.
+      nodes: new Map<string, unknown>([
+        ["a", liveNode],
+        ["b", { id: "b" }],
+      ]),
+    };
+    const cleanup = mountCanvasCursorOverlay(host, aw, () => canvas);
+    const emitRemote = (canvasPresence: unknown) => {
+      states.set(remoteId, { user: { name: "Remote", color: "#ff0000" }, canvasPresence });
+      aw.emit("change", [{ added: [], updated: [remoteId], removed: [] }, "remote"]);
+    };
+    const hover = () => {
+      for (let index = 0; index < 5; index++)
+        setCanvasCursor(aw, { x: index, y: index, space: "canvas" });
+    };
+
+    hover();
+    expect(canvas.getData).not.toHaveBeenCalled();
+
+    emitRemote({ version: 1, sequence: 1, selectedNodeIds: ["a"] });
+    expect(canvas.getData).not.toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(host.querySelector(".realtime-canvas-presence-box.is-selection")).not.toBeNull(),
+    );
+
+    emitRemote({ version: 1, sequence: 2, selectedNodeIds: ["a"], editingNodeId: "b" });
+    expect(canvas.getData).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => {
+      const editing = host.querySelector<HTMLElement>(".realtime-canvas-presence-box.is-editing");
+      expect(editing?.style.getPropertyValue("--realtime-presence-color")).toBe("#ff0000");
+    });
+
+    const selection = host.querySelector<HTMLElement>(
+      ".realtime-canvas-presence-box.is-selection",
+    )!;
+    const before = selection.style.transform;
+    liveNode.x += 30;
+    hover();
+    await vi.waitFor(() => expect(selection.style.transform).not.toBe(before));
+
+    cleanup();
+    aw.destroy();
+    host.remove();
+  });
 });
 
 describe("readCanvasViewport", () => {

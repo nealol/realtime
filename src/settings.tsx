@@ -13,7 +13,6 @@ import type RealtimePlugin from "./main";
 import { FileDiff } from "@pierre/diffs/react";
 import { parseDiffFromFile } from "@pierre/diffs";
 import {
-  normalizeServerUrl,
   validateAvatarUrl,
   validateGitEmail,
   type CursorAuditEntry,
@@ -24,6 +23,7 @@ import {
   type StorageUsage,
   type VaultInfo,
 } from "./auth";
+import { CompatibilityError } from "./caps";
 import { PLUGIN_NAME } from "./brand";
 import { generateClientIdentity } from "./names";
 import { openTrashModal } from "./TrashModal";
@@ -44,11 +44,6 @@ export interface RealtimeSettings {
    * Obsidian client can hold tokens for multiple servers without collisions.
    */
   authServerId: string;
-  /**
-   * Server URL of an in-progress SSO setup login. Used for nothing else:
-   * changing it cancels any pending SSO login (see AuthClient.beginSetupFor).
-   */
-  pendingSetupServerUrl: string;
   /** Identity from /api/me, cached for status + awareness defaults. */
   userId: string;
   userDisplayName: string;
@@ -108,7 +103,6 @@ export function defaultSettings(): RealtimeSettings {
   return {
     authServerUrl: "http://127.0.0.1:8081",
     authServerId: "",
-    pendingSetupServerUrl: "",
     userId: "",
     userDisplayName: "",
     userEmail: "",
@@ -179,15 +173,15 @@ function SettingsView({
 }
 
 /**
- * Banner shown when the last server-info compatibility check failed. Never
- * rendered when compatible — per project policy, the plugin does not nudge
- * about newer server versions unless compatibility is actually broken.
+ * Banner shown when a server-info compatibility check failed. Never rendered
+ * when compatible — per project policy, the plugin does not nudge about newer
+ * server versions unless compatibility is actually broken.
  *
- * Reads `plugin.lastCompatibilityError`, which is updated by `Auth.serverInfoChecked`
- * on every server-info fetch. Non-persisted: reflects the live server, not config.
+ * Most callers pass `plugin.lastCompatibilityError`, which `Auth.serverInfoChecked`
+ * updates on every check of the active server. Non-persisted: reflects the live
+ * server, not config.
  */
-function CompatibilityBanner({ plugin }: { plugin: RealtimePlugin }) {
-  const err = plugin.lastCompatibilityError;
+function CompatibilityBanner({ error: err }: { error: RealtimePlugin["lastCompatibilityError"] }) {
   if (!err) return null;
   const isClientTooOld = err.reason === "client-too-old";
   const title = isClientTooOld ? "Plugin update required" : "Server incompatible";
@@ -230,6 +224,10 @@ function SetupView({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [sessions, setSessions] = useState<KnownSession[]>([]);
+  // Compatibility of the server typed in the setup form. Checking a candidate
+  // deliberately leaves the active server's `lastCompatibilityError` alone.
+  const [candidateCompat, setCandidateCompat] =
+    useState<RealtimePlugin["lastCompatibilityError"]>(null);
   // Reveal the paste-code fallback shortly after SSO starts, in case the deep
   // link back into Obsidian doesn't fire.
   const showPaste = useDelayedFlag(busy, 2000);
@@ -242,10 +240,18 @@ function SetupView({
       void plugin.auth
         .validSessionsForServer(serverUrl)
         .then((result) => {
-          if (!cancelled) setSessions(result);
+          if (cancelled) return;
+          setSessions(result);
+          setCandidateCompat(null);
         })
-        .catch(() => {
-          if (!cancelled) setSessions([]);
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          setSessions([]);
+          setCandidateCompat(
+            e instanceof CompatibilityError
+              ? { reason: e.reason, detail: e.message, serverVersion: e.serverVersion }
+              : null,
+          );
         });
     }, 250);
     return () => {
@@ -258,7 +264,9 @@ function SetupView({
     <div className="realtime-setup-wrap">
       <div className="realtime-setup-card">
         <h2>Set up {PLUGIN_NAME}</h2>
-        <CompatibilityBanner plugin={plugin} />
+        <CompatibilityBanner
+          error={step === "server" ? candidateCompat : plugin.lastCompatibilityError}
+        />
         {step === "server" ? (
           <form
             style={{ marginTop: "-4px" }}
@@ -571,7 +579,7 @@ function FullSettings({
   return (
     <>
       {/*<h2>Realtime</h2>*/}
-      <CompatibilityBanner plugin={plugin} />
+      <CompatibilityBanner error={plugin.lastCompatibilityError} />
       <AccountSection plugin={plugin} refresh={refresh} />
       <EnableSyncSection plugin={plugin} refresh={refresh} />
       <StructuredSyncSection plugin={plugin} refresh={refresh} />
@@ -2157,6 +2165,8 @@ class ServerMigrationModal extends Modal {
   private plugin: RealtimePlugin;
   private refresh: () => void;
   private root: Root | null = null;
+  /** Aborted on close: an unfinished migration must never commit afterwards. */
+  private readonly closed = new AbortController();
 
   constructor(app: App, plugin: RealtimePlugin, refresh: () => void) {
     super(app);
@@ -2172,11 +2182,13 @@ class ServerMigrationModal extends Modal {
         plugin={this.plugin}
         refresh={this.refresh}
         close={() => this.close()}
+        signal={this.closed.signal}
       />,
     );
   }
 
   onClose(): void {
+    this.closed.abort();
     this.root?.unmount();
     this.root = null;
     this.contentEl.empty();
@@ -2188,11 +2200,13 @@ function ServerMigrationView({
   plugin,
   refresh,
   close,
+  signal,
 }: {
   app: App;
   plugin: RealtimePlugin;
   refresh: () => void;
   close: () => void;
+  signal: AbortSignal;
 }) {
   const [url, setUrl] = useState(plugin.settings.authServerUrl);
   const [busy, setBusy] = useState(false);
@@ -2223,25 +2237,14 @@ function ServerMigrationView({
               setBusy(true);
               setError("");
               try {
-                const normalized = normalizeServerUrl(url);
-                const { token, me } = await plugin.auth.authenticateAt(normalized);
-                const vaults = await plugin.auth.listVaultsAt(normalized, token);
-                const match = vaults.find((vault) => vault.name === app.vault.getName());
-                if (!match)
-                  throw new Error(
-                    `No remote vault named "${app.vault.getName()}" was found on that server.`,
-                  );
-                plugin.settings.activeVaultId = match.id;
-                await plugin.auth.setSessionForServer(normalized, token, me);
-                await plugin.saveSettings();
-                await plugin.reloadSync();
+                await plugin.migrateToServer(url, signal);
                 new Notice(`${PLUGIN_NAME}: server updated.`);
                 close();
                 refresh();
               } catch (e) {
-                setError(e instanceof Error ? e.message : String(e));
+                if (!signal.aborted) setError(e instanceof Error ? e.message : String(e));
               } finally {
-                setBusy(false);
+                if (!signal.aborted) setBusy(false);
               }
             })()
           }
@@ -2366,7 +2369,11 @@ function SsoPasteFallback({ plugin, visible }: { plugin: RealtimePlugin; visible
           type="button"
           className="mod-cta"
           disabled={!code}
-          onClick={() => plugin.auth.submitPastedCode(code)}
+          onClick={() => {
+            if (!plugin.auth.submitPastedCode(code)) {
+              new Notice(`${PLUGIN_NAME}: no sign-in is waiting for a code. Start sign-in again.`);
+            }
+          }}
         >
           Use code
         </button>

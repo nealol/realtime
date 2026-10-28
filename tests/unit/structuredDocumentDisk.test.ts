@@ -1,12 +1,14 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { BaseDocument } from "../../src/BaseDocument";
-import { RealtimeProvider } from "../../src/sync/RealtimeProvider";
+import { RealtimeProvider, SYNC_EVENT_LOCAL_CHANGES } from "../../src/sync/RealtimeProvider";
 import { getClientToken } from "../../src/sync/clientToken";
 import { LocalSyncState } from "../../src/localSyncState";
 import { parseBase, serializeBase } from "../../src/structured/base";
 import { reconcileInto, toValue, type JsonValue } from "../../src/structured/reconcile";
 import { storedContentFingerprint } from "../../src/SyncedDoc";
+import { sha256Text } from "../../src/hash";
+import type * as Hash from "../../src/hash";
 import { makeFakePlugin, type FakePlugin } from "../support/fakePlugin";
 import { startAuthHarness, type AuthHarness } from "../support/authServer";
 import { freshGuid, waitFor } from "../support/util";
@@ -28,6 +30,41 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await harness?.stop();
+});
+
+/** Holds content fingerprints in flight until released. */
+const hashGate = vi.hoisted(() => {
+  const gate = {
+    hashed: [] as string[],
+    held: null as Promise<void> | null,
+    release: () => {},
+    hold(): void {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      gate.held = promise;
+      gate.release = () => {
+        gate.held = null;
+        resolve();
+      };
+    },
+  };
+  return gate;
+});
+
+vi.mock("../../src/hash", async (importOriginal) => {
+  const actual = await importOriginal<typeof Hash>();
+  return {
+    ...actual,
+    sha256Text: async (text: string) => {
+      hashGate.hashed.push(text);
+      if (hashGate.held) await hashGate.held;
+      return actual.sha256Text(text);
+    },
+  };
+});
+
+afterEach(() => {
+  hashGate.release();
+  hashGate.hashed.length = 0;
 });
 
 const docId = (guid: string) => `${vaultId}__${guid}`;
@@ -82,6 +119,20 @@ function attachLocalSyncState(plugin: FakePlugin): LocalSyncState {
       state.acknowledgedFingerprint(path, identity),
   };
   return state;
+}
+
+/** Record the fingerprints the document reports as acknowledged. */
+function recordAcknowledgements(plugin: FakePlugin): string[] {
+  const recorded: string[] = [];
+  const vaultSync = (plugin as any).vaultSync as {
+    noteContentAcknowledged: (...args: [string, string, string, string, boolean?]) => void;
+  };
+  const note = vaultSync.noteContentAcknowledged;
+  vaultSync.noteContentAcknowledged = (...args) => {
+    recorded.push(args[3]);
+    note(...args);
+  };
+  return recorded;
 }
 
 describe("StructuredDocument disk sync", () => {
@@ -271,6 +322,92 @@ describe("StructuredDocument disk sync", () => {
     } finally {
       doc.destroy();
       collaborator.destroy();
+    }
+  });
+});
+
+describe("StructuredDocument acknowledged content", () => {
+  /**
+   * A ready Base over `value`. `remoteSet` applies a collaborator's change
+   * and `acknowledge` reports that the server holds every local change, both
+   * without a server round trip.
+   */
+  async function startAcknowledging(value: JsonValue) {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    const recorded = recordAcknowledgements(plugin);
+    vault.files.set("views.base", serializeBase(value));
+    const doc = new BaseDocument(plugin as any, "views.base", guid, docId(guid), true);
+    const remote = new Y.Doc();
+    const acknowledged = () => state.acknowledgedFingerprint("views.base", guid);
+    const cleanup = () => {
+      doc.destroy();
+      remote.destroy();
+      state.destroy();
+    };
+    try {
+      await doc.whenReady();
+      const initial = await sha256Text(serializeBase(doc.value));
+      await waitFor(() => acknowledged() === initial, { label: "startup content acknowledged" });
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+    Y.applyUpdate(remote, Y.encodeStateAsUpdate(doc.ydoc));
+    const remoteSet = (next: JsonValue) => {
+      const before = Y.encodeStateVector(doc.ydoc);
+      remote.transact(() => reconcileInto(remote.getMap("root"), next));
+      Y.applyUpdate(doc.ydoc, Y.encodeStateAsUpdate(remote, before), doc.provider);
+    };
+    const acknowledge = () => (doc.provider as any).emit(SYNC_EVENT_LOCAL_CHANGES, false);
+    return { doc, recorded, acknowledged, remoteSet, acknowledge, cleanup };
+  }
+
+  it("keeps a fingerprint across transactions that change no content", async () => {
+    const { doc, acknowledged, remoteSet, acknowledge, cleanup } = await startAcknowledging({
+      formulas: { a: "1" },
+    });
+    try {
+      hashGate.hold();
+      remoteSet({ formulas: { a: "1", b: "2" } });
+      const content = serializeBase(doc.value);
+      acknowledge();
+      await waitFor(() => hashGate.hashed.includes(content), { label: "content hashing" });
+      doc.ydoc.transact(() => {});
+      doc.ydoc.transact(() => reconcileInto(doc.root, doc.value));
+      hashGate.release();
+
+      const fingerprint = await sha256Text(content);
+      await waitFor(() => acknowledged() === fingerprint, { label: "content acknowledged" });
+      expect(serializeBase(doc.value)).toBe(content);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("never records a value that changed while it was fingerprinted", async () => {
+    const { doc, recorded, acknowledged, remoteSet, acknowledge, cleanup } =
+      await startAcknowledging({ formulas: { a: "1" } });
+    try {
+      hashGate.hold();
+      remoteSet({ formulas: { a: "1", b: "2" } });
+      const stale = serializeBase(doc.value);
+      acknowledge();
+      await waitFor(() => hashGate.hashed.includes(stale), { label: "stale value hashing" });
+      remoteSet({ formulas: { a: "1", c: "3" } });
+      const newer = serializeBase(doc.value);
+      hashGate.release();
+
+      // No further acknowledgement arrives: the document retries on its own.
+      const latest = await sha256Text(newer);
+      await waitFor(() => acknowledged() === latest, { label: "newer value acknowledged" });
+      expect(recorded).not.toContain(await sha256Text(stale));
+    } finally {
+      cleanup();
     }
   });
 });

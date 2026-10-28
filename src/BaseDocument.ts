@@ -47,6 +47,21 @@ export class BaseDocument extends StructuredDocument {
     return this.binding.isActive();
   }
 
+  // The binding pushes nothing into the view before startup (the CRDT holds
+  // only stored, possibly empty, state): push the reconciled value once.
+  protected async finishStartupReconcile(): Promise<void> {
+    await super.finishStartupReconcile();
+    this.binding.applyRemote();
+  }
+
+  protected liveStartupValue(): JsonValue | null {
+    return this.binding.startupLiveValue();
+  }
+
+  protected startupDiskChanged(): void {
+    this.binding.checkStartupAnchor();
+  }
+
   protected parse(text: string): JsonValue {
     return parseBase(text);
   }

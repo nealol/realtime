@@ -7,6 +7,7 @@ import {
   reconcileInto,
   toValue,
 } from "../../src/structured/reconcile";
+import { canonicalizeCanvasOrders } from "../../src/structured/canvasOperations";
 import {
   parseCanvas,
   reconcileCanvas,
@@ -355,6 +356,60 @@ describe("canvas concurrent merge", () => {
         .map((n) => n.id)
         .sort(),
     ).toEqual(["n1", "n3"]);
+  });
+
+  it("deletes known items after a restart while keeping concurrent additions", () => {
+    const seed = {
+      nodes: [
+        { id: "n1", type: "text", text: "first", x: 0, y: 0 },
+        { id: "n2", type: "text", text: "second", x: 100, y: 0 },
+      ],
+      edges: [{ id: "e1", fromNode: "n1", toNode: "n2" }],
+    };
+    const before = new Y.Doc();
+    apply(before, seed);
+    // A restart replays the persisted updates into a doc with a new clientID:
+    // every existing item now belongs to a foreign client.
+    const restarted = new Y.Doc();
+    Y.applyUpdate(restarted, Y.encodeStateAsUpdate(before));
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(before));
+    apply(peer, {
+      nodes: [...seed.nodes, { id: "n3", type: "text", text: "remote", x: 0, y: 200 }],
+      edges: seed.edges,
+    });
+    Y.applyUpdate(restarted, Y.encodeStateAsUpdate(peer));
+
+    // The disk edit removed n2 and e1 from the content it was made against.
+    restarted.transact(() =>
+      reconcileCanvas(
+        restarted.getMap("root"),
+        parseCanvas(JSON.stringify({ nodes: [seed.nodes[0]], edges: [] })),
+        restarted.clientID,
+        parseCanvas(JSON.stringify(seed)),
+      ),
+    );
+    canonicalizeCanvasOrders(restarted.getMap("root"));
+
+    expect(canvasNodes(restarted.getMap("root")).map((n) => n.id)).toEqual(["n1", "n3"]);
+    expect(canvasEdges(restarted.getMap("root"))).toEqual([]);
+
+    // The deletion reaches the peer, and the peer's stale full snapshot that
+    // still holds n2 cannot resurrect it.
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(restarted));
+    apply(peer, {
+      nodes: [...seed.nodes, { id: "n3", type: "text", text: "remote", x: 0, y: 200 }],
+      edges: seed.edges,
+    });
+    Y.applyUpdate(restarted, Y.encodeStateAsUpdate(peer));
+    for (const doc of [restarted, peer]) {
+      expect(
+        canvasNodes(doc.getMap("root"))
+          .map((n) => n.id)
+          .sort(),
+      ).toEqual(["n1", "n3"]);
+      expect(canvasEdges(doc.getMap("root"))).toEqual([]);
+    }
   });
 });
 

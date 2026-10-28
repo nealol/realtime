@@ -1,5 +1,7 @@
 import type RealtimePlugin from "../main";
 import type { BaseDocument } from "../BaseDocument";
+import { parseBase } from "../structured/base";
+import { jsonEqual, type JsonValue } from "../structured/reconcile";
 
 /**
  * Origin tag stamped on the Yjs transaction when we fold a local base edit
@@ -37,6 +39,14 @@ export class BaseBinding {
   /** Our patch function, so unpatch can tell whether we're still the top patch. */
   private patchedRequestSave: InternalBaseView["requestSave"] | null = null;
   private applyingRemote = false;
+  /**
+   * Before startup: the view has been seen displaying this file's disk
+   * content, so what it shows since is this file plus local edits, never
+   * leftovers of a view Obsidian reused from another file.
+   */
+  private startupAnchored = false;
+  /** Before startup: what the view showed when bound, matched once the disk is known. */
+  private boundSnapshot: JsonValue | null = null;
 
   constructor(plugin: RealtimePlugin, doc: BaseDocument) {
     this.plugin = plugin;
@@ -70,6 +80,10 @@ export class BaseBinding {
       return result;
     };
     view.requestSave = this.patchedRequestSave;
+    if (!this.doc.isReady()) {
+      this.boundSnapshot = this.readView();
+      this.checkStartupAnchor();
+    }
     this.applyRemote();
   }
 
@@ -92,7 +106,11 @@ export class BaseBinding {
     if (!found || found !== this.view || this.isStaleView()) this.unpatch();
   }
 
-  /** Push the CRDT's current value into the live view and persist it. */
+  /**
+   * Push the CRDT's current value into the live view and persist it. Before
+   * startup the CRDT holds only stored (possibly empty) state, so nothing is
+   * pushed; the document calls this once its startup reconcile completes.
+   */
   applyRemote(): void {
     if (!this.view) return;
     // The leaf may have switched this reused view to a different file since we
@@ -101,10 +119,12 @@ export class BaseBinding {
       this.unpatch();
       return;
     }
+    if (!this.doc.isReady()) return;
+    this.boundSnapshot = null;
     const next = this.doc.baseData();
     // Avoid a pointless re-render (and the scroll/selection churn it brings)
     // when the view already shows this content.
-    if (this.view.getViewData() === next) return;
+    if (sameBase(this.view.getViewData(), next)) return;
     this.applyingRemote = true;
     try {
       this.view.setViewData(next, false);
@@ -118,8 +138,40 @@ export class BaseBinding {
     }
   }
 
+  /**
+   * Before startup, recognize that the view displays this file: it shows (or
+   * showed when bound) exactly the disk content the startup reconcile merges.
+   */
+  checkStartupAnchor(): void {
+    if (this.startupAnchored || !this.view || this.doc.isReady() || this.isStaleView()) return;
+    const current = this.readView();
+    if (
+      (current !== null && this.doc.matchesStartupDisk(current)) ||
+      (this.boundSnapshot !== null && this.doc.matchesStartupDisk(this.boundSnapshot))
+    ) {
+      this.startupAnchored = true;
+      this.boundSnapshot = null;
+    }
+  }
+
+  /** Before startup: the view's current content, if it displays this file. */
+  startupLiveValue(): JsonValue | null {
+    if (!this.view || this.isStaleView()) return null;
+    this.checkStartupAnchor();
+    return this.startupAnchored ? this.readView() : null;
+  }
+
   destroy(): void {
     this.unpatch();
+  }
+
+  private readView(): JsonValue | null {
+    try {
+      const data = this.view?.getViewData();
+      return typeof data === "string" ? parseBase(data) : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Restore the view's original `requestSave` and forget the binding. */
@@ -136,6 +188,8 @@ export class BaseBinding {
     this.view = null;
     this.originalRequestSave = null;
     this.patchedRequestSave = null;
+    this.startupAnchored = false;
+    this.boundSnapshot = null;
   }
 
   private captureLocal(): void {
@@ -145,6 +199,14 @@ export class BaseBinding {
       // base everywhere with the other base's content.
       if (this.view && this.isStaleView()) {
         this.unpatch();
+        return;
+      }
+      // Before startup reconcile the document holds only its stored state, and
+      // the YAML may be stale data of a reused view. Fold nothing: the startup
+      // merge reads this view (startupLiveValue) once it has been seen showing
+      // this file, and saved edits reach it through the disk.
+      if (!this.doc.isReady()) {
+        this.checkStartupAnchor();
         return;
       }
       const data = this.view?.getViewData();
@@ -185,4 +247,14 @@ function isInternalBaseView(value: unknown): value is InternalBaseView {
     typeof view.setViewData === "function" &&
     typeof view.requestSave === "function"
   );
+}
+
+/** Whether two `.base` texts hold the same value, ignoring YAML formatting. */
+function sameBase(left: string, right: string): boolean {
+  if (left === right) return true;
+  try {
+    return jsonEqual(parseBase(left), parseBase(right));
+  } catch {
+    return false;
+  }
 }

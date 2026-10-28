@@ -1,6 +1,6 @@
 {
   "name": "realtime",
-  "version": "0.4.4-alpha.7",
+  "version": "0.4.4-alpha.8",
   "private": true,
   "description": "Google-docs-like collaborative editing for Obsidian, powered by Yjs.",
   "keywords": [

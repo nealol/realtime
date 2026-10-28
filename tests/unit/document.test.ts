@@ -10,6 +10,8 @@ import { setDocumentEpoch } from "../../src/documentEpoch";
 import { LocalSyncState } from "../../src/localSyncState";
 import { storedContentFingerprint } from "../../src/SyncedDoc";
 import { sha256Text } from "../../src/hash";
+import type * as Hash from "../../src/hash";
+import { SYNC_EVENT_LOCAL_CHANGES } from "../../src/sync/RealtimeProvider";
 import type RealtimePlugin from "../../src/main";
 
 /**
@@ -42,6 +44,50 @@ function attachLocalSyncState(plugin: FakePlugin): LocalSyncState {
   };
   return state;
 }
+
+/** Record the fingerprints the document reports as acknowledged. */
+function recordAcknowledgements(plugin: FakePlugin): string[] {
+  const recorded: string[] = [];
+  const vaultSync = (plugin as any).vaultSync as {
+    noteContentAcknowledged: (...args: [string, string, string, string, boolean?]) => void;
+  };
+  const note = vaultSync.noteContentAcknowledged;
+  vaultSync.noteContentAcknowledged = (...args) => {
+    recorded.push(args[3]);
+    note(...args);
+  };
+  return recorded;
+}
+
+/** Holds content fingerprints in flight until released. */
+const hashGate = vi.hoisted(() => {
+  const gate = {
+    hashed: [] as string[],
+    held: null as Promise<void> | null,
+    release: () => {},
+    hold(): void {
+      const { promise, resolve } = Promise.withResolvers<void>();
+      gate.held = promise;
+      gate.release = () => {
+        gate.held = null;
+        resolve();
+      };
+    },
+  };
+  return gate;
+});
+
+vi.mock("../../src/hash", async (importOriginal) => {
+  const actual = await importOriginal<typeof Hash>();
+  return {
+    ...actual,
+    sha256Text: async (text: string) => {
+      hashGate.hashed.push(text);
+      if (hashGate.held) await hashGate.held;
+      return actual.sha256Text(text);
+    },
+  };
+});
 
 const modalMock = vi.hoisted(() => ({
   choice: "local" as "local" | "remote",
@@ -87,6 +133,8 @@ afterEach(() => {
   modalMock.choice = "local";
   modalMock.delayMs = 0;
   modalMock.calls.length = 0;
+  hashGate.release();
+  hashGate.hashed.length = 0;
 });
 
 /** The vault-namespaced doc id for a bare guid. */
@@ -1645,6 +1693,185 @@ describe("Document before its first server sync", () => {
     } finally {
       doc.destroy();
       peer.destroy();
+    }
+  });
+});
+
+describe("Document acknowledged content", () => {
+  /**
+   * A ready document over `content` with an editor bound, so only
+   * acknowledgements (not disk writes) record its content. `remoteEdit`
+   * applies a collaborator's change and `acknowledge` reports that the server
+   * holds every local change, both without a server round trip.
+   */
+  async function startAcknowledging(content: string) {
+    const guid = freshGuid();
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    const recorded = recordAcknowledgements(plugin);
+    vault.files.set("note.md", content);
+    const doc = new Document(plugin as any, "note.md", guid, docId(guid), true);
+    const remote = new Y.Doc();
+    const acknowledged = () => state.acknowledgedFingerprint("note.md", guid);
+    const cleanup = () => {
+      doc.destroy();
+      remote.destroy();
+      state.destroy();
+    };
+    try {
+      await doc.whenReady();
+      const initial = await sha256Text(content);
+      await waitFor(() => acknowledged() === initial, { label: "startup content acknowledged" });
+    } catch (error) {
+      cleanup();
+      throw error;
+    }
+    doc.bindEditor();
+    Y.applyUpdate(remote, Y.encodeStateAsUpdate(doc.ydoc));
+    const remoteEdit = (text: string) => {
+      const before = Y.encodeStateVector(doc.ydoc);
+      const ytext = remote.getText("contents");
+      ytext.insert(ytext.length, text);
+      Y.applyUpdate(doc.ydoc, Y.encodeStateAsUpdate(remote, before), doc.provider);
+    };
+    const acknowledge = () => (doc.provider as any).emit(SYNC_EVENT_LOCAL_CHANGES, false);
+    return { doc, recorded, acknowledged, remoteEdit, acknowledge, cleanup };
+  }
+
+  // These documents hold live server connections, so the clock cannot be
+  // faked: the burst is paced in real time, and checks that nothing was
+  // recorded wait past the record delay.
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("records content while acknowledgements keep arriving, then the latest", async () => {
+    const { doc, acknowledged, remoteEdit, acknowledge, cleanup } =
+      await startAcknowledging("seed\n");
+    try {
+      const contents: string[] = [];
+      for (let i = 0; i < 40; i++) {
+        remoteEdit(`${i}\n`);
+        acknowledge();
+        contents.push(doc.content);
+        await sleep(40);
+      }
+      // Acknowledgements never paused, yet content from during the burst
+      // was recorded: later acknowledgements do not postpone the record.
+      const fingerprints = await Promise.all(contents.map((content) => sha256Text(content)));
+      expect(fingerprints).toContain(acknowledged());
+      const latest = await sha256Text(doc.content);
+      await waitFor(() => acknowledged() === latest, { label: "latest content acknowledged" });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("never records content that changed while it was fingerprinted", async () => {
+    const { doc, recorded, acknowledged, remoteEdit, acknowledge, cleanup } =
+      await startAcknowledging("seed\n");
+    try {
+      hashGate.hold();
+      remoteEdit("stale\n");
+      const stale = doc.content;
+      acknowledge();
+      await waitFor(() => hashGate.hashed.includes(stale), { label: "stale content hashing" });
+      remoteEdit("newer\n");
+      const newer = doc.content;
+      hashGate.release();
+
+      // No further acknowledgement arrives: the document retries on its own.
+      const latest = await sha256Text(newer);
+      await waitFor(() => acknowledged() === latest, { label: "newer content acknowledged" });
+      expect(recorded).not.toContain(await sha256Text(stale));
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("records local changes only once a later acknowledgement covers them", async () => {
+    const { doc, recorded, acknowledged, acknowledge, cleanup } =
+      await startAcknowledging("seed\n");
+    try {
+      doc.disconnect();
+      doc.ytext.insert(0, "offline ");
+      const edited = await sha256Text(doc.content);
+      expect(doc.provider.hasLocalChanges).toBe(true);
+      // An acknowledgement of earlier changes does not cover this edit.
+      acknowledge();
+      await sleep(400);
+      expect(recorded).not.toContain(edited);
+
+      doc.connect();
+      await waitFor(() => acknowledged() === edited, { label: "edit acknowledged" });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("records startup content before the document is ready", async () => {
+    const guid = freshGuid();
+    const peer = new Peer(memberPlugin, docId(guid));
+    const { plugin, vault } = makeFakePlugin(harness.authUrl, {
+      sessionToken: token,
+      activeVaultId: vaultId,
+    });
+    const state = attachLocalSyncState(plugin);
+    let doc: Document | null = null;
+    try {
+      await peer.whenSynced();
+      peer.setText("remote start\n");
+      await peer.whenChangesSynced();
+
+      doc = new Document(plugin as any, "note.md", guid, docId(guid), false);
+      const created = doc;
+      const create = vault.create.bind(vault);
+      vault.create = async (path, content) => {
+        // Readiness does not wait for the initial sync-status acknowledgement.
+        // Hold materialization until it arrives to exercise the clean startup
+        // path, which must record immediately rather than queueing a timer.
+        await waitFor(() => !created.provider.hasLocalChanges, { label: "provider clean" });
+        return create(path, content);
+      };
+      await doc.whenReady();
+      expect(doc.content).toBe("remote start\n");
+      expect(state.acknowledgedFingerprint("note.md", guid)).toBe(
+        await sha256Text("remote start\n"),
+      );
+    } finally {
+      doc?.destroy();
+      peer.destroy();
+      state.destroy();
+    }
+  });
+
+  it("records nothing once destroyed, whether waiting or fingerprinting", async () => {
+    const waiting = await startAcknowledging("seed\n");
+    try {
+      waiting.remoteEdit("pending\n");
+      const pending = await sha256Text(waiting.doc.content);
+      waiting.acknowledge();
+      waiting.doc.destroy();
+      await sleep(400);
+      expect(waiting.recorded).not.toContain(pending);
+    } finally {
+      waiting.cleanup();
+    }
+
+    const hashing = await startAcknowledging("seed\n");
+    try {
+      hashGate.hold();
+      hashing.remoteEdit("in flight\n");
+      const inFlight = hashing.doc.content;
+      hashing.acknowledge();
+      await waitFor(() => hashGate.hashed.includes(inFlight), { label: "content hashing" });
+      hashing.doc.destroy();
+      hashGate.release();
+      await sleep(50);
+      expect(hashing.recorded).not.toContain(await sha256Text(inFlight));
+    } finally {
+      hashing.cleanup();
     }
   });
 });

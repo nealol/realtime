@@ -1,12 +1,14 @@
 import type RealtimePlugin from "../main";
 import type { CanvasDocument } from "../CanvasDocument";
-import { parseCanvas, type StructuredCanvas } from "../structured/canvas";
+import type { StructuredCanvas } from "../structured/canvas";
 import { diffCanvas, normalizeCanvas, type CanvasOperation } from "../structured/canvasOperations";
 import {
+  liveCanvasNodeGeometry,
   mountCanvasCursorOverlay,
   mountPresenceStack,
   readCanvasViewport,
   setCanvasPresence,
+  type CanvasPresenceNode,
   type CanvasPresenceState,
 } from "../presence";
 import { CanvasTextCardBinding } from "./CanvasTextCardBinding";
@@ -22,6 +24,8 @@ import type { EventRef } from "obsidian";
  */
 export const CANVAS_LOCAL_ORIGIN = Symbol("realtime-canvas-request-save");
 let loggedUnsupported = false;
+/** Orders edits seen in views before startup, so the latest-edited view wins. */
+let startupEditCounter = 0;
 
 interface InternalCanvas {
   getData: () => unknown;
@@ -44,6 +48,8 @@ interface BoundCanvasView {
     file?: { path?: string } | null;
     getViewData?: () => unknown;
     setViewData?: (data: string, clear?: boolean) => void;
+    /** Obsidian saves the view here before it loads another file or closes. */
+    onUnloadFile?: (file: unknown) => Promise<void>;
   };
 }
 
@@ -85,6 +91,24 @@ export class CanvasBinding {
 
   applyRemote(): void {
     for (const binding of this.views.values()) binding.applyRemote();
+  }
+
+  /**
+   * Before the startup reconcile: the unsaved content of the open view edited
+   * most recently, among views seen displaying this file, or null.
+   */
+  startupLiveValue(): StructuredCanvas | null {
+    let latest: { value: StructuredCanvas; sequence: number } | null = null;
+    for (const binding of this.views.values()) {
+      const live = binding.startupLive();
+      if (live && (!latest || live.sequence > latest.sequence)) latest = live;
+    }
+    return latest?.value ?? null;
+  }
+
+  /** Before startup: let each view recognize the file's (new) disk content. */
+  checkStartupViews(): void {
+    for (const binding of this.views.values()) binding.checkStartupAnchor();
   }
 
   scheduleRemote(): void {
@@ -196,6 +220,11 @@ class CanvasViewBinding {
   private originalRequestSave: InternalCanvas["requestSave"] | null = null;
   /** Our patch function, so unpatch can tell whether we're still the top patch. */
   private patchedRequestSave: InternalCanvas["requestSave"] | null = null;
+  /**
+   * Undoes our `onUnloadFile` patch while it is still the top patch; null when
+   * the view has no unload hook, so gesture saves must be captured eagerly.
+   */
+  private restoreOnUnloadFile: (() => void) | null = null;
   private applyingRemote = false;
   /**
    * Normalized snapshot of the last data pushed into the view via
@@ -207,6 +236,16 @@ class CanvasViewBinding {
   private lastImportedHash: string | null = null;
   /** Last normalized state accepted by this exact live view. */
   private shadow: ReturnType<typeof normalizeCanvas> | null = null;
+  /**
+   * Before startup: this view has been seen displaying this file's disk
+   * content, so what it shows since is this file plus local edits, never
+   * leftovers of a view Obsidian reused from another file.
+   */
+  private startupAnchored = false;
+  /** Before startup: what the view showed when bound, matched once the disk is known. */
+  private boundSnapshot: StructuredCanvas | null = null;
+  /** Before startup: order of the latest edit seen in this view. */
+  private startupEditSequence = 0;
   private interactionActive = false;
   private interactionTimer: ReturnType<typeof setInterval> | null = null;
   private remoteTimer: ReturnType<typeof setTimeout> | null = null;
@@ -259,10 +298,40 @@ class CanvasViewBinding {
     this.originalRequestSave = original;
     this.patchedRequestSave = (...args: unknown[]) => {
       const result = original(...args);
-      if (!this.applyingRemote) this.captureLocal();
+      // Obsidian requests a save on every pointer move of a gesture. Capturing
+      // each one serializes the whole board per frame; instead the bounded
+      // interaction sampler and the release capture fold the gesture in. That
+      // is only safe when the unload hook below can flush the gesture before
+      // the view switches files; otherwise keep capturing every save. Before
+      // startup a capture only orders this view's edit, so keep it.
+      if (
+        !this.applyingRemote &&
+        (!this.interactionActive || !this.restoreOnUnloadFile || !this.doc.isReady())
+      ) {
+        this.captureLocal();
+      }
       return result;
     };
     canvas.requestSave = this.patchedRequestSave;
+    // Obsidian unloads the current file (with `view.file` still set to it)
+    // before reusing the view for another file or closing it, and saves the
+    // view there. Fold the in-progress gesture first, while the view still
+    // shows this document. Like requestSave above, the closure delegates to
+    // what it wrapped even if a lingering copy outlives this binding.
+    const originalUnload = view.onUnloadFile;
+    if (typeof originalUnload === "function") {
+      const ownUnload = Object.prototype.hasOwnProperty.call(view, "onUnloadFile");
+      const patchedUnload = (file: unknown) => {
+        if (this.interactionActive && this.canvas && !this.isStale()) this.stopInteraction(true);
+        return originalUnload.call(view, file);
+      };
+      view.onUnloadFile = patchedUnload;
+      this.restoreOnUnloadFile = () => {
+        if (view.onUnloadFile !== patchedUnload) return;
+        if (ownUnload) view.onUnloadFile = originalUnload;
+        else delete view.onUnloadFile;
+      };
+    }
     // Mount presence avatar stack + canvas cursor overlay. Both clean up via
     // presenceCleanup, which is called in unpatch().
     const stackCleanup = mountPresenceStack(
@@ -289,7 +358,45 @@ class CanvasViewBinding {
       host,
     );
     this.textCardBinding.start();
+    if (!this.doc.isReady()) {
+      this.boundSnapshot = this.readView();
+      this.checkStartupAnchor();
+    }
     this.applyRemote();
+  }
+
+  /**
+   * Before startup, recognize that the view displays this file: it shows (or
+   * showed when bound) exactly the disk content the startup reconcile merges.
+   */
+  checkStartupAnchor(): void {
+    if (this.startupAnchored || !this.canvas || this.doc.isReady() || this.isStale()) return;
+    const current = this.readView();
+    if (
+      (current !== null && this.doc.matchesStartupDisk(current)) ||
+      (this.boundSnapshot !== null && this.doc.matchesStartupDisk(this.boundSnapshot))
+    ) {
+      this.startupAnchored = true;
+      this.boundSnapshot = null;
+    }
+  }
+
+  /** Before startup: this view's current content, if it displays this file. */
+  startupLive(): { value: StructuredCanvas; sequence: number } | null {
+    if (!this.canvas || this.isStale()) return null;
+    this.checkStartupAnchor();
+    const value = this.startupAnchored ? this.readView() : null;
+    return value && { value, sequence: this.startupEditSequence };
+  }
+
+  /** The view's normalized content; null when the view cannot provide it. */
+  private readView(): StructuredCanvas | null {
+    try {
+      return this.canvas ? normalizeCanvas(this.canvas.getData()) : null;
+    } catch (error) {
+      console.error(`[Realtime] failed to read canvas view for ${this.doc.path}`, error);
+      return null;
+    }
   }
 
   /**
@@ -316,6 +423,7 @@ class CanvasViewBinding {
     // Do not import the constructor-time empty Y.Doc into an already-open
     // canvas. The real value arrives after IndexedDB/server startup reconcile.
     if (!this.doc.isReady()) return;
+    this.boundSnapshot = null;
     if (this.textCardBinding?.hasUnboundActiveEditor()) {
       this.remotePending = true;
       return;
@@ -397,7 +505,10 @@ class CanvasViewBinding {
 
   /** Restore the canvas's original `requestSave` and forget the binding. */
   private unpatch(): void {
-    this.stopInteraction(false);
+    // Saves requested during a gesture are folded in by the sampler, so a
+    // binding torn down mid-gesture must still capture the latest state. A
+    // view now showing another file holds none of this document's edits.
+    this.stopInteraction(!this.isStale());
     if (this.remoteTimer) clearTimeout(this.remoteTimer);
     this.remoteTimer = null;
     this.remotePending = false;
@@ -426,6 +537,8 @@ class CanvasViewBinding {
         this.canvas.requestSave = this.originalRequestSave;
       }
     }
+    this.restoreOnUnloadFile?.();
+    this.restoreOnUnloadFile = null;
     this.canvas = null;
     this.adapter = null;
     this.view = null;
@@ -433,6 +546,8 @@ class CanvasViewBinding {
     this.patchedRequestSave = null;
     this.lastImportedHash = null;
     this.shadow = null;
+    this.startupAnchored = false;
+    this.boundSnapshot = null;
   }
 
   private prioritizeAttachments(canvas: StructuredCanvas): void {
@@ -510,6 +625,9 @@ class CanvasViewBinding {
 
   private startInteraction(): void {
     if (this.interactionActive || !this.canvas || this.isStale()) return;
+    // A gesture starts from what the view shows now: before startup, that
+    // may be the file's disk content, recognizing the view before it changes.
+    this.checkStartupAnchor();
     this.interactionActive = true;
     this.publishPresence(true);
     // Sampling is durable but bounded. Awareness handles smooth pointer motion.
@@ -537,18 +655,10 @@ class CanvasViewBinding {
       this.updatePresence(this, null);
       return;
     }
-    const data = normalizeCanvas(canvas.getData());
-    const selectedNodeIds = selectedIds(canvas).filter((id) => id in data.nodes);
+    const selection = selectedNodeGeometry(canvas);
+    const selectedNodeIds = selection.map((node) => node.id);
+    const interactionNodes = selection.flatMap((node) => (node.geometry ? [node.geometry] : []));
     const viewport = readCanvasViewport(canvas);
-    const interactionNodes = selectedNodeIds.flatMap((id) => {
-      const node = data.nodes[id];
-      if (!node || typeof node !== "object" || Array.isArray(node)) return [];
-      const { x, y, width, height } = node;
-      if ([x, y, width, height].some((value) => typeof value !== "number")) return [];
-      return [
-        { id, x: x as number, y: y as number, width: width as number, height: height as number },
-      ];
-    });
     this.updatePresence(this, {
       version: 1,
       sequence: ++this.presenceSequence,
@@ -571,21 +681,29 @@ class CanvasViewBinding {
         this.invalidate(this);
         return;
       }
-      // Saves can fire while Obsidian is still mounting/reusing a canvas view.
-      // Before startup reconcile, that snapshot may be stale data from a
-      // previous path; disk startup handling is the source of truth until ready.
-      if (!this.doc.isReady()) return;
+      // Before startup reconcile the document holds only its stored state, and
+      // the snapshot may be stale data of a reused view. Fold nothing: the
+      // startup merge reads this view (startupLive) once it has been seen
+      // showing this file, and saved edits reach it through the disk.
+      if (!this.doc.isReady()) {
+        this.checkStartupAnchor();
+        if (this.startupAnchored) this.startupEditSequence = ++startupEditCounter;
+        return;
+      }
       const data = this.canvas.getData();
-      this.prioritizeAttachments(normalizeCanvas(data));
+      // Normalize once: attachment discovery, the bounce-back check, and the
+      // operation diff all read this snapshot.
+      const next = normalizeCanvas(data);
+      this.prioritizeAttachments(next);
       if (!data) return;
       // Ignore the bounce-back from our own importData(): if the view still
       // shows exactly what we just pushed, it's not a local edit. Obsidian's
       // requestSave is debounced and may fire after applyingRemote has been
       // reset, so the flag alone is insufficient.
-      const dataHash = hashCanvasData(data);
-      if (this.lastImportedHash !== null && dataHash === this.lastImportedHash) return;
-      this.lastImportedHash = null;
-      const next = normalizeCanvas(data);
+      if (this.lastImportedHash !== null) {
+        if (hashStructuredCanvas(next) === this.lastImportedHash) return;
+        this.lastImportedHash = null;
+      }
       if (this.shadow && typeof this.doc.applyCanvasOperations === "function") {
         const operations: CanvasOperation[] = diffCanvas(this.shadow, next);
         if (operations.length) {
@@ -670,6 +788,43 @@ function selectedIds(canvas: InternalCanvas): string[] {
   return [...new Set(ids)].sort();
 }
 
+/**
+ * Selected node ids (sorted, edges excluded) with their geometry when it is a
+ * numeric box. Reads Obsidian's live node map so presence publishing does not
+ * serialize the whole Canvas per frame; falls back to one getData() snapshot
+ * when the live map cannot answer for some selected id (older/private shapes).
+ */
+function selectedNodeGeometry(
+  canvas: InternalCanvas,
+): Array<{ id: string; geometry: CanvasPresenceNode | null }> {
+  const ids = selectedIds(canvas);
+  if (!ids.length) return [];
+  const live: Array<{ id: string; geometry: CanvasPresenceNode }> = [];
+  for (const id of ids) {
+    const geometry = liveCanvasNodeGeometry(canvas, id);
+    if (geometry === undefined) {
+      const data = normalizeCanvas(canvas.getData());
+      return ids.flatMap<{ id: string; geometry: CanvasPresenceNode | null }>((selectedId) => {
+        if (!(selectedId in data.nodes)) return [];
+        const node = data.nodes[selectedId];
+        if (!node || typeof node !== "object" || Array.isArray(node))
+          return [{ id: selectedId, geometry: null }];
+        const { x, y, width, height } = node;
+        if (
+          typeof x !== "number" ||
+          typeof y !== "number" ||
+          typeof width !== "number" ||
+          typeof height !== "number"
+        )
+          return [{ id: selectedId, geometry: null }];
+        return [{ id: selectedId, geometry: { id: selectedId, x, y, width, height } }];
+      });
+    }
+    if (geometry) live.push({ id, geometry });
+  }
+  return live;
+}
+
 const loggedAdapterFallbacks = new Set<string>();
 
 function logAdapterFallback(reason: string, error?: unknown): void {
@@ -730,21 +885,26 @@ export function canvasAttachmentPaths(canvas: StructuredCanvas): string[] {
 /**
  * Normalize canvas data through the parser so field reordering or default
  * additions by Obsidian's view don't defeat the equality check. Both
- * {@link applyRemote} and {@link captureLocal} hash through this so the
- * comparison is stable regardless of which side produced the snapshot.
+ * {@link applyRemote} and {@link captureLocal} hash through
+ * {@link hashStructuredCanvas} so the comparison is stable regardless of which
+ * side produced the snapshot.
  */
 function hashCanvasData(data: unknown): string {
   try {
-    const parsed = parseCanvas(JSON.stringify(data ?? {}));
-    return JSON.stringify({
-      n: Object.keys(parsed.nodes).sort(),
-      e: Object.keys(parsed.edges).sort(),
-      // Include field-level content so a real local edit (e.g. a node move)
-      // is NOT mistaken for the bounce-back even when the id sets match.
-      nodes: parsed.nodes,
-      edges: parsed.edges,
-    });
+    return hashStructuredCanvas(normalizeCanvas(data));
   } catch {
     return "";
   }
+}
+
+/** Equality fingerprint of an already normalized canvas snapshot. */
+function hashStructuredCanvas(canvas: StructuredCanvas): string {
+  return JSON.stringify({
+    n: Object.keys(canvas.nodes).sort(),
+    e: Object.keys(canvas.edges).sort(),
+    // Include field-level content so a real local edit (e.g. a node move)
+    // is NOT mistaken for the bounce-back even when the id sets match.
+    nodes: canvas.nodes,
+    edges: canvas.edges,
+  });
 }

@@ -103,22 +103,35 @@ name the client doesn't know exists (via `requiredCaps`).
 ### Enforcement points in the plugin
 
 `Auth.serverInfoChecked` (in `src/auth.ts`) runs `checkServerCaps` on every
-`/api/server-info` fetch, sets `plugin.lastCompatibilityError` on failure, and
-throws `CompatibilityError`. All server-info callers go through it:
+`/api/server-info` fetch and throws `CompatibilityError` on failure. It updates
+`plugin.lastCompatibilityError` only for the active server; checking a staged
+migration destination does not change the current server's banner. Callers include:
 
 - `ensureServerId` — startup / legacy token migration
-- `resolveServerId` — post-SSO session binding (also covers
-  `completeWithToken` via `setSession`)
+- `setSession` — protocol-token validation before committing a session
 - `validSessionsForServer` — settings UI session picker
 - `useKnownSession` — saved-session restore (check before trusting the
   saved session's server)
 - `authenticateAt` — **before** `window.open` launches the SSO browser flow,
   so an incompatible server never sends the user to the browser
 
+`authenticateAt` returns a staged session; `commitSession` installs it only while
+the sign-in attempt is still current. Migration also validates the matching vault
+before committing. Cancellation, logout, or unload prevents a late protocol token
+or completed validation from replacing the active session.
+
 `maybeStartSync` (in `src/main.ts`) hard-blocks on `CompatibilityError`:
 sets the sync status and returns before `me()` / `startSync()`. Network and
 offline errors are still tolerated as before — only compatibility failures
 hard-block.
+
+`ServerCompatibilityGate` (in `src/sync/compatibilityGate.ts`) shares one
+single-flight server-info check across the vault index, notes, Canvas, Bases,
+and plugin databases. Every provider uses it before requesting document tokens
+or opening a socket, including autonomous reconnects and cached-token attempts.
+An established connection dropping invalidates the shared check. A known
+incompatibility also stops traffic on existing sockets; edits remain local and
+the next compatible handshake replays them.
 
 The settings banner (`CompatibilityBanner` in `src/settings.tsx`) renders
 only when `plugin.lastCompatibilityError` is set, showing `reason`, `detail`,

@@ -18,6 +18,8 @@
 # test logs / local data
 /.test-unit.log
 /.test-e2e.log
+# Local profiling artifacts and handoff notes: profiling/README.md
+/profiling/
 /.ysweet-data/
 /instasync.zip
 /realtime.zip

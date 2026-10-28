@@ -13,6 +13,8 @@ import {
 import { resetDocumentEpochStateForTests, setEpochProposalHandler } from "../../src/documentEpoch";
 import { DocumentEpochPendingError, type ClientToken } from "../../src/sync/clientToken";
 import { HttpError } from "../../src/httpError";
+import { ServerCompatibilityGate } from "../../src/sync/compatibilityGate";
+import { CompatibilityError } from "../../src/caps";
 
 const TOKEN: ClientToken = {
   url: "ws://sync.test/d/vault__doc/ws",
@@ -617,6 +619,127 @@ describe("RealtimeProvider", () => {
       f.destroy();
       vi.useRealTimers();
     }
+  });
+
+  describe("server compatibility gate", () => {
+    /** A provider behind a real gate whose server-info check reads `server.compatible`. */
+    function gatedFixture() {
+      const server = { compatible: false, checks: 0 };
+      const gate = new ServerCompatibilityGate(
+        () => "http://sync.test",
+        async () => {
+          server.checks += 1;
+          if (!server.compatible) {
+            throw new CompatibilityError("server-incompatible", "server advertised restApi=99");
+          }
+        },
+      );
+      const doc = new Y.Doc();
+      const sockets: FakeSocket[] = [];
+      const tokenSource = vi.fn(() => Promise.resolve(TOKEN));
+      const provider = new RealtimeProvider("vault__doc", doc, tokenSource, {
+        connect: false,
+        connectionGate: gate,
+        socketFactory: (url) => {
+          const socket = new FakeSocket(url);
+          sockets.push(socket);
+          return socket;
+        },
+      });
+      const f: ProviderFixture = {
+        doc,
+        provider,
+        sockets,
+        destroy: () => {
+          provider.destroy();
+          doc.destroy();
+        },
+      };
+      return { f, gate, server, tokenSource };
+    }
+
+    /** Apply every sync message the client sent on `socket` to `serverDoc`. */
+    function applyClientSync(socket: FakeSocket, serverDoc: Y.Doc): void {
+      for (const message of socket.sent) {
+        const decoder = decoding.createDecoder(message);
+        if (decoding.readVarUint(decoder) !== 0) continue;
+        syncProtocol.readSyncMessage(decoder, encoding.createEncoder(), serverDoc, "client");
+      }
+    }
+
+    it("mints no token and opens no socket until the server is verified compatible", async () => {
+      const { f, gate, server, tokenSource } = gatedFixture();
+      try {
+        void f.provider.connect();
+        await vi.waitFor(() => expect(f.provider.status).toBe("error"));
+        // Nudges while the refusal is remembered cost no server-info request.
+        void f.provider.connect();
+        await Promise.resolve();
+        expect(server.checks).toBe(1);
+        expect(tokenSource).not.toHaveBeenCalled();
+        expect(f.sockets).toHaveLength(0);
+
+        server.compatible = true;
+        await gate.verify();
+        void f.provider.connect();
+        await vi.waitFor(() => expect(f.sockets).toHaveLength(1));
+        expect(tokenSource).toHaveBeenCalledOnce();
+      } finally {
+        f.destroy();
+      }
+    });
+
+    it("verifies the server again before reconnecting after an established drop", async () => {
+      const { f, server, tokenSource } = gatedFixture();
+      server.compatible = true;
+      try {
+        const socket = await openAndHandshake(f);
+        expect(server.checks).toBe(1);
+
+        // The server restarts as an incompatible release.
+        server.compatible = false;
+        socket.drop();
+        await vi.waitFor(() => expect(server.checks).toBe(2));
+        await vi.waitFor(() => expect(f.provider.status).toBe("error"));
+        expect(f.sockets).toHaveLength(1);
+        expect(tokenSource).toHaveBeenCalledOnce();
+      } finally {
+        f.destroy();
+      }
+    });
+
+    it("stops writing to a live server found incompatible and resends the edit after recovery", async () => {
+      const { f, gate, server } = gatedFixture();
+      server.compatible = true;
+      const serverDoc = new Y.Doc();
+      try {
+        const first = await openAndHandshake(f);
+        server.compatible = false;
+        await expect(gate.verify()).rejects.toBeInstanceOf(CompatibilityError);
+        const sentBefore = first.sent.length;
+
+        f.doc.getMap("values").set("local", "edit while incompatible");
+
+        expect(first.sent).toHaveLength(sentBefore);
+        expect(first.closeCount).toBe(1);
+        expect(f.provider.hasLocalChanges).toBe(true);
+        await vi.waitFor(() => expect(f.provider.status).toBe("error"));
+        expect(f.sockets).toHaveLength(1);
+
+        server.compatible = true;
+        await gate.verify();
+        void f.provider.connect();
+        await vi.waitFor(() => expect(f.sockets).toHaveLength(2));
+        const second = f.sockets[1];
+        second.open();
+        second.deliver(serverStep1(serverDoc));
+        applyClientSync(second, serverDoc);
+        expect(serverDoc.getMap("values").get("local")).toBe("edit while incompatible");
+      } finally {
+        serverDoc.destroy();
+        f.destroy();
+      }
+    });
   });
 });
 
