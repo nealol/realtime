@@ -21,6 +21,9 @@
 # Local profiling artifacts and handoff notes: profiling/README.md
 /profiling/
 /.ysweet-data/
+/git/.upload-token
+/app.js
+/app.css
 /instasync.zip
 /realtime.zip
 /packages/plugin-api-types/dist/
