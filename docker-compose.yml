@@ -1,0 +1,23 @@
+# Compose version of the README's `docker run` command:
+#   docker run -p 8081:8081 -v realtime-data:/data \
+#     -e PUBLIC_BASE_URL=... -e OIDC_MODE=oidc -e OIDC_ISSUER=... \
+#     -e OIDC_CLIENT_ID=... -e OIDC_CLIENT_SECRET=... \
+#     ghcr.io/<owner>/realtime-server
+
+services:
+  realtime:
+    image: ghcr.io/nealol/realtime-server:latest
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      - realtime-data:/data
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      OIDC_MODE: ${OIDC_MODE:-oidc}
+      OIDC_ISSUER: ${OIDC_ISSUER}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET}
+
+volumes:
+  realtime-data:
